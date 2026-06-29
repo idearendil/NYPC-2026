@@ -194,6 +194,14 @@ def extract(env, side):
     ymx = torch.where(tmask, ty, torch.full_like(ty, -BIG)).max(1, keepdim=True).values
     normx = ((tx - xmn) / (xmx - xmn).clamp(min=1) * 20 - 10) * tmask.float()
     normy = ((ty - ymn) / (ymx - ymn).clamp(min=1) * 20 - 10) * tmask.float()
+    # The board is point-symmetric about its centre, so RIGHT's view is LEFT's
+    # view point-reflected -- which, for normalized coords, is exactly a negation
+    # (token features are already perspective-swapped via me/opp, and tok_dist is
+    # reflection-invariant). Feeding both sides a canonical (LEFT) orientation lets
+    # one shared net play either side correctly.
+    if side == 1:
+        normx = -normx
+        normy = -normy
     t1 = torch.cat([raw24, normx[:, :, None], normy[:, :, None]], dim=2)  # [B,T,26]
 
     cnt, sumhp = env._side_counts()
@@ -622,7 +630,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         opt_critic.load_state_dict(ck['opt_critic'])
         pool_t1 = [frozen_from_state(mk_t1, sd, device) for sd in ck['pool_t1']]
         pool_t2 = [frozen_from_state(mk_t2, sd, device) for sd in ck['pool_t2']]
-        pool_wr = ck['pool_wr']
+        pool_wr = ck['pool_wr'].cpu()   # kept on CPU (used with the CPU opp_gen)
         pool_ids = ck['pool_ids']
         next_opp_id = ck['next_opp_id']
         opp_assign = ck['opp_assign'].to(device)
@@ -728,7 +736,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         flat['adv'] = (a - a.mean()) / (a.std() + 1e-8)
 
         # ---- PPO epochs ----
-        pl = vl = el = 0.0
+        pl = vl = el = kl = 0.0
         nb = 0
         for _ in range(cfg.epochs):
             perm = torch.randperm(Ntot)
@@ -737,7 +745,11 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 mb = {k: flat[k][idx].to(device) for k in keys}
                 # ---- actor update (policy + entropy) ----
                 logp, ent = evaluate_policy(actor_t1, actor_t2, mb)
-                ratio = torch.exp(logp - mb['old_logp'])
+                logratio = logp - mb['old_logp']
+                ratio = torch.exp(logratio)
+                with torch.no_grad():
+                    # Schulman's positive KL estimator E[(r-1) - log r] ~ KL(old||new)
+                    approx_kl = ((ratio - 1) - logratio).mean()
                 adv_b = mb['adv']
                 s1 = ratio * adv_b
                 s2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv_b
@@ -758,7 +770,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 nn.utils.clip_grad_norm_(critic_params, cfg.max_grad_norm)
                 opt_critic.step()
 
-                pl += ploss.item(); vl += vloss.item(); el += ent.mean().item(); nb += 1
+                pl += ploss.item(); vl += vloss.item(); el += ent.mean().item()
+                kl += approx_kl.item(); nb += 1
 
         # ---- value-net explained variance ----
         with torch.no_grad():
@@ -785,7 +798,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         dt = time.time() - t0
         if it % log_every == 0:
             print(f"iter {it:3d} | eps {ep_count:5d} | avg_ep_R {wr:+6.2f} | "
-                  f"ploss {pl/nb:+.4f} vloss {vl/nb:.3f} ent {el/nb:.3f} | "
+                  f"ploss {pl/nb:+.4f} vloss {vl/nb:.3f} ent {el/nb:.3f} kl {kl/nb:.4f} | "
                   f"ev {ev:+.3f} pool {len(pool_t1)} wr_min {float(pool_wr.min()):.2f} | "
                   f"{steps*cfg.B/dt:,.0f} steps/s ({dt:.1f}s)")
 
@@ -798,6 +811,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'ploss': pl / nb,
                 'vloss': vl / nb,
                 'entropy': el / nb,
+                'approx_kl': kl / nb,
                 'value_ev': ev,
                 'pool_size': len(pool_t1),
                 'opp_winrate_min': float(pool_wr.min()),

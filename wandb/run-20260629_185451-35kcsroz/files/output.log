@@ -12,3 +12,37 @@ iter  10 | eps  1507 | avg_ep_R  +6.88 | ploss -0.0028 vloss 1.709 ent 1.343 | e
 iter  11 | eps  1552 | avg_ep_R  +7.27 | ploss -0.0030 vloss 1.535 ent 1.352 | ev +0.922 pool 8 wr_min 0.50 | 935 steps/s (213.9s)
 iter  12 | eps  1596 | avg_ep_R  +8.01 | ploss -0.0028 vloss 1.240 ent 1.450 | ev +0.932 pool 9 wr_min 0.50 | 864 steps/s (231.4s)
 iter  13 | eps  1699 | avg_ep_R  +8.61 | ploss -0.0025 vloss 1.178 ent 1.480 | ev +0.923 pool 10 wr_min 0.50 | 693 steps/s (288.6s)
+iter  14 | eps  1769 | avg_ep_R  +8.94 | ploss -0.0019 vloss 1.133 ent 1.452 | ev +0.920 pool 10 wr_min 0.50 | 624 steps/s (320.6s)
+iter  15 | eps  1889 | avg_ep_R  +9.24 | ploss -0.0021 vloss 0.880 ent 1.447 | ev +0.923 pool 10 wr_min 0.50 | 749 steps/s (267.1s)
+iter  16 | eps  1933 | avg_ep_R  +9.52 | ploss -0.0021 vloss 0.602 ent 1.602 | ev +0.914 pool 10 wr_min 0.50 | 740 steps/s (270.0s)
+iter  17 | eps  1977 | avg_ep_R  +9.68 | ploss -0.0014 vloss 0.391 ent 1.589 | ev +0.906 pool 10 wr_min 0.50 | 734 steps/s (272.3s)
+iter  18 | eps  1999 | avg_ep_R  +9.66 | ploss -0.0011 vloss 0.385 ent 1.587 | ev +0.925 pool 10 wr_min 0.50 | 714 steps/s (280.2s)
+iter  19 | eps  1950 | avg_ep_R  +9.47 | ploss -0.0011 vloss 0.437 ent 1.658 | ev +0.923 pool 10 wr_min 0.50 | 715 steps/s (279.7s)
+iter  20 | eps  1916 | avg_ep_R  +9.60 | ploss -0.0008 vloss 0.417 ent 1.691 | ev +0.907 pool 10 wr_min 0.50 | 726 steps/s (275.2s)
+iter  21 | eps  1928 | avg_ep_R  +9.55 | ploss -0.0005 vloss 0.435 ent 1.743 | ev +0.909 pool 10 wr_min 0.50 | 724 steps/s (276.0s)
+iter  22 | eps  1851 | avg_ep_R  +9.46 | ploss -0.0007 vloss 0.448 ent 1.781 | ev +0.911 pool 10 wr_min 0.50 | 740 steps/s (270.2s)
+iter  23 | eps  1917 | avg_ep_R  +9.58 | ploss -0.0003 vloss 0.494 ent 1.789 | ev +0.903 pool 10 wr_min 0.50 | 727 steps/s (275.1s)
+iter  24 | eps  1946 | avg_ep_R  +9.56 | ploss -0.0004 vloss 0.428 ent 1.700 | ev +0.902 pool 10 wr_min 0.50 | 742 steps/s (269.5s)
+iter  25 | eps  1947 | avg_ep_R  +9.68 | ploss -0.0006 vloss 0.451 ent 1.708 | ev +0.894 pool 10 wr_min 0.50 | 741 steps/s (269.7s)
+iter  26 | eps  1918 | avg_ep_R  +9.53 | ploss -0.0002 vloss 0.679 ent 1.754 | ev +0.893 pool 10 wr_min 0.50 | 752 steps/s (265.9s)
+iter  27 | eps  1915 | avg_ep_R  +9.63 | ploss -0.0005 vloss 0.530 ent 1.678 | ev +0.878 pool 10 wr_min 0.50 | 747 steps/s (267.5s)
+iter  28 | eps  1925 | avg_ep_R  +9.58 | ploss -0.0002 vloss 0.440 ent 1.707 | ev +0.888 pool 10 wr_min 0.50 | 749 steps/s (266.8s)
+iter  29 | eps  1974 | avg_ep_R  +9.72 | ploss -0.0007 vloss 0.358 ent 1.671 | ev +0.882 pool 10 wr_min 0.50 | 743 steps/s (269.0s)
+iter  30 | eps  1998 | avg_ep_R  +9.83 | ploss -0.0001 vloss 0.253 ent 1.612 | ev +0.889 pool 10 wr_min 0.50 | 742 steps/s (269.6s)
+iter  31 | eps  2080 | avg_ep_R  +9.93 | ploss -0.0007 vloss 0.190 ent 1.492 | ev +0.873 pool 10 wr_min 0.50 | 738 steps/s (270.7s)
+iter  32 | eps  2127 | avg_ep_R  +9.95 | ploss -0.0001 vloss 0.167 ent 1.450 | ev +0.880 pool 10 wr_min 0.50 | 730 steps/s (274.0s)
+iter  33 | eps  2141 | avg_ep_R  +9.92 | ploss -0.0003 vloss 0.147 ent 1.487 | ev +0.871 pool 10 wr_min 0.50 | 722 steps/s (276.8s)
+iter  34 | eps  2145 | avg_ep_R  +9.96 | ploss -0.0003 vloss 0.131 ent 1.555 | ev +0.897 pool 10 wr_min 0.50 | 676 steps/s (295.7s)
+iter  35 | eps  2141 | avg_ep_R  +9.90 | ploss -0.0008 vloss 0.176 ent 1.536 | ev +0.879 pool 10 wr_min 0.50 | 685 steps/s (291.8s)
+iter  36 | eps  2208 | avg_ep_R  +9.90 | ploss -0.0003 vloss 0.153 ent 1.577 | ev +0.880 pool 10 wr_min 0.50 | 670 steps/s (298.4s)
+Traceback (most recent call last):
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 750, in <module>
+    opt_actor.step()
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 746, in main
+    actor_loss = ploss + cfg.ent_coef * eloss
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 592, in train
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 537, in opponent_actions
+    return c
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 359, in sample_policy
+    tok_ids = o['tok_ids']
+KeyboardInterrupt

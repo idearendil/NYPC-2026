@@ -39,9 +39,15 @@ import torch
 # and for the reference dynamics used by the parity test).
 # --------------------------------------------------------------------------- #
 _TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testing-tool.py")
-_spec = importlib.util.spec_from_file_location("tt_reference", _TT_PATH)
-tt = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(tt)
+if os.path.exists(_TT_PATH):
+    _spec = importlib.util.spec_from_file_location("tt_reference", _TT_PATH)
+    tt = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(tt)
+else:
+    # Only map generation / the parity tests need the reference simulator. The
+    # submission bot reuses the encoder but never generates maps, so allow import
+    # to succeed without testing-tool.py present.
+    tt = None
 
 MAX_DAYS = 200
 START_GOLD = 500

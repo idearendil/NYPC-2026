@@ -7,3 +7,15 @@
 2026-06-29 18:54:51,427 INFO    MainThread:2320 [wandb_init.py:init():856] wandb.init called with sweep_config: {}
 config: {'B': 256, 'steps_per_iter': 200000, 'iters': 50, 'gamma': 0.997, 'lam': 0.95, 'clip': 0.2, 'lr': 0.0003, 'epochs': 3, 'minibatch': 4096, 'ent_coef': 0.005, 'vf_coef': 0.5, 'max_grad_norm': 1.0, 'd_model': 64, 'store_device': 'cpu', 'opp_ema_alpha': 0.02, 'pool_add_threshold': 0.6, 'pool_max_size': 10, 'opp_sample_floor': 0.05, 'use_wandb': True, '_wandb': {}}
 2026-06-29 18:54:51,427 INFO    MainThread:2320 [wandb_init.py:init():899] starting backend
+2026-06-29 18:54:54,594 INFO    MainThread:2320 [wandb_init.py:init():914] sending inform_init request
+2026-06-29 18:54:55,326 INFO    MainThread:2320 [wandb_init.py:init():919] backend started and connected
+2026-06-29 18:54:55,367 INFO    MainThread:2320 [wandb_init.py:init():989] updated telemetry
+2026-06-29 18:54:55,369 INFO    MainThread:2320 [wandb_init.py:init():1012] communicating run to backend with 90.0 second timeout
+2026-06-29 18:54:57,351 INFO    MainThread:2320 [wandb_init.py:init():1057] starting run threads in backend
+2026-06-29 18:54:58,264 INFO    MainThread:2320 [wandb_run.py:_console_start():2509] atexit reg
+2026-06-29 18:54:58,264 INFO    MainThread:2320 [wandb_run.py:_redirect():2359] redirect: wrap_raw
+2026-06-29 18:54:58,264 INFO    MainThread:2320 [wandb_run.py:_redirect():2428] Wrapping output streams.
+2026-06-29 18:54:58,264 INFO    MainThread:2320 [wandb_run.py:_redirect():2451] Redirects installed.
+2026-06-29 18:54:58,268 INFO    MainThread:2320 [wandb_init.py:init():1095] run started, returning control to user process
+2026-06-29 21:27:12,568 INFO    wandb-AsyncioManager-main:2320 [service_client.py:_forward_responses():122] Reached EOF.
+2026-06-29 21:27:12,568 INFO    wandb-AsyncioManager-main:2320 [mailbox.py:close():154] Closing mailbox, abandoning 1 handles.

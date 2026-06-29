@@ -116,8 +116,20 @@ Slots are grouped by assigned opponent so each pooled net runs once per step.
 
 **wandb logging** (project `nypc2026-selfplay`, disable with `--no-wandb`):
 `avg_ep_R`, `ploss`/`vloss`/`entropy`, value-net **explained variance**
-(`value_ev`), `pool_size`, per-opponent EMA win rate (`opp_winrate/<i>`),
+(`value_ev`), `pool_size`, per-opponent EMA win rate keyed by a **stable id**
+(`opp_winrate/<id>`, so a curve tracks the same opponent across FIFO evictions),
 `opp_winrate_min`/`_mean`, `pool_added`, `steps_per_s`, `episodes`.
+
+**Hyperparameters** live in `config.yaml` (one field per `Config` field, with
+comments). Edit it freely; `load_config` errors on unknown keys. CLI flags
+(`--B`, `--steps`, `--iters`, `--no-wandb`, `--no-resume`) override the file.
+
+**Checkpoint / resume:** at the start of every iter, `checkpoint.pt` is written
+atomically with the agent (actor T1/T2 + critic), both optimizers, the whole
+opponent pool (actor nets + EMA win rates + stable ids), the current opponent
+assignments, and all RNG states. On restart (`resume: true`, default) training
+loads it and continues from the saved iter — so an interrupted run picks up where
+it left off. Pass `--no-resume` (or delete the file) to start fresh.
 
 Networks per the spec:
 - **T1** (3 transformer blocks): 거점-token transformer; token feats (24, log1p) +
@@ -158,6 +170,36 @@ less staleness, less memory. Defaults are now 200k × 250 (= 50M total).
 > Note: attention uses a hand-written multi-head implementation, not
 > `nn.MultiheadAttention` — the fused CUDA fast-path emits all-NaN rows when a
 > batch mixes padded and unpadded token sequences (our mixed-size case).
+
+## Submission bot (`submit_bot.py`)
+A ready-to-submit player that speaks `sample-code.py`'s stdin/stdout protocol but
+picks actions by running the trained actor. It is **numpy-only at runtime** — the
+1000ms handshake budget can't fit torch's ~2.3s import, while numpy imports in
+~0.15s. Workflow:
+
+```
+python ppo_selfplay.py ...                    # trains -> checkpoint.pt
+python export_weights.py --ckpt checkpoint.pt --out weights.npz   # offline, uses torch
+python verify_np_bot.py                       # checks numpy == torch pipeline (needs both files)
+# then submit / play:
+testing-tool.py -a "python submit_bot.py --weights weights.npz" -b "..." --seed 1 --NP 40 --KP 6
+```
+
+- The encoder (`extract`/`observe`) and the transformer forward are ported to
+  numpy and verified numerically against the torch path (`verify_np_bot.py`:
+  encoder features match to ~1e-6, net outputs to ~1e-6, travel cache and all
+  action masks match exactly).
+- Region→거점 travel time (turns) is precomputed once at map load, inside the 1s
+  handshake. Per-turn `decide` is ~1–4ms on one CPU thread (budget 100ms).
+- `--stochastic` samples actions ∝ policy probs; default is **argmax**.
+- Move interpretation matches the env: a chosen (source, target) keeps the
+  `work_cap` (post-build) lowest-HP stationary warriors at the source (ties →
+  smaller suffix) and moves the rest, emitting one `MOVE` per moved warrior.
+- The agent remembers its movers' destinations (the protocol never reveals them).
+  The opponent's gold/income (also never sent) are reconstructed from the visible
+  economy — exact except for rare opponent move-cost edge cases.
+- `fast_env.py`'s import of `testing-tool.py` is now lazy, so importing the env
+  package doesn't require the reference simulator to be present.
 
 ## Modeling notes / assumptions
 - **Mixed sizes are supported via padding.** A batch may contain games with
