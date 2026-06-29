@@ -1,0 +1,34 @@
+# PPO self-play hyperparameters (loaded by ppo_selfplay.py).
+# Every field maps to a Config field; edit freely. CLI flags
+# (--B / --steps / --iters / --no-wandb / --no-resume) override these.
+
+# ---- rollout / batch ----
+B: 256                  # parallel games stepped together
+steps_per_iter: 200000  # env-steps collected per iteration (horizon = steps_per_iter / B)
+iters: 250              # number of training iterations
+
+# ---- PPO ----
+gamma: 0.997            # discount
+lam: 0.95               # GAE lambda
+clip: 0.2               # PPO clip range
+lr: 0.0003              # Adam lr (shared by actor & critic optimizers)
+epochs: 3               # PPO epochs per iteration
+minibatch: 4096         # minibatch size
+ent_coef: 0.005         # entropy bonus (actor loss)
+vf_coef: 0.5            # value loss weight (critic loss)
+max_grad_norm: 1.0      # grad clipping
+
+# ---- model ----
+d_model: 64             # transformer width
+store_device: cpu       # device for the rollout buffer (cpu keeps GPU mem free)
+
+# ---- opponent pool ----
+opp_ema_alpha: 0.02     # EMA rate for per-opponent win rate
+pool_add_threshold: 0.6 # snapshot the agent into the pool when min win rate exceeds this
+pool_max_size: 10       # max opponents; oldest is evicted (FIFO) when full
+opp_sample_floor: 0.05  # minimum sampling weight per opponent
+
+# ---- logging / checkpointing ----
+use_wandb: true
+ckpt_path: checkpoint.pt  # written at the start of every iter; resumed from on restart
+resume: true              # resume from ckpt_path if it exists

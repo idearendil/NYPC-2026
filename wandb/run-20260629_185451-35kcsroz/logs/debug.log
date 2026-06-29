@@ -1,0 +1,9 @@
+2026-06-29 18:54:51,426 INFO    MainThread:2320 [wandb_setup.py:_flush():81] Current SDK version is 0.27.0
+2026-06-29 18:54:51,426 INFO    MainThread:2320 [wandb_setup.py:_flush():81] Configure stats pid to 2320
+2026-06-29 18:54:51,426 INFO    MainThread:2320 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-06-29 18:54:51,426 INFO    MainThread:2320 [wandb_init.py:setup_run_log_directory():723] Logging user logs to D:\claude_projects\nypc2026\wandb\run-20260629_185451-35kcsroz\logs\debug.log
+2026-06-29 18:54:51,426 INFO    MainThread:2320 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to D:\claude_projects\nypc2026\wandb\run-20260629_185451-35kcsroz\logs\debug-internal.log
+2026-06-29 18:54:51,427 INFO    MainThread:2320 [wandb_init.py:init():851] calling init triggers
+2026-06-29 18:54:51,427 INFO    MainThread:2320 [wandb_init.py:init():856] wandb.init called with sweep_config: {}
+config: {'B': 256, 'steps_per_iter': 200000, 'iters': 50, 'gamma': 0.997, 'lam': 0.95, 'clip': 0.2, 'lr': 0.0003, 'epochs': 3, 'minibatch': 4096, 'ent_coef': 0.005, 'vf_coef': 0.5, 'max_grad_norm': 1.0, 'd_model': 64, 'store_device': 'cpu', 'opp_ema_alpha': 0.02, 'pool_add_threshold': 0.6, 'pool_max_size': 10, 'opp_sample_floor': 0.05, 'use_wandb': True, '_wandb': {}}
+2026-06-29 18:54:51,427 INFO    MainThread:2320 [wandb_init.py:init():899] starting backend
