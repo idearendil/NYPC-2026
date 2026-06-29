@@ -1,0 +1,13 @@
+# PPO self-play training dependencies (ppo_selfplay.py + fast_env.py + tests)
+#
+# torch is the CUDA build (cu126). Install it from the PyTorch index, e.g.:
+#   pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu126
+# then install the rest:
+#   pip install -r requirements.txt
+#
+# (The submission bot, submit_bot.py, needs ONLY numpy at runtime.)
+
+torch==2.12.0
+numpy==2.2.6
+PyYAML==6.0.3
+wandb==0.27.0
