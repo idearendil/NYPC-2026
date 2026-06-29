@@ -17,3 +17,5 @@ config: {'B': 256, 'steps_per_iter': 200000, 'iters': 250, 'gamma': 0.997, 'lam'
 2026-06-29 21:42:57,862 INFO    MainThread:13680 [wandb_run.py:_redirect():2428] Wrapping output streams.
 2026-06-29 21:42:57,863 INFO    MainThread:13680 [wandb_run.py:_redirect():2451] Redirects installed.
 2026-06-29 21:42:57,867 INFO    MainThread:13680 [wandb_init.py:init():1095] run started, returning control to user process
+2026-06-29 22:03:50,278 INFO    wandb-AsyncioManager-main:13680 [service_client.py:_forward_responses():122] Reached EOF.
+2026-06-29 22:03:50,279 INFO    wandb-AsyncioManager-main:13680 [mailbox.py:close():154] Closing mailbox, abandoning 1 handles.

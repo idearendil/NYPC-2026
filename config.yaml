@@ -31,4 +31,4 @@ opp_sample_floor: 0.05  # minimum sampling weight per opponent
 # ---- logging / checkpointing ----
 use_wandb: true
 ckpt_path: checkpoint.pt  # written at the start of every iter; resumed from on restart
-resume: true              # resume from ckpt_path if it exists
+resume: false              # resume from ckpt_path if it exists
