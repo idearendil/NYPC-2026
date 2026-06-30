@@ -465,8 +465,13 @@ class Bot:
         heal_cost = np.where(kind_t == KIND_HQ, HQ_HEAL, BASE_HEAL)
         is_strong = self.stronghold[g]
         is_hq = self.is_hq[g]
-        can_up = me_b & (lvl_t < maxlev)
-        can_heal = me_b & (lvl_t >= maxlev)
+        # Upgrade legality mirrors the judge (testing-tool.apply_upgrades): a region is
+        # only upgradeable when a friendly warrior is present AND no enemy warrior is on
+        # it. up_room = "has room to upgrade" (ignores transient occupancy) is used by
+        # the HQ-saving commitment so it can keep saving while an enemy sits on the HQ.
+        up_room = me_b & (lvl_t < maxlev)
+        can_up = up_room & (my_cnt > 0) & (op_cnt == 0)
+        can_heal = me_b & (lvl_t >= maxlev) & (my_cnt > 0) & (op_cnt == 0)
         build_new = (own_t == 0) & is_strong & (~is_hq)
         cost = np.full(T, COST_INF, dtype=np.float64)
         cost = np.where(build_new, BASE_COST[1], cost)
@@ -492,6 +497,7 @@ class Bot:
                     wc_cur=my_wc.astype(np.int64), wc_after=wc_after.astype(np.int64),
                     stat_cnt=stat_cnt.astype(np.int64),
                     is_hq_me=(is_hq & me_b), can_up_hq=(is_hq & can_up),
+                    can_up_hq_room=(is_hq & up_room),
                     owner_me=me_b, build_new=build_new, nu=(build_new | can_up),
                     extra4=extra4, tok_dist=tok_dist, normx=normx, normy=normy)
 
@@ -574,9 +580,13 @@ class Bot:
         committed = self.hq_commit
         my_hq_region = 0 if self.my_side == 'A' else self.N - 1
         hq_tok = self.tok2idx.get(my_hq_region)
-        hq_can_up = (hq_tok is not None) and bool(o['can_up_hq'][hq_tok])
-        hq_cost = HQ_UPCOST[o['hq_level'] + 1] if hq_can_up else COST_INF
-        hq_afford = hq_can_up and (o['gold'] >= hq_cost)
+        # hq_room: HQ has room to upgrade (ignores occupancy) -> drives saving/sampling.
+        # hq_legal: ALSO satisfies the judge's legality (friendly present, no enemy) ->
+        # gates whether the upgrade may actually be emitted this turn.
+        hq_room = (hq_tok is not None) and bool(o['can_up_hq_room'][hq_tok])
+        hq_legal = (hq_tok is not None) and bool(o['can_up_hq'][hq_tok])
+        hq_cost = HQ_UPCOST[o['hq_level'] + 1] if hq_room else COST_INF
+        hq_afford = hq_room and (o['gold'] >= hq_cost)
 
         p_build = 1.0 / (1.0 + np.exp(-head5[:, 0]))
         # normal builds need a free worker (gating); the HQ token is sampleable even
@@ -586,16 +596,19 @@ class Bot:
             build_mask = np.zeros(T, dtype=bool)
         else:
             build_mask = normal_build_mask.copy()
-            if hq_can_up:
+            if hq_room:
                 build_mask[hq_tok] = True
         if sto:
             outcome = (self.rng.random(T) < (p_build * build_mask)).astype(bool)
         else:
             outcome = (p_build > 0.5) & build_mask
 
-        hq_sampled = hq_can_up and bool(outcome[hq_tok])
-        do_hq_now = hq_afford and (committed or hq_sampled)
-        self.hq_commit = (not hq_afford) and (committed or hq_sampled) and hq_can_up
+        hq_sampled = hq_room and bool(outcome[hq_tok])
+        want_hq = hq_afford and (committed or hq_sampled)   # intend + can afford
+        do_hq_now = want_hq and hq_legal                    # emit only if legal this turn
+        # Keep saving while we still intend to upgrade but haven't emitted yet -- whether
+        # because it's unaffordable OR because an enemy is on the HQ (defer, don't drop).
+        self.hq_commit = (committed or hq_sampled) and hq_room and (not do_hq_now)
 
         # HQ upgrade takes gold priority; greedily allocate the rest to non-HQ builds.
         gold_after_hq = int(o['gold']) - (int(hq_cost) if do_hq_now else 0)

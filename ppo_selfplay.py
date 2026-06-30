@@ -267,8 +267,13 @@ def extract(env, side):
                             torch.full_like(lvl_t, BASE_HEAL))
     is_strong = env.mb.is_stronghold.gather(1, tok_g)
     is_hq = env.is_hq_mask.gather(1, tok_g)
-    can_up = me_b & (lvl_t < maxlev)
-    can_heal = me_b & (lvl_t >= maxlev)
+    # Upgrade legality mirrors the judge (testing-tool.apply_upgrades): a region is
+    # only upgradeable when a friendly warrior is present AND no enemy warrior is on
+    # it. up_room = "has room to upgrade" (ignores transient occupancy) is used by
+    # the HQ-saving commitment so it can keep saving while an enemy sits on the HQ.
+    up_room = me_b & (lvl_t < maxlev)
+    can_up = up_room & (my_cnt > 0) & (op_cnt == 0)
+    can_heal = me_b & (lvl_t >= maxlev) & (my_cnt > 0) & (op_cnt == 0)
     build_new = (own_t == 0) & is_strong & (~is_hq)
     cost = torch.full_like(lvl_t, COST_INF)
     cost = torch.where(build_new, torch.full_like(cost, env.BASE_COST[1]), cost)
@@ -297,6 +302,8 @@ def extract(env, side):
         build_cand=build_cand, build_cost=cost,
         wc_cur=my_wc, wc_after=wc_after, stat_cnt=stat_cnt,
         is_hq_me=(is_hq & me_b), can_up_hq=(is_hq & can_up),
+        can_up_hq_room=(is_hq & up_room),
+        hq_upcost=env.HQ_UPCOST[(hq_level + 1).clamp(max=HQ_MAXLEVEL)],
         owner_me=me_b, build_new=build_new,
         extra4=extra4, tok_dist=tok_dist, normx=normx, normy=normy,
         # free workers = non-moving friendly not currently labouring (surplus
@@ -354,13 +361,16 @@ def sample_policy(t1net, t2net, o, N):
     committed = o['hq_commit']                        # [B] saving for an HQ upgrade
     not_committed = ~committed
 
-    # HQ-upgrade macro bookkeeping. can_up_hq is True only at an upgradeable owned
-    # HQ token, so it doubles as the HQ-token selector.
-    can_up_hq = o['can_up_hq']                         # [B,T]
-    hq_can_up = can_up_hq.any(1)                       # [B]
-    hq_tok = can_up_hq.float().argmax(1)              # [B] (valid where hq_can_up)
-    hq_cost = o['build_cost'].gather(1, hq_tok[:, None]).squeeze(1)
-    hq_afford = hq_can_up & (o['gold'] >= hq_cost)
+    # HQ-upgrade macro bookkeeping. can_up_hq_room marks the (upgradeable, owned) HQ
+    # token regardless of occupancy -- it drives saving/sampling. can_up_hq is the
+    # same token but ALSO requires the judge's legality (friendly present, no enemy),
+    # gating whether the upgrade may actually be emitted this turn.
+    can_up_hq_room = o['can_up_hq_room']               # [B,T]
+    hq_room = can_up_hq_room.any(1)                     # [B] HQ has room to upgrade
+    hq_legal = o['can_up_hq'].any(1)                    # [B] legal to upgrade this turn
+    hq_tok = can_up_hq_room.float().argmax(1)          # [B] (valid where hq_room)
+    hq_cost = o['hq_upcost']                            # [B] next-level cost (occupancy-free)
+    hq_afford = hq_room & (o['gold'] >= hq_cost)
 
     # ---------------- BUILD ----------------
     # Normal builds need affordability + a free worker (gating). The HQ token is
@@ -368,18 +378,21 @@ def sample_policy(t1net, t2net, o, N):
     # saving for it. While committed, every build is masked off.
     normal_build_mask = (o['build_cand'] & (o['build_cost'] <= o['gold'][:, None])
                          & o['tmask'] & (o['free_total'][:, None] >= 1))
-    build_mask = (normal_build_mask | can_up_hq) & not_committed[:, None]
+    build_mask = (normal_build_mask | can_up_hq_room) & not_committed[:, None]
     p_build = torch.sigmoid(head5[:, :, 0]) * build_mask.float()
     outcome = torch.bernoulli(p_build)
     build_logp = (build_mask.float() * bern_logp(torch.sigmoid(head5[:, :, 0]), outcome)).sum(1)
 
-    hq_sampled = outcome.bool().gather(1, hq_tok[:, None]).squeeze(1) & hq_can_up
-    do_hq_now = hq_afford & (committed | hq_sampled)                  # upgrade HQ this turn
-    new_commit = (~hq_afford) & (committed | hq_sampled) & hq_can_up  # keep/enter saving
+    hq_sampled = outcome.bool().gather(1, hq_tok[:, None]).squeeze(1) & hq_room
+    want_hq = hq_afford & (committed | hq_sampled)            # intend + can afford
+    do_hq_now = want_hq & hq_legal                           # emit only if legal this turn
+    # Keep saving while we still intend to upgrade but haven't emitted yet -- whether
+    # because it's unaffordable OR because an enemy is on the HQ (defer, don't drop).
+    new_commit = (committed | hq_sampled) & hq_room & (~do_hq_now)
 
     # HQ upgrade takes gold priority; the rest goes to the sampled non-HQ builds.
     gold_after_hq = o['gold'] - do_hq_now.long() * hq_cost
-    non_hq_outcome = outcome.bool() & (~can_up_hq)
+    non_hq_outcome = outcome.bool() & (~can_up_hq_room)
     perm = torch.argsort(torch.rand(B, T, device=dev), dim=1)
     exec_build, gold1 = _greedy(non_hq_outcome, o['build_cost'], gold_after_hq, perm, T)
 
@@ -1093,7 +1106,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 value, aux_c = critic.value_aux(mb['t1'], mb['glob'], mb['tmask'])
                 vloss = F.mse_loss(value, mb['ret'])
                 aux_loss_c = masked_token_mse(aux_c, mb['gold_aux'], mb['tmask'])
-                critic_loss = cfg.vf_coef * vloss + cfg.aux_coef * aux_loss_c
+                critic_loss = vloss + cfg.aux_coef * aux_loss_c
                 opt_critic.zero_grad()
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(critic_params, cfg.max_grad_norm)
