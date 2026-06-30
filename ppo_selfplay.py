@@ -613,19 +613,52 @@ def sample_opponents(n, pool_wr, gen, floor=0.05):
     return torch.multinomial(probs, n, replacement=True, generator=gen)
 
 
-def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, B, N, dev):
-    """Sample opponent actions, grouping batch slots by their assigned opponent
-    so each pooled policy runs once over its subset of games."""
+def rusher_action(env, side):
+    """Scripted fixed opponent embodying a pure 'rush' strategy (a batched port of
+    the supplied rush bot): never builds or upgrades; trains 1 warrior/turn; once
+    >=6 non-moving warriors have gathered at its HQ, hurls them at the enemy HQ
+    (the per-region move keeps the HQ's work_cap=1 worker and sends the rest).
+    Returns a full-batch action dict; the caller copies only its assigned rows."""
+    B, N, dev = env.B, env.N, env.device
+    my_hq = env.hq_region[:, side]            # [B]
+    opp_hq = env.hq_region[:, 1 - side]       # [B]
+    sd = env.slot_side[None, :].expand(B, env.W)
+    stat = (env.w_hp > 0) & (sd == side) & (~env.w_move)
+    hq_cnt = env._scatter_region(stat).gather(1, my_hq[:, None]).squeeze(1)   # [B]
+
+    move = torch.full((B, N), -1, dtype=torch.long, device=dev)
+    rows = (hq_cnt >= 6).nonzero(as_tuple=True)[0]
+    if rows.numel() > 0:
+        move[rows, my_hq[rows]] = opp_hq[rows]
+    return {'build': torch.zeros(B, N, dtype=torch.bool, device=dev),
+            'move': move,
+            'train': torch.ones(B, dtype=torch.long, device=dev)}   # env caps by cap/gold
+
+
+# Unified opponent index 0 is the fixed rusher; net snapshot i is unified index i+1.
+RUSHER_IDX = 0
+
+
+def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev):
+    """Sample opponent actions, grouping batch slots by their assigned opponent so
+    each opponent runs once over its subset of games. Unified index 0 is the fixed
+    scripted rusher; index p>=1 maps to net snapshot pool_t1[p-1]/pool_t2[p-1]."""
     build_full = torch.zeros(B, N, dtype=torch.bool, device=dev)
     move_full = torch.full((B, N), -1, dtype=torch.long, device=dev)
     train_full = torch.zeros(B, dtype=torch.long, device=dev)
     for p in torch.unique(opp_assign).tolist():
         rows = (opp_assign == p).nonzero(as_tuple=True)[0]
-        sub = slice_obs(o_op, rows)
-        act, _, _ = sample_policy(pool_t1[p], pool_t2[p], sub, N)
-        build_full[rows] = act['build']
-        move_full[rows] = act['move']
-        train_full[rows] = act['train']
+        if p == RUSHER_IDX:
+            act = rusher_action(env, side)
+            build_full[rows] = act['build'][rows]
+            move_full[rows] = act['move'][rows]
+            train_full[rows] = act['train'][rows]
+        else:
+            sub = slice_obs(o_op, rows)
+            act, _, _ = sample_policy(pool_t1[p - 1], pool_t2[p - 1], sub, N)
+            build_full[rows] = act['build']
+            move_full[rows] = act['move']
+            train_full[rows] = act['train']
     return {'build': build_full, 'move': move_full, 'train': train_full}
 
 
@@ -645,13 +678,16 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     mk_t1 = lambda: ActorT1(d=cfg.d_model)
     mk_t2 = lambda: ActorT2(cfg.d_model + T2_EXTRA, d=cfg.d_model)
 
-    # opponent pool: starts with a frozen copy of the initial policy.
-    # pool_ids gives each opponent a stable id (survives FIFO index shifts) so
-    # wandb curves track the same opponent over time.
+    # opponent pool. Unified index 0 is a FIXED scripted rusher (never evicted,
+    # tracked with its own EMA win rate); index i>=1 is net snapshot pool_t1[i-1].
+    # It starts with the rusher + a frozen copy of the initial policy. Net snapshots
+    # are capped at cfg.pool_max_size (=10) so the total pool is at most 11.
+    # pool_ids gives each opponent a stable id (survives eviction index shifts) so
+    # wandb curves track the same opponent over time ('rusher' for the fixed one).
     pool_t1 = [frozen_copy(actor_t1)]
     pool_t2 = [frozen_copy(actor_t2)]
-    pool_wr = torch.full((1,), 0.5)                     # EMA win rate per opponent
-    pool_ids = [0]
+    pool_wr = torch.full((2,), 0.5)                     # EMA win rate: [rusher, net0]
+    pool_ids = ['rusher', 0]
     next_opp_id = 1
     opp_gen = torch.Generator().manual_seed(seed + 777)
     opp_assign = sample_opponents(cfg.B, pool_wr, opp_gen,
@@ -691,6 +727,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         pool_ids = ck['pool_ids']
         next_opp_id = ck['next_opp_id']
         opp_assign = ck['opp_assign'].to(device)
+        # backward-compat: checkpoints predating the fixed rusher have no rusher
+        # slot (pool_wr/pool_ids align 1:1 with the net snapshots, opp_assign is
+        # net-0-based). Prepend the rusher at unified index 0 and shift indices.
+        if pool_wr.numel() == len(pool_t1):
+            pool_wr = torch.cat([torch.full((1,), 0.5), pool_wr])
+            pool_ids = ['rusher'] + list(pool_ids)
+            opp_assign = opp_assign + 1
+            print("  migrated pre-rusher checkpoint: prepended fixed rusher opponent")
         # RNG states must be CPU ByteTensors (map_location may have moved them)
         opp_gen.set_state(ck['opp_gen'].cpu())
         torch.set_rng_state(ck['torch_rng'].cpu())
@@ -698,7 +742,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             torch.cuda.set_rng_state_all([s.cpu() for s in ck['cuda_rng']])
         start_iter = ck['iter']
         print(f"resumed from {cfg.ckpt_path} at iter {start_iter} "
-              f"(pool size {len(pool_t1)})")
+              f"(pool size {len(pool_t1) + 1})")
 
     run = None
     if cfg.use_wandb:
@@ -744,7 +788,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 val = critic.value(o_ag['t1'], o_ag['glob'], o_ag['tmask'])
                 o_op = extract(env, 1)
                 act_op = opponent_actions(pool_t1, pool_t2, o_op, opp_assign,
-                                          cfg.B, N, device)
+                                          env, 1, cfg.B, N, device)
             env.step({'left': act_ag, 'right': act_op})
             r, done = reward_done(env)
             # gold-production change this turn (per 거점, [me, opp]); label for o_ag
@@ -866,11 +910,13 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         added = False
         if float(pool_wr.min()) > cfg.pool_add_threshold:
             if len(pool_t1) >= cfg.pool_max_size:
-                # evict the oldest opponent; pool indices shift down by one
+                # evict the oldest NET snapshot (unified index 1); the fixed rusher
+                # at index 0 is never evicted. Remaining net indices shift down one.
                 pool_t1.pop(0); pool_t2.pop(0)
-                pool_wr = pool_wr[1:]
-                pool_ids.pop(0)
-                opp_assign = (opp_assign - 1).clamp(min=0)
+                pool_wr = torch.cat([pool_wr[:1], pool_wr[2:]])
+                pool_ids.pop(1)
+                opp_assign = torch.where(opp_assign >= 1,
+                                         (opp_assign - 1).clamp(min=0), opp_assign)
             pool_t1.append(frozen_copy(actor_t1))
             pool_t2.append(frozen_copy(actor_t2))
             pool_wr = torch.cat([pool_wr, torch.full((1,), 0.5)])
@@ -884,7 +930,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             print(f"iter {it:3d} | eps {ep_count:5d} | avg_ep_R {wr:+6.2f} | "
                   f"ploss {pl/nb:+.4f} vloss {vl/nb:.3f} ent {el/nb:.3f} kl {kl/nb:.4f} "
                   f"aux {ax_a/nb:.3f}/{ax_c/nb:.3f} ep {epochs_run}/{cfg.epochs} | "
-                  f"ev {ev:+.3f} pool {len(pool_t1)} wr_min {float(pool_wr.min()):.2f} | "
+                  f"ev {ev:+.3f} pool {len(pool_t1)+1} wr_min {float(pool_wr.min()):.2f} "
+                  f"rush_wr {float(pool_wr[RUSHER_IDX]):.2f} | "
                   f"{steps*cfg.B/dt:,.0f} steps/s ({dt:.1f}s)")
 
         if run is not None:
@@ -901,9 +948,10 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'aux_loss_critic': ax_c / nb,
                 'epochs_run': epochs_run,
                 'value_ev': ev,
-                'pool_size': len(pool_t1),
+                'pool_size': len(pool_t1) + 1,
                 'opp_winrate_min': float(pool_wr.min()),
                 'opp_winrate_mean': float(pool_wr.mean()),
+                'opp_winrate_rusher': float(pool_wr[RUSHER_IDX]),
                 'pool_added': int(added),
                 'steps_per_s': steps * cfg.B / dt,
             }

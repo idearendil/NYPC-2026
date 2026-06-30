@@ -16,4 +16,19 @@ iter  14 | eps  1309 | avg_ep_R  +4.20 | ploss -0.0040 vloss 1.553 ent 1.788 kl 
 iter  15 | eps  1278 | avg_ep_R  +4.50 | ploss -0.0043 vloss 1.433 ent 1.966 kl 0.0064 aux 0.007/0.010 ep 5/5 | ev +0.935 pool 6 wr_min 0.54 | 852 steps/s (234.6s)
 iter  16 | eps  1331 | avg_ep_R  +5.21 | ploss -0.0039 vloss 1.463 ent 2.188 kl 0.0069 aux 0.007/0.010 ep 5/5 | ev +0.934 pool 6 wr_min 0.57 | 828 steps/s (241.4s)
 iter  17 | eps  1339 | avg_ep_R  +5.96 | ploss -0.0038 vloss 1.409 ent 2.288 kl 0.0070 aux 0.007/0.010 ep 5/5 | ev +0.929 pool 7 wr_min 0.50 | 836 steps/s (239.2s)
-iter
+iter  18 | eps  1211 | avg_ep_R  +4.29 | ploss -0.0033 vloss 1.470 ent 2.345 kl 0.0069 aux 0.009/0.012 ep 5/5 | ev +0.910 pool 7 wr_min 0.54 | 820 steps/s (243.8s)
+iter  19 | eps  1196 | avg_ep_R  +3.36 | ploss -0.0045 vloss 1.754 ent 2.469 kl 0.0074 aux 0.009/0.012 ep 5/5 | ev +0.909 pool 7 wr_min 0.51 | 835 steps/s (239.4s)
+iter  20 | eps  1227 | avg_ep_R  +4.35 | ploss -0.0041 vloss 1.675 ent 2.432 kl 0.0074 aux 0.008/0.012 ep 5/5 | ev +0.899 pool 8 wr_min 0.50 | 849 steps/s (235.6s)
+iter  21 | eps  1171 | avg_ep_R  +4.01 | ploss -0.0035 vloss 1.595 ent 2.484 kl 0.0080 aux 0.009/0.013 ep 5/5 | ev +0.896 pool 8 wr_min 0.47 | 823 steps/s (242.8s)
+Traceback (most recent call last):
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 947, in <module>
+    main()
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 943, in main
+    train(cfg, device=args.device)
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 743, in train
+    act_ag, store, _ = sample_policy(actor_t1, actor_t2, o_ag, N)
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 363, in sample_policy
+    logits = t2_logits_sources(t2net, h1, o['extra4'], surplus_pb, o['tok_dist'],
+  File "D:\claude_projects\nypc2026\ppo_selfplay.py", line 314, in t2_logits_sources
+    x = torch.cat([h1q, exq, sf, tv, dx, dy], dim=2)
+KeyboardInterrupt

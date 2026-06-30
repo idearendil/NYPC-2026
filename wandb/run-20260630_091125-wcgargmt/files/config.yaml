@@ -1,0 +1,98 @@
+_wandb:
+    value:
+        cli_version: 0.27.0
+        e:
+            cxe4v3xk2atl7ckz16ov9sqvuc7mxdm4:
+                codePath: ppo_selfplay.py
+                codePathLocal: ppo_selfplay.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "499797454848"
+                        used: "380759277568"
+                email: leetm2021@postech.ac.kr
+                executable: D:\other_programs\anaconda3\envs\orbit\python.exe
+                git:
+                    commit: bc9cbae529bb5fddee2f1de64e6eef65a27917c9
+                    remote: https://github.com/idearendil/NYPC-2026.git
+                gpu: NVIDIA GeForce RTX 3070 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6144
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce RTX 3070 Ti
+                      uuid: GPU-62a5a7d7-54b9-0497-640f-30583c3b185b
+                host: MAGI3
+                memory:
+                    total: "34191097856"
+                os: Windows-10-10.0.26200-SP0
+                program: D:\claude_projects\nypc2026\ppo_selfplay.py
+                python: CPython 3.10.20
+                root: D:\claude_projects\nypc2026
+                startedAt: "2026-06-30T00:11:25.227464Z"
+                writerId: cxe4v3xk2atl7ckz16ov9sqvuc7mxdm4
+        m: []
+        python_version: 3.10.20
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 16
+                - 61
+            "4": 3.10.20
+            "5": 0.27.0
+            "8":
+                - 3
+            "12": 0.27.0
+            "13": windows-amd64
+B:
+    value: 256
+aux_coef:
+    value: 0.15
+ckpt_path:
+    value: checkpoint.pt
+clip:
+    value: 0.2
+d_model:
+    value: 64
+ent_coef:
+    value: 0.01
+epochs:
+    value: 5
+gamma:
+    value: 0.997
+iters:
+    value: 250
+lam:
+    value: 0.95
+lr:
+    value: 0.0005
+max_grad_norm:
+    value: 1
+minibatch:
+    value: 4096
+opp_ema_alpha:
+    value: 0.02
+opp_sample_floor:
+    value: 0.05
+pool_add_threshold:
+    value: 0.6
+pool_max_size:
+    value: 10
+resume:
+    value: false
+steps_per_iter:
+    value: 200000
+store_device:
+    value: cpu
+target_kl:
+    value: 0.02
+use_wandb:
+    value: true
+vf_coef:
+    value: 0.5
