@@ -11,11 +11,13 @@ iters: 250              # number of training iterations
 gamma: 0.997            # discount
 lam: 0.95               # GAE lambda
 clip: 0.2               # PPO clip range
-lr: 0.0003              # Adam lr (shared by actor & critic optimizers)
-epochs: 3               # PPO epochs per iteration
+lr: 0.0005              # Adam lr (shared by actor & critic optimizers)
+epochs: 5               # PPO epochs per iteration
 minibatch: 4096         # minibatch size
-ent_coef: 0.005         # entropy bonus (actor loss)
+target_kl: 0.02         # KL early stop: end the iter's epochs once mean approx_kl exceeds this (null disables)
+ent_coef: 0.01         # entropy bonus (actor loss)
 vf_coef: 0.5            # value loss weight (critic loss)
+aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
 # ---- model ----

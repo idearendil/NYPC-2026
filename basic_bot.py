@@ -22,6 +22,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import NamedTuple
+import numpy as np
 
 MAX_TURN = 200
 START_GOLD = 500
@@ -237,6 +238,8 @@ def parse_init() -> tuple[GameMap, GameState]:
         S.warriors.append(Warrior(WarriorId(opp, sfx), M.opp_hq, HQ_LEVELS[1].warrior_hp))
     S.buildings.append(Building(0, Side.LEFT, BType.HQ, 1, HQ_LEVELS[1].hp))
     S.buildings.append(Building(M.N - 1, Side.RIGHT, BType.HQ, 1, HQ_LEVELS[1].hp))
+
+    temp = np.load("data.bin")
 
     print("OK", flush=True)
     return M, S

@@ -4,7 +4,7 @@ format, choosing actions by running the trained PPO actor net.
 
 Why numpy: the handshake budget is 1000ms, but importing torch alone is ~2.3s.
 numpy imports in ~0.15s, so we run inference with numpy and load the actor
-weights from a torch-free `weights.npz` (produced offline by `export_weights.py`).
+weights from a torch-free `data.bin` (an .npz produced offline by `export_weights.py`).
 
 Correctness: the encoder features and the transformer forward are a faithful port
 of `ppo_selfplay.extract` / `fast_env.observe` and the network modules; the port
@@ -24,12 +24,15 @@ upkeep). This is exact except for rare opponent move-cost edge cases.
 """
 from __future__ import annotations
 
-import argparse
 import math
-import os
 import sys
 
 import numpy as np
+
+# NOTE: keep module-top imports a strict subset of basic_bot.py's ({math, sys,
+# numpy}). argparse (~14ms cold, pulls in re/gettext) is replaced by manual argv
+# parsing, and os (free, already loaded) is imported lazily -- so nothing extra
+# competes with numpy's import inside the tight 1s handshake window.
 
 # ---- game constants (mirror testing-tool.py / fast_env.py) ------------------
 HQ_HP       = [0, 10, 15, 20, 25, 30]
@@ -275,9 +278,12 @@ def _workcap(kind, level):
 
 class Bot:
     def __init__(self, weights_path, stochastic=False):
+        import os  # already loaded at startup; lazy here to keep module-top imports minimal
+        self.debug = bool(os.environ.get("BOT_DEBUG"))
         self.stochastic = stochastic
-        self.net = Net(np.load(weights_path))
-        self.rng = np.random.default_rng()
+        self.weights_path = weights_path
+        self.net = None                  # loaded lazily, after the handshake (see _ensure_ready)
+        self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
 
         self.my_side = 'A'
         self.me_code = OWN_LEFT
@@ -316,15 +322,14 @@ class Bot:
             deg = int(tok[0])
             self.adj[r] = sorted(int(v) for v in tok[1:1 + deg])
 
-        self.stronghold = np.zeros(N, dtype=bool)
-        for r in strongholds:
-            self.stronghold[r] = True
-        self.is_hq = np.zeros(N, dtype=bool)
-        self.is_hq[0] = True
-        self.is_hq[N - 1] = True
-        self.tok_ids = np.array(sorted(set(strongholds) | {0, N - 1}), dtype=np.int64)
-        self.tok2idx = {int(r): i for i, r in enumerate(self.tok_ids)}
-        self.tt = compute_travel(N, self.x, self.y, self.adj, self.tok_ids)
+        # Keep the handshake path pure-Python (no numpy ops). All numpy array
+        # construction is deferred to _ensure_ready so the only thing between
+        # receiving the map and printing OK is `import numpy` itself -- matching
+        # the basic_bot profile that is known to clear the 1s handshake.
+        self._strongholds = strongholds
+        self.stronghold = self.is_hq = self.tok_ids = None
+        self.tok2idx = {}
+        self.tt = None       # travel times precomputed lazily after OK (see _ensure_ready)
 
         for sfx in range(1, START_WARRIORS + 1):
             self.warriors[('A', sfx)] = Warrior('A', sfx, 0, HQ_WHP[1])
@@ -485,8 +490,8 @@ class Bot:
                     wc_cur=my_wc.astype(np.int64), wc_after=wc_after.astype(np.int64),
                     stat_cnt=stat_cnt.astype(np.int64),
                     is_hq_me=(is_hq & me_b), can_up_hq=(is_hq & can_up),
-                    owner_me=me_b, build_new=build_new, extra4=extra4,
-                    tok_dist=tok_dist, normx=normx, normy=normy)
+                    owner_me=me_b, build_new=build_new, nu=(build_new | can_up),
+                    extra4=extra4, tok_dist=tok_dist, normx=normx, normy=normy)
 
     def _hq_level(self, side):
         r = 0 if side == 'A' else self.N - 1
@@ -494,13 +499,33 @@ class Bot:
         return b.level if (b is not None and b.kind == 'HQ' and b.side == side) else 0
 
     # -------------------------------------------------------- action selection
+    def _ensure_ready(self):
+        """Heavy init deferred out of the 1s handshake into turn 1's budget: load
+        the actor weights and precompute region->거점 travel times. Both are only
+        needed once we actually choose an action, so keeping them out of the
+        handshake gives the unavoidable numpy import the full 1s OK budget."""
+        if self.net is None:
+            N = self.N
+            self.stronghold = np.zeros(N, dtype=bool)
+            for r in self._strongholds:
+                self.stronghold[r] = True
+            self.is_hq = np.zeros(N, dtype=bool)
+            self.is_hq[0] = True
+            self.is_hq[N - 1] = True
+            self.tok_ids = np.array(sorted(set(self._strongholds) | {0, N - 1}), dtype=np.int64)
+            self.tok2idx = {int(r): i for i, r in enumerate(self.tok_ids)}
+            self.net = Net(np.load(self.weights_path))
+            self.tt = compute_travel(N, self.x, self.y, self.adj, self.tok_ids)
+            self.rng = np.random.default_rng()
+
     def decide(self, turn):
         import time as _t
         t0 = _t.perf_counter()
+        self._ensure_ready()
         o = self.encode(turn)
         plan = self._select_action(o)
         cmds = self._to_commands(plan, o)
-        if os.environ.get("BOT_DEBUG"):
+        if self.debug:
             print(f"turn {turn}: decide {(_t.perf_counter()-t0)*1000:.1f}ms",
                   file=sys.stderr, flush=True)
         return cmds
@@ -518,9 +543,24 @@ class Bot:
         sto = self.stochastic
         h1, head5 = self.net.t1(o['t1'], o['glob'])
 
+        # Non-moving friendly warriors board-wide (caps builds), and of those the
+        # "free" ones not currently labouring -- surplus beyond each region's
+        # work_cap -- which can actually be dispatched to staff a base (gates builds).
+        by_region = {}
+        for w in self.warriors.values():
+            if w.side == self.my_side and w.hp > 0 and not w.moving:
+                by_region.setdefault(w.region, []).append(w)
+        n_nonmoving = sum(len(ws) for ws in by_region.values())
+        n_free = 0
+        for r, ws in by_region.items():
+            b = self.buildings.get(r)
+            kc = _workcap(b.kind, b.level) if (b is not None and b.side == self.my_side) else 0
+            n_free += max(len(ws) - kc, 0)
+
         # ---------------- BUILD ----------------
         p_build = 1.0 / (1.0 + np.exp(-head5[:, 0]))
-        build_mask = o['build_cand'] & (o['build_cost'] <= o['gold'])
+        # gating: build/upgrade only when >=1 free (non-moving, non-labouring) worker
+        build_mask = o['build_cand'] & (o['build_cost'] <= o['gold']) & (n_free >= 1)
         if sto:
             outcome = (self.rng.random(T) < (p_build * build_mask)).astype(bool)
         else:
@@ -528,6 +568,21 @@ class Bot:
         prio = np.where(build_mask, p_build, -1.0)
         order = np.argsort(-prio, kind='stable')
         exec_build, gold1 = self._greedy(outcome, o['build_cost'], o['gold'], order)
+
+        # cap new-build/upgrade actions (heal exempt) to n_nonmoving: keep a random
+        # subset if more were chosen, so we never build more bases than we have
+        # workers to staff.
+        nu_exec = exec_build & o['nu']
+        if int(nu_exec.sum()) > n_nonmoving:
+            idx = np.nonzero(nu_exec)[0]
+            keep_idx = self.rng.choice(idx, size=n_nonmoving, replace=False)
+            capped = np.zeros(T, dtype=bool)
+            capped[keep_idx] = True
+            exec_build = (exec_build & ~o['nu']) | capped
+            gold1 = int(o['gold']) - int(np.where(exec_build, o['build_cost'], 0.0).sum())
+
+        # plan force-staffing: one nearest surplus warrior per understaffed base
+        force_moves, force_ids = self._plan_force_staff(o, exec_build)
 
         wc_pb = np.where(exec_build, o['wc_after'], o['wc_cur'])
         surplus_pb = np.maximum(o['stat_cnt'] - wc_pb, 0)
@@ -576,19 +631,60 @@ class Bot:
         else:
             train_cat = int(np.argmax(tl_m))
 
-        return exec_build, exec_move, tgt, wc_pb, train_cat
+        return exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids
+
+    def _plan_force_staff(self, o, exec_build):
+        """For each new/upgraded base whose non-moving friendly count is below its
+        post-build work_cap, pick the nearest *surplus* friendly warrior to send
+        there. Returns (list of (warrior, target_region), set of force-moved ids).
+        Surplus = stationary friendly warriors beyond a region's post-build keep-cap
+        (work_cap where we own a building, else 0) -- the same pool the policy moves,
+        so force_ids are excluded from policy moves in _to_commands."""
+        tok = o['tok_ids']
+        nu, stat_cnt = o['nu'], o['stat_cnt']
+        wc_after, wc_cur = o['wc_after'], o['wc_cur']
+        needing = [ti for ti in range(len(tok))
+                   if exec_build[ti] and nu[ti] and stat_cnt[ti] < wc_after[ti]]
+        if not needing:
+            return [], set()
+        # post-build keep-cap per 거점 region (non-거점 regions keep 0)
+        keepcap = {int(tok[ti]): (int(wc_after[ti]) if exec_build[ti] else int(wc_cur[ti]))
+                   for ti in range(len(tok))}
+        by_region = {}
+        for w in self.warriors.values():
+            if w.side == self.my_side and w.hp > 0 and not w.moving:
+                by_region.setdefault(w.region, []).append(w)
+        surplus = []
+        for r, ws in by_region.items():
+            ws.sort(key=lambda w: (w.hp, w.num))
+            surplus.extend(ws[keepcap.get(r, 0):])
+        force_moves, assigned = [], set()
+        for ti in needing:
+            best, bestkey = None, None
+            for w in surplus:
+                if id(w) in assigned:
+                    continue
+                key = (int(self.tt[w.region, ti]), w.region, w.hp, w.num)
+                if bestkey is None or key < bestkey:
+                    bestkey, best = key, w
+            if best is not None:
+                assigned.add(id(best))
+                force_moves.append((best, int(tok[ti])))
+        return force_moves, assigned
 
     def _to_commands(self, plan, o):
-        exec_build, exec_move, tgt, wc_pb, train_cat = plan
+        exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids = plan
         tok = o['tok_ids']
         upgrades, moves = [], []
         for t in np.nonzero(exec_build)[0]:
             upgrades.append(int(tok[t]))
+        for w, treg in force_moves:          # force-staffing (nearest surplus warrior)
+            moves.append((w, treg))
         for s in np.nonzero(exec_move)[0]:
             sreg = int(tok[s]); treg = int(tok[int(tgt[s])]); keep = int(wc_pb[s])
             here = [w for w in self.warriors.values()
                     if w.side == self.my_side and w.hp > 0
-                    and not w.moving and w.region == sreg]
+                    and not w.moving and w.region == sreg and id(w) not in force_ids]
             here.sort(key=lambda w: (w.hp, w.num))
             for w in here[keep:]:
                 moves.append((w, treg))
@@ -748,12 +844,23 @@ class Bot:
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", default="weights.npz")
-    ap.add_argument("--stochastic", action="store_true",
-                    help="sample actions ~ policy probs (default: argmax)")
-    args = ap.parse_args()
-    Bot(args.weights, stochastic=args.stochastic).run()
+    # Manual argv parse (no argparse) -- supports `--weights X`, `--weights=X`,
+    # and `--stochastic`; defaults match the submission (data.bin, argmax).
+    weights, stochastic = "data.bin", True
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--stochastic":
+            stochastic = True
+        elif a == "--weights":
+            i += 1
+            if i < len(args):
+                weights = args[i]
+        elif a.startswith("--weights="):
+            weights = a.split("=", 1)[1]
+        i += 1
+    Bot(weights, stochastic=stochastic).run()
 
 
 if __name__ == "__main__":

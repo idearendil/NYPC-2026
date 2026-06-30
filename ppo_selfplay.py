@@ -34,6 +34,7 @@ import dataclasses
 import os
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -121,6 +122,9 @@ class ActorT1(nn.Module):
         super().__init__()
         self.enc = Encoder(TOK_FEAT + GLOB_FEAT, d, heads, ff, layers)
         self.head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 5))
+        # auxiliary head: per-token next-turn gold-production change (/WORK_INCOME)
+        # for [me, opp]. Shapes the shared encoder; unused at inference.
+        self.aux = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2))
         self.d = d
 
     def forward(self, t1, glob, tmask):
@@ -147,14 +151,27 @@ class Critic(nn.Module):
         super().__init__()
         self.enc = Encoder(TOK_FEAT + GLOB_FEAT, d, heads, ff, layers)
         self.head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+        # auxiliary head: per-token next-turn gold-production change (/WORK_INCOME)
+        # for [me, opp]. Shapes the critic's encoder.
+        self.aux = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2))
 
-    def value(self, t1, glob, tmask):
+    def _encode(self, t1, glob, tmask):
         B, T, _ = t1.shape
         x = torch.cat([t1, glob[:, None, :].expand(B, T, GLOB_FEAT)], dim=2)
-        h = self.enc(x, ~tmask)
+        return self.enc(x, ~tmask)
+
+    def _pool(self, h, tmask):
         v = self.head(h).squeeze(-1)           # [B,T]
         m = tmask.float()
         return (v * m).sum(1) / m.sum(1).clamp(min=1)
+
+    def value(self, t1, glob, tmask):
+        return self._pool(self._encode(t1, glob, tmask), tmask)
+
+    def value_aux(self, t1, glob, tmask):
+        """Value plus the per-token gold-production aux prediction (one encode)."""
+        h = self._encode(t1, glob, tmask)
+        return self._pool(h, tmask), self.aux(h)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +285,11 @@ def extract(env, side):
         is_hq_me=(is_hq & me_b), can_up_hq=(is_hq & can_up),
         owner_me=me_b, build_new=build_new,
         extra4=extra4, tok_dist=tok_dist, normx=normx, normy=normy,
+        # free workers = non-moving friendly not currently labouring (surplus
+        # beyond each region's work_cap); used to gate builds.
+        free_total=(env._scatter_region(my_stat)
+                    - torch.where(env.b_owner == me, workcap,
+                                  torch.zeros_like(workcap))).clamp(min=0).sum(1),
     )
 
 
@@ -315,7 +337,13 @@ def sample_policy(t1net, t2net, o, N):
     h1, head5 = t1net(o['t1'], o['glob'], o['tmask'])
 
     # ---------------- BUILD ----------------
-    build_mask = o['build_cand'] & (o['build_cost'] <= o['gold'][:, None]) & o['tmask']
+    # Gating: building/upgrading requires >=1 free worker -- a non-moving friendly
+    # warrior not currently labouring -- who can be sent to staff the base. The
+    # per-build cap and the force-staffing move are applied inside the env
+    # (fast_env._phase_build); dropped builds still count as taken for PPO since
+    # build_logp uses the Bernoulli outcome.
+    build_mask = (o['build_cand'] & (o['build_cost'] <= o['gold'][:, None]) & o['tmask']
+                  & (o['free_total'][:, None] >= 1))
     p_build = torch.sigmoid(head5[:, :, 0]) * build_mask.float()
     outcome = torch.bernoulli(p_build)
     build_logp = (build_mask.float() * bern_logp(torch.sigmoid(head5[:, :, 0]), outcome)).sum(1)
@@ -413,8 +441,17 @@ def _greedy(item_mask, cost, gold, perm, T):
 # --------------------------------------------------------------------------- #
 # PPO re-evaluation of stored decisions
 # --------------------------------------------------------------------------- #
+def masked_token_mse(pred, target, tmask):
+    """MSE of a per-token [B,T,C] prediction vs target, averaged over valid tokens
+    (tmask [B,T] bool) and channels."""
+    m = tmask.float()[:, :, None]
+    se = ((pred - target) ** 2) * m
+    return se.sum() / (m.sum().clamp(min=1) * pred.shape[-1])
+
+
 def evaluate_policy(t1net, t2net, b):
     h1, head5 = t1net(b['t1'], b['glob'], b['tmask'])
+    aux_pred = t1net.aux(h1)                 # [B,T,2] gold-production change pred
     B, T = b['tmask'].shape
 
     # build
@@ -442,7 +479,7 @@ def evaluate_policy(t1net, t2net, b):
 
     logp = build_logp + train_logp + move_logp
     ent = build_ent + train_ent + move_ent
-    return logp, ent
+    return logp, ent, aux_pred
 
 
 # --------------------------------------------------------------------------- #
@@ -480,8 +517,16 @@ class Config:
     lr: float = 3e-4
     epochs: int = 3
     minibatch: int = 4096
+    # KL early stopping: stop an iter's PPO epochs once the policy has drifted
+    # this far from the data-collection policy (approx_kl, Schulman estimator).
+    # null/None disables it. Lets you raise lr/epochs without overshooting.
+    target_kl: Optional[float] = 0.02
     ent_coef: float = 0.005
     vf_coef: float = 0.5
+    # auxiliary task: predict each 거점's next-turn gold-production change
+    # (/WORK_INCOME, for [me, opp]) from the token encodings, on BOTH the actor and
+    # critic. Shapes the encoders with a dense economy signal. 0 disables.
+    aux_coef: float = 0.25
     max_grad_norm: float = 1.0
     d_model: int = 64
     store_device: str = "cpu"
@@ -547,7 +592,9 @@ def frozen_copy(net):
 
 def frozen_from_state(make_net, state, device):
     net = make_net().to(device)
-    net.load_state_dict(state)
+    # strict=False: pre-aux checkpoints lack the (inference-unused) aux head;
+    # pooled opponents only run the policy, so a fresh aux head is harmless.
+    net.load_state_dict(state, strict=False)
     net.eval()
     for p in net.parameters():
         p.requires_grad_(False)
@@ -623,11 +670,21 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     start_iter = 0
     if cfg.resume and os.path.exists(cfg.ckpt_path):
         ck = torch.load(cfg.ckpt_path, map_location=device, weights_only=False)
-        actor_t1.load_state_dict(ck['actor_t1'])
+        # strict=False so checkpoints predating the gold-production aux heads still
+        # load (the backbone/policy/critic transfer; the new aux heads start fresh).
+        a1_miss = actor_t1.load_state_dict(ck['actor_t1'], strict=False)
         actor_t2.load_state_dict(ck['actor_t2'])
-        critic.load_state_dict(ck['critic'])
-        opt_actor.load_state_dict(ck['opt_actor'])
-        opt_critic.load_state_dict(ck['opt_critic'])
+        c_miss = critic.load_state_dict(ck['critic'], strict=False)
+        try:
+            opt_actor.load_state_dict(ck['opt_actor'])
+            opt_critic.load_state_dict(ck['opt_critic'])
+        except (ValueError, KeyError) as e:
+            # param set changed (aux heads added) -> Adam moments can't map; reset.
+            print(f"  optimizer state incompatible ({e}); reinitializing optimizers")
+        if a1_miss.missing_keys or c_miss.missing_keys:
+            print(f"  loaded pre-aux checkpoint; aux heads initialized fresh "
+                  f"(actor missing {len(a1_miss.missing_keys)}, "
+                  f"critic missing {len(c_miss.missing_keys)})")
         pool_t1 = [frozen_from_state(mk_t1, sd, device) for sd in ck['pool_t1']]
         pool_t2 = [frozen_from_state(mk_t2, sd, device) for sd in ck['pool_t2']]
         pool_wr = ck['pool_wr'].cpu()   # kept on CPU (used with the CPU opp_gen)
@@ -649,6 +706,11 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         os.environ["WANDB_API_KEY"] = (
             "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")
         run = wandb.init(project="nypc2026-selfplay", config=vars(cfg))
+
+    # per-token realized work 'take' from the previous step, for the gold-production
+    # aux label (Δtake = this turn's production change). Episodes span iters, so this
+    # persists across iterations; reset to 0 per game at episode boundaries.
+    prev_take = torch.zeros(cfg.B, env.mb.T, 2, device=device)
 
     for it in range(start_iter, cfg.iters):
         # ---- checkpoint before starting this iter (for crash-safe resume) ----
@@ -685,12 +747,17 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                                           cfg.B, N, device)
             env.step({'left': act_ag, 'right': act_op})
             r, done = reward_done(env)
+            # gold-production change this turn (per 거점, [me, opp]); label for o_ag
+            cur_take = env.token_take(0)
+            gold_aux = cur_take - prev_take
+            prev_take = cur_take
             if done.any():
                 ep_rewards += float(r[done].sum()); ep_count += int(done.sum())
             rec = {k: v.to(sdev) for k, v in store.items()}
             rec['value'] = val.to(sdev)
             rec['reward'] = r.to(sdev)
             rec['done'] = done.float().to(sdev)
+            rec['gold_aux'] = gold_aux.to(sdev)
             buf.append(rec)
             if done.any():
                 drows = done.nonzero(as_tuple=True)[0]
@@ -708,6 +775,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 opp_assign[drows] = sample_opponents(
                     drows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
                 env.regen(done)
+                # new map -> no prior production; baseline the aux delta at 0
+                prev_take[drows] = 0
 
         with torch.no_grad():
             o_ag = extract(env, 0)
@@ -729,7 +798,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         # ---- flatten ----
         keys = ['t1', 'glob', 'tmask', 'extra4', 'tok_dist', 'normx', 'normy',
                 'build_mask', 'build_outcome', 'train_mask', 'train_cat',
-                'valid_src', 'tgt', 'surplus_pb', 'old_logp', 'adv', 'ret', 'value']
+                'valid_src', 'tgt', 'surplus_pb', 'old_logp', 'adv', 'ret', 'value',
+                'gold_aux']
         flat = {k: torch.cat([buf[t][k] for t in range(steps)], dim=0) for k in keys}
         Ntot = flat['t1'].shape[0]
         a = flat['adv']
@@ -737,14 +807,18 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
 
         # ---- PPO epochs ----
         pl = vl = el = kl = 0.0
+        ax_a = ax_c = 0.0
         nb = 0
+        epochs_run = 0
         for _ in range(cfg.epochs):
             perm = torch.randperm(Ntot)
+            ep_kl = 0.0
+            ep_nb = 0
             for i in range(0, Ntot, cfg.minibatch):
                 idx = perm[i:i + cfg.minibatch]
                 mb = {k: flat[k][idx].to(device) for k in keys}
-                # ---- actor update (policy + entropy) ----
-                logp, ent = evaluate_policy(actor_t1, actor_t2, mb)
+                # ---- actor update (policy + entropy + gold-production aux) ----
+                logp, ent, aux_a = evaluate_policy(actor_t1, actor_t2, mb)
                 logratio = logp - mb['old_logp']
                 ratio = torch.exp(logratio)
                 with torch.no_grad():
@@ -755,16 +829,18 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 s2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv_b
                 ploss = -torch.min(s1, s2).mean()
                 eloss = -ent.mean()
-                actor_loss = ploss + cfg.ent_coef * eloss
+                aux_loss_a = masked_token_mse(aux_a, mb['gold_aux'], mb['tmask'])
+                actor_loss = ploss + cfg.ent_coef * eloss + cfg.aux_coef * aux_loss_a
                 opt_actor.zero_grad()
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(actor_params, cfg.max_grad_norm)
                 opt_actor.step()
 
-                # ---- critic update (value regression) ----
-                value = critic.value(mb['t1'], mb['glob'], mb['tmask'])
+                # ---- critic update (value regression + gold-production aux) ----
+                value, aux_c = critic.value_aux(mb['t1'], mb['glob'], mb['tmask'])
                 vloss = F.mse_loss(value, mb['ret'])
-                critic_loss = cfg.vf_coef * vloss
+                aux_loss_c = masked_token_mse(aux_c, mb['gold_aux'], mb['tmask'])
+                critic_loss = cfg.vf_coef * vloss + cfg.aux_coef * aux_loss_c
                 opt_critic.zero_grad()
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(critic_params, cfg.max_grad_norm)
@@ -772,6 +848,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
 
                 pl += ploss.item(); vl += vloss.item(); el += ent.mean().item()
                 kl += approx_kl.item(); nb += 1
+                ax_a += aux_loss_a.item(); ax_c += aux_loss_c.item()
+                ep_kl += approx_kl.item(); ep_nb += 1
+
+            epochs_run += 1
+            # KL early stopping: if this epoch's mean drift exceeds the target,
+            # stop refreshing on this (now-stale) batch before overshooting.
+            if cfg.target_kl is not None and ep_kl / max(ep_nb, 1) > cfg.target_kl:
+                break
 
         # ---- value-net explained variance ----
         with torch.no_grad():
@@ -798,7 +882,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         dt = time.time() - t0
         if it % log_every == 0:
             print(f"iter {it:3d} | eps {ep_count:5d} | avg_ep_R {wr:+6.2f} | "
-                  f"ploss {pl/nb:+.4f} vloss {vl/nb:.3f} ent {el/nb:.3f} kl {kl/nb:.4f} | "
+                  f"ploss {pl/nb:+.4f} vloss {vl/nb:.3f} ent {el/nb:.3f} kl {kl/nb:.4f} "
+                  f"aux {ax_a/nb:.3f}/{ax_c/nb:.3f} ep {epochs_run}/{cfg.epochs} | "
                   f"ev {ev:+.3f} pool {len(pool_t1)} wr_min {float(pool_wr.min()):.2f} | "
                   f"{steps*cfg.B/dt:,.0f} steps/s ({dt:.1f}s)")
 
@@ -812,6 +897,9 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'vloss': vl / nb,
                 'entropy': el / nb,
                 'approx_kl': kl / nb,
+                'aux_loss_actor': ax_a / nb,
+                'aux_loss_critic': ax_c / nb,
+                'epochs_run': epochs_run,
                 'value_ev': ev,
                 'pool_size': len(pool_t1),
                 'opp_winrate_min': float(pool_wr.min()),

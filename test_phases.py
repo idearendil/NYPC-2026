@@ -75,7 +75,7 @@ def run(maps, turns, seed, device, label):
                 s = Sub(); s.upgrades = list(a[0])
                 tt.apply_upgrades(refs[b], m, side, s, rb)
         ref_each(do_build)
-        env._phase_build(act)
+        env._phase_build(act, apply_agent_rules=False)   # parity = pure game rules only
         if not _cmp_all("build", t, refs, env, done):
             return False
 

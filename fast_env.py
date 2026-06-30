@@ -300,6 +300,9 @@ class FastEnv:
         self.w_hp = z(B, W); self.w_region = z(B, W)
         self.w_move = torch.zeros((B, W), dtype=torch.bool, device=dev)
         self.w_tgt = z(B, W)
+        # per-region realized work 'take' (= gold/WORK_INCOME) from the last work
+        # phase, per side; used to build the gold-production aux-prediction label.
+        self.last_region_take = z(B, N, 2)
 
     def reset(self, mask=None):
         """Reset all games (mask=None) or only the games where mask[b] is True
@@ -319,6 +322,7 @@ class FastEnv:
         for t in (self.w_hp, self.w_region, self.w_tgt):
             t[m] = 0
         self.w_move[m] = False
+        self.last_region_take[m] = 0
         rows = m.nonzero(as_tuple=True)[0]
         if rows.numel() > 0:
             rhq = self.mb.hq_right[rows]
@@ -417,10 +421,15 @@ class FastEnv:
         return cnt, sumhp
 
     # --------------------------------------------------------------- step
-    def step(self, actions: dict):
+    def step(self, actions: dict, apply_agent_rules: bool = True):
         """Advance every game one day. ``actions`` = {'left':{...}, 'right':{...}}
-        each with build [B,N] bool, move [B,N] long (-1 none), train [B] long."""
-        self._phase_build(actions)
+        each with build [B,N] bool, move [B,N] long (-1 none), train [B] long.
+
+        ``apply_agent_rules`` (default True) enables the agent-side build policy
+        baked into the env: gate builds on having a non-moving worker, cap builds
+        to the worker count, and auto-staff understaffed new/upgraded bases. Set
+        it False for a pure-rules step (used by the testing-tool parity tests)."""
+        self._phase_build(actions, apply_agent_rules)
         self._phase_register_moves(actions)
         self._phase_train_charge(actions)
         self._phase_move()
@@ -432,8 +441,8 @@ class FastEnv:
         return self
 
     # build -> register moves -> train (morning, in that order)
-    def _phase_build(self, actions):
-        B, N = self.B, self.N
+    def _phase_build(self, actions, apply_agent_rules: bool = True):
+        B, N, W = self.B, self.N, self.W
         cnt, _ = self._side_counts()
         for side in (0, 1):
             me = OWN_LEFT if side == 0 else OWN_RIGHT
@@ -441,6 +450,20 @@ class FastEnv:
             fr = cnt[:, :, side]
             en = cnt[:, :, 1 - side]
             legal = mask & (fr > 0) & (en == 0)
+
+            if apply_agent_rules:
+                # Gating uses *free* workers: non-moving friendly warriors that are
+                # not currently labouring (surplus beyond a region's work_cap, plus
+                # any stationary warriors off the buildings) -- the same pool that
+                # can actually be dispatched to staff a base. The cap still uses the
+                # plain non-moving count (n_nonmoving).
+                sd = self.slot_side[None, :].expand(B, W)
+                stat = (self.w_hp > 0) & (sd == side) & (~self.w_move)
+                n_nonmoving = stat.sum(dim=1)
+                keepcap = torch.where(self.b_owner == me, self._workcap(),
+                                      torch.zeros_like(self.b_level))
+                n_free = (self._scatter_region(stat) - keepcap).clamp(min=0).sum(dim=1)
+                legal = legal & (n_free[:, None] >= 1)
 
             is_mine = self.b_owner == me
             is_empty = self.b_owner == OWN_NONE
@@ -452,6 +475,23 @@ class FastEnv:
             build_new = legal & is_empty & is_strong & (~is_hq)
             can_up = legal & is_mine & (self.b_level < maxlev)
             can_heal = legal & is_mine & (self.b_level >= maxlev)
+
+            if apply_agent_rules:
+                # Cap new-build/upgrade actions (heal exempt) to n_nonmoving: if
+                # more were requested, keep a uniformly random subset of that many.
+                # The dropped ones are intentionally NOT executed here; for PPO they
+                # still count as taken (build_logp uses the pre-exec Bernoulli outcome).
+                nu = build_new | can_up
+                if bool((nu.sum(dim=1) > n_nonmoving).any()):
+                    rnd = torch.where(nu, torch.rand(B, N, device=self.device),
+                                      torch.full((B, N), -1.0, device=self.device))
+                    order = torch.argsort(rnd, dim=1, descending=True)
+                    pos = torch.empty_like(order)
+                    pos.scatter_(1, order,
+                                 torch.arange(N, device=self.device)[None, :].expand(B, N))
+                    keep = pos < n_nonmoving[:, None]
+                    build_new = build_new & keep
+                    can_up = can_up & keep
 
             # costs
             upcost = torch.where(
@@ -475,6 +515,69 @@ class FastEnv:
             newhp = self._maxhp()
             changed = build_new | can_up | can_heal
             self.b_hp = torch.where(changed, newhp, self.b_hp)
+
+            # auto-staff understaffed new/upgraded bases (heal excluded)
+            if apply_agent_rules:
+                self._force_staff(side, me, build_new | can_up)
+
+    def _force_staff(self, side, me, nu_mask):
+        """For each region in ``nu_mask`` (this side's new builds / upgrades this
+        turn) whose non-moving friendly count is below its post-build work_cap,
+        force one nearest *surplus* friendly warrior to move there. The move is
+        free (we own the building) and is registered here -- before
+        _phase_register_moves -- so the policy's own move commands never touch the
+        staffed warrior. Surplus = friendly stationary warriors beyond a region's
+        keep-cap (work_cap where we own a building, else 0): exactly the pool the
+        policy may move, so staffing simply claims from it first."""
+        if not bool(nu_mask.any()):
+            return
+        B, N, W = self.B, self.N, self.W
+        dev = self.device
+        workcap = self._workcap()                                   # post-build [B,N]
+        sd = self.slot_side[None, :].expand(B, W)
+        cand = (self.w_hp > 0) & (sd == side) & (~self.w_move)       # stationary friendly
+        stat_cnt = self._scatter_region(cand)                       # [B,N]
+        needing = nu_mask & (stat_cnt < workcap)
+        if not bool(needing.any()):
+            return
+
+        keepcap = torch.where(self.b_owner == me, workcap, torch.zeros_like(workcap))
+        keep_w = keepcap.gather(1, self.w_region)                   # [B,W]
+        group = self.b_ar[:, None] * N + self.w_region
+        slot = self.slot_idx[None, :].expand(B, W)
+        rank, _ = _seg_stats(group, self.w_hp, slot, cand)
+        is_surplus = cand & (rank >= keep_w)                        # movable pool
+        surplus_rem = (stat_cnt - keepcap).clamp(min=0)            # per-region surplus count
+
+        tt = self.mb.travel_turns                                   # [B,N,T]
+        tok = self.mb.token_ids
+        tvalid = self.mb.token_valid
+        assigned = torch.zeros((B, W), dtype=torch.bool, device=dev)
+        force_tgt = torch.zeros((B, W), dtype=torch.int64, device=dev)
+        BIGD = 1 << 30
+        for ti in range(self.mb.T):
+            tokreg = tok[:, ti].clamp(max=N - 1)                    # [B]
+            need_t = tvalid[:, ti] & needing.gather(1, tokreg[:, None]).squeeze(1)
+            if not bool(need_t.any()):
+                continue
+            md = torch.where(surplus_rem > 0, tt[:, :, ti],
+                             torch.full_like(tt[:, :, ti], BIGD))   # [B,N]
+            r_star = md.argmin(dim=1)                               # [B] nearest src region
+            src_ok = need_t & ((surplus_rem.gather(1, r_star[:, None]).squeeze(1)) > 0)
+            at = ((self.w_region == r_star[:, None]) & is_surplus
+                  & (~assigned) & src_ok[:, None])
+            wkey = torch.where(at, rank, torch.full_like(rank, BIGD))
+            wsel = wkey.argmin(dim=1)                               # [B] chosen warrior slot
+            chose = at.gather(1, wsel[:, None]).squeeze(1)
+            rows = chose.nonzero(as_tuple=True)[0]
+            if rows.numel() > 0:
+                sl = wsel[rows]
+                assigned[rows, sl] = True
+                force_tgt[rows, sl] = tokreg[rows]
+                surplus_rem[rows, r_star[rows]] -= 1
+
+        self.w_move = torch.where(assigned, torch.ones_like(self.w_move), self.w_move)
+        self.w_tgt = torch.where(assigned, force_tgt, self.w_tgt)
 
     def _phase_register_moves(self, actions):
         B, N = self.B, self.N
@@ -632,14 +735,19 @@ class FastEnv:
         cnt, _ = self._side_counts()
         workcap = self._workcap()
         income = torch.zeros((self.B, 2), dtype=torch.int64, device=self.device)
+        take_bns = torch.zeros((self.B, self.N, 2), dtype=torch.int64, device=self.device)
         for side in (0, 1):
             me = OWN_LEFT if side == 0 else OWN_RIGHT
             mine = self.b_owner == me
             take = torch.minimum(workcap, cnt[:, :, side])
             take = torch.where(mine, take, torch.zeros_like(take))
+            take_bns[:, :, side] = take
             income[:, side] = WORK_INCOME * take.sum(dim=1)
         self.gold += income
         self.prev_income = income
+        # stash the realized per-region take so the aux label is exact (post-work,
+        # pre-upkeep counts) rather than recomputed from end-of-turn state.
+        self.last_region_take = take_bns
 
     def _phase_upkeep(self):
         B = self.B
@@ -674,6 +782,16 @@ class FastEnv:
         l = (self.b_owner.gather(1, self.hq_region[:, 0:1]).squeeze(1) == OWN_LEFT)
         r = (self.b_owner.gather(1, self.hq_region[:, 1:2]).squeeze(1) == OWN_RIGHT)
         return torch.stack([l, r], dim=1)
+
+    def token_take(self, side: int = 0):
+        """[B,T,2] per-거점 realized work 'take' (= gold/WORK_INCOME) from the most
+        recent work phase, columns = (me, opp) for ``side``. Gathered onto the same
+        token order as ``observe`` (sorted token_ids, padded tokens clamped)."""
+        tok_g = self.mb.token_ids.clamp(max=self.N - 1)
+        me, opp = side, 1 - side
+        lt = self.last_region_take
+        return torch.stack([lt[:, :, me].gather(1, tok_g),
+                            lt[:, :, opp].gather(1, tok_g)], dim=2).float()
 
     # --------------------------------------------------------------- observe
     def observe(self, side: int):

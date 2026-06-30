@@ -3,7 +3,7 @@
 submission bot can run with numpy only (no ~2.3s torch import at handshake).
 
 Usage:
-    python export_weights.py --ckpt checkpoint.pt --out weights.npz
+    python export_weights.py --ckpt checkpoint.pt --out data.bin
 """
 import argparse
 
@@ -14,7 +14,7 @@ import torch
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoint.pt")
-    ap.add_argument("--out", default="weights.npz")
+    ap.add_argument("--out", default="data.bin")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -29,7 +29,10 @@ def main():
     arrays["meta.d_model"] = np.int64(d_model)
     arrays["meta.heads"] = np.int64(4)        # ActorT1/ActorT2 default
 
-    np.savez(args.out, **arrays)
+    # Pass a file handle (not a path) so numpy writes EXACTLY args.out and does
+    # not append a ".npz" extension (the submission binary must be named data.bin).
+    with open(args.out, "wb") as f:
+        np.savez(f, **arrays)
     print(f"wrote {args.out}: {len(arrays)} arrays, d_model={d_model}")
 
 

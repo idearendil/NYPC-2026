@@ -292,7 +292,7 @@ def run_parity_maps(maps, turns, seed, device='cpu', verbose=True, label=""):
             per_game.append((al, ar))
         pre = [fast_snapshot(env, b) for b in range(B)]
         act = assemble_actions(env, per_game)
-        env.step(act)
+        env.step(act, apply_agent_rules=False)   # parity = pure game rules only
 
         for b in range(B):
             if done[b]:
@@ -421,7 +421,7 @@ def run_scripted_coverage(NP, KP, turns, seed):
         actR = econ_action(st, m, Side.RIGHT, cov)
         ref_apply_turn(st, m, actL, actR)
         act = assemble_actions(env, [(actL, actR)])
-        env.step(act)
+        env.step(act, apply_agent_rules=False)   # parity = pure game rules only
         err = compare(t, 0, ref_snapshot(st, m), fast_snapshot(env, 0))
         if err is not None:
             print(f"[FAIL scripted] turn {t}: {err}")
