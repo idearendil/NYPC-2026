@@ -41,11 +41,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import fast_env as fe
-from fast_env import (OWN_LEFT, OWN_RIGHT, KIND_HQ, MOVE_COST, TRAIN_COST,
-                      HQ_MAXLEVEL, BASE_MAXLEVEL, HQ_HEAL, BASE_HEAL, MAX_DAYS)
+from fast_env import (OWN_LEFT, OWN_RIGHT, KIND_HQ, KIND_BASE, MOVE_COST,
+                      TRAIN_COST, HQ_MAXLEVEL, BASE_MAXLEVEL, HQ_HEAL, BASE_HEAL,
+                      MAX_DAYS)
 
 TOK_FEAT = 26          # 14 scalars + 5 arrive + 5 reach (all log1p) + 2 norm coords
-GLOB_FEAT = 11
+GLOB_FEAT = 12         # 11 + HQ-upgrade "turns to afford" (log1p)
 T2_EXTRA = 8           # 4 logged + surplus + travel + 2 norm coord diffs
 COST_INF = 1_000_000_000
 
@@ -194,6 +195,19 @@ def extract(env, side):
         plog1p(g[:, 9] / 5),  plog1p(g[:, 10] / 5),
     ], dim=1)
 
+    # HQ-upgrade "turns to afford" feature: max(0, cost-gold) / net_income, where
+    # net_income = last turn's building income - upkeep (2 per warrior). Denominator
+    # floored at 1 so net<=0 reads as "very far" (large) rather than dividing badly.
+    hq_lvl = info['hq_level'].long()
+    hq_can_up = hq_lvl < HQ_MAXLEVEL
+    hq_cost = env.HQ_UPCOST[(hq_lvl + 1).clamp(max=HQ_MAXLEVEL)]
+    my_total = ((env.w_hp > 0) & (env.slot_side[None, :].expand(B, env.W) == side)).sum(1)
+    net_income = env.prev_income[:, side] - 2 * my_total
+    need = (hq_cost - info['gold'].long()).clamp(min=0).float()
+    turns = torch.where(hq_can_up, need / net_income.clamp(min=1).float(),
+                        torch.zeros(B, device=glob_t.device))
+    glob_t = torch.cat([glob_t, plog1p(turns)[:, None]], dim=1)
+
     tmask = info['token_mask']
     tok_ids = info['token_ids']
     tok_g = tok_ids.clamp(max=N - 1)
@@ -290,6 +304,7 @@ def extract(env, side):
         free_total=(env._scatter_region(my_stat)
                     - torch.where(env.b_owner == me, workcap,
                                   torch.zeros_like(workcap))).clamp(min=0).sum(1),
+        hq_commit=env.hq_commit[:, side],
     )
 
 
@@ -336,32 +351,59 @@ def sample_policy(t1net, t2net, o, N):
     dev = o['t1'].device
     h1, head5 = t1net(o['t1'], o['glob'], o['tmask'])
 
+    committed = o['hq_commit']                        # [B] saving for an HQ upgrade
+    not_committed = ~committed
+
+    # HQ-upgrade macro bookkeeping. can_up_hq is True only at an upgradeable owned
+    # HQ token, so it doubles as the HQ-token selector.
+    can_up_hq = o['can_up_hq']                         # [B,T]
+    hq_can_up = can_up_hq.any(1)                       # [B]
+    hq_tok = can_up_hq.float().argmax(1)              # [B] (valid where hq_can_up)
+    hq_cost = o['build_cost'].gather(1, hq_tok[:, None]).squeeze(1)
+    hq_afford = hq_can_up & (o['gold'] >= hq_cost)
+
     # ---------------- BUILD ----------------
-    # Gating: building/upgrading requires >=1 free worker -- a non-moving friendly
-    # warrior not currently labouring -- who can be sent to staff the base. The
-    # per-build cap and the force-staffing move are applied inside the env
-    # (fast_env._phase_build); dropped builds still count as taken for PPO since
-    # build_logp uses the Bernoulli outcome.
-    build_mask = (o['build_cand'] & (o['build_cost'] <= o['gold'][:, None]) & o['tmask']
-                  & (o['free_total'][:, None] >= 1))
+    # Normal builds need affordability + a free worker (gating). The HQ token is
+    # additionally sampleable even when unaffordable, to let the policy *commit* to
+    # saving for it. While committed, every build is masked off.
+    normal_build_mask = (o['build_cand'] & (o['build_cost'] <= o['gold'][:, None])
+                         & o['tmask'] & (o['free_total'][:, None] >= 1))
+    build_mask = (normal_build_mask | can_up_hq) & not_committed[:, None]
     p_build = torch.sigmoid(head5[:, :, 0]) * build_mask.float()
     outcome = torch.bernoulli(p_build)
     build_logp = (build_mask.float() * bern_logp(torch.sigmoid(head5[:, :, 0]), outcome)).sum(1)
 
+    hq_sampled = outcome.bool().gather(1, hq_tok[:, None]).squeeze(1) & hq_can_up
+    do_hq_now = hq_afford & (committed | hq_sampled)                  # upgrade HQ this turn
+    new_commit = (~hq_afford) & (committed | hq_sampled) & hq_can_up  # keep/enter saving
+
+    # HQ upgrade takes gold priority; the rest goes to the sampled non-HQ builds.
+    gold_after_hq = o['gold'] - do_hq_now.long() * hq_cost
+    non_hq_outcome = outcome.bool() & (~can_up_hq)
     perm = torch.argsort(torch.rand(B, T, device=dev), dim=1)
-    exec_build, gold1 = _greedy(outcome.bool(), o['build_cost'], o['gold'], perm, T)
+    exec_build, gold1 = _greedy(non_hq_outcome, o['build_cost'], gold_after_hq, perm, T)
+
+    do_hq_tok = torch.zeros(B, T, dtype=torch.bool, device=dev)
+    rows_hq = do_hq_now.nonzero(as_tuple=True)[0]
+    if rows_hq.numel() > 0:
+        do_hq_tok[rows_hq, hq_tok[rows_hq]] = True
+    exec_all = exec_build | do_hq_tok
 
     # post-build quantities
-    wc_pb = torch.where(exec_build, o['wc_after'], o['wc_cur'])
+    wc_pb = torch.where(exec_all, o['wc_after'], o['wc_cur'])
     surplus_pb = (o['stat_cnt'] - wc_pb).clamp(min=0)
-    owner_me_pb = o['owner_me'] | (exec_build & o['build_new'])
-    hq_up = (exec_build & o['can_up_hq']).any(1)
-    hq_after = (o['hq_level'] + hq_up.long()).clamp(max=HQ_MAXLEVEL)
+    owner_me_pb = o['owner_me'] | (exec_all & o['build_new'])
+    hq_after = (o['hq_level'] + do_hq_now.long()).clamp(max=HQ_MAXLEVEL)
 
     # ---------------- MOVE (T2) ----------------
+    # While committed only free moves are allowed: targets restricted to our own
+    # building tokens (the HQ is always one, so a surplus source is never starved).
+    # Sources still require surplus (valid_src), unchanged.
     valid_src = o['tmask'] & (surplus_pb > 0) & (MOVE_COST * surplus_pb <= gold1[:, None])
+    tgt_allowed = torch.where(committed[:, None], o['tmask'] & owner_me_pb, o['tmask'])
     logits = t2_logits_sources(t2net, h1, o['extra4'], surplus_pb, o['tok_dist'],
                                o['normx'], o['normy'], o['tmask'], valid_src)
+    logits = logits.masked_fill(~tgt_allowed[:, None, :], -1e9)
     logp_tok = F.log_softmax(logits, dim=2)                       # [B,src,tok]
     src_idx = torch.arange(T, device=dev)[None, :].expand(B, T)
     tgt = src_idx.clone()                                         # default: self (no move)
@@ -384,6 +426,8 @@ def sample_policy(t1net, t2net, o, N):
     cats = torch.arange(4, device=dev)
     cap = env_traincap(t1net, hq_after)
     tmask_train = (cats[None, :] <= cap[:, None]) & (cats[None, :] * TRAIN_COST <= gold2[:, None])
+    # while committed: no training -> only category 0 allowed
+    tmask_train = torch.where(committed[:, None], cats[None, :] == 0, tmask_train)
     tl_m = tl.masked_fill(~tmask_train, -1e9)
     logp_tr = F.log_softmax(tl_m, dim=1)
     train_cat = torch.multinomial(logp_tr.exp(), 1).squeeze(1)
@@ -391,17 +435,22 @@ def sample_policy(t1net, t2net, o, N):
 
     old_logp = build_logp + move_logp + train_logp
 
-    # ---------------- build env action tensors ----------------
+    # ---------------- env action tensors ----------------
     tok_ids = o['tok_ids']
     build_env = torch.zeros(B, N, dtype=torch.bool, device=dev)
     rb, tb = exec_build.nonzero(as_tuple=True)
     build_env[rb, tok_ids[rb, tb]] = True
+    force_build_env = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    if rows_hq.numel() > 0:                                       # forced (committed) HQ upgrade
+        hq_region = tok_ids.gather(1, hq_tok[:, None]).squeeze(1)
+        force_build_env[rows_hq, hq_region[rows_hq]] = True
     move_env = torch.full((B, N), -1, dtype=torch.long, device=dev)
     rm, sm = exec_move.nonzero(as_tuple=True)
     src_reg = tok_ids[rm, sm]
     tgt_reg = tok_ids[rm, tgt[rm, sm]]
     move_env[rm, src_reg] = tgt_reg
-    action = {'build': build_env, 'move': move_env, 'train': train_cat}
+    action = {'build': build_env, 'move': move_env, 'train': train_cat,
+              'force_build': force_build_env}
 
     store = dict(
         t1=o['t1'], glob=o['glob'], tmask=o['tmask'],
@@ -410,9 +459,10 @@ def sample_policy(t1net, t2net, o, N):
         build_mask=build_mask, build_outcome=outcome,
         train_mask=tmask_train, train_cat=train_cat,
         valid_src=valid_src, tgt=tgt, surplus_pb=surplus_pb,
+        tgt_allowed=tgt_allowed,
         old_logp=old_logp,
     )
-    return action, store, old_logp
+    return action, store, old_logp, new_commit
 
 
 _TRAINCAP = None
@@ -472,6 +522,7 @@ def evaluate_policy(t1net, t2net, b):
     logits = t2_logits_sources(t2net, h1, b['extra4'], b['surplus_pb'],
                                b['tok_dist'], b['normx'], b['normy'],
                                b['tmask'], b['valid_src'])
+    logits = logits.masked_fill(~b['tgt_allowed'][:, None, :], -1e9)
     logp_tok = F.log_softmax(logits, dim=2)
     vs = b['valid_src'].float()
     move_logp = (logp_tok.gather(2, b['tgt'][:, :, None]).squeeze(2) * vs).sum(1)
@@ -613,53 +664,201 @@ def sample_opponents(n, pool_wr, gen, floor=0.05):
     return torch.multinomial(probs, n, replacement=True, generator=gen)
 
 
-def rusher_action(env, side):
-    """Scripted fixed opponent embodying a pure 'rush' strategy (a batched port of
-    the supplied rush bot): never builds or upgrades; trains 1 warrior/turn; once
-    >=6 non-moving warriors have gathered at its HQ, hurls them at the enemy HQ
-    (the per-region move keeps the HQ's work_cap=1 worker and sends the rest).
-    Returns a full-batch action dict; the caller copies only its assigned rows."""
-    B, N, dev = env.B, env.N, env.device
-    my_hq = env.hq_region[:, side]            # [B]
-    opp_hq = env.hq_region[:, 1 - side]       # [B]
-    sd = env.slot_side[None, :].expand(B, env.W)
-    stat = (env.w_hp > 0) & (sd == side) & (~env.w_move)
-    hq_cnt = env._scatter_region(stat).gather(1, my_hq[:, None]).squeeze(1)   # [B]
-
-    move = torch.full((B, N), -1, dtype=torch.long, device=dev)
-    rows = (hq_cnt >= 6).nonzero(as_tuple=True)[0]
-    if rows.numel() > 0:
-        move[rows, my_hq[rows]] = opp_hq[rows]
-    return {'build': torch.zeros(B, N, dtype=torch.bool, device=dev),
-            'move': move,
-            'train': torch.ones(B, dtype=torch.long, device=dev)}   # env caps by cap/gold
-
-
 # Unified opponent index 0 is the fixed rusher; net snapshot i is unified index i+1.
 RUSHER_IDX = 0
 
+# rush-bot strategy knobs (mirror rush_bot.py).
+RUSH_SIZE = 6               # warriors massed at home before the wave launches
+KEEP_HOME = 1               # workers kept home when the wave launches / while sieging
+PASSIVE_UPGRADE_TURN = 100  # passive opponent by this turn -> economy/UPGRADE
+SIEGE_MARGIN = 20           # turns past ETA before a launched wave is "spent"
+_MODE_MASS, _MODE_RUSH_SENT, _MODE_UPGRADE = 0, 1, 2
 
-def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev):
+
+class RusherState:
+    """Per-game persistent state for the scripted rush opponent -- a batched port of
+    rush_bot.py's Brain state machine. All tensors are [B]; ``reset_rows`` clears a
+    game's state at its episode boundary. Not checkpointed: episodes never resume
+    across runs (the env is freshly reset on resume), so a fresh state always aligns
+    with a fresh env."""
+
+    def __init__(self, B, device):
+        self.mode = torch.zeros(B, dtype=torch.long, device=device)            # MASS
+        self.send_turn = torch.full((B,), -1, dtype=torch.long, device=device)  # None
+        self.opp_attacked = torch.zeros(B, dtype=torch.bool, device=device)
+        self.HQ_WCAP = torch.tensor(fe.HQ_WCAP, device=device)
+        self.HQ_TRAINCAP = torch.tensor(fe.HQ_TRAINCAP, device=device)
+        self.HQ_UPCOST = torch.tensor(fe.HQ_UPCOST, device=device)
+        self.HQ_HP = torch.tensor(fe.HQ_HP, device=device)
+
+    def reset_rows(self, rows):
+        self.mode[rows] = _MODE_MASS
+        self.send_turn[rows] = -1
+        self.opp_attacked[rows] = False
+
+
+def rusher_action(env, side, rstate):
+    """Scripted fixed opponent: a batched port of rush_bot.py. State machine over
+    MASS (mass RUSH_SIZE warriors at home, defend an inbound attack, then launch the
+    wave once the opponent commits to economy or has attacked), RUSH_SENT (the wave
+    is marching -- keep one worker home for income), and UPGRADE (pure economy: keep
+    the HQ work slots filled and pour gold into HQ upgrades; also the fallback once an
+    early rush is spent or the opponent stays passive). Persistent per-game state
+    lives in ``rstate`` (reset at episode boundaries). Returns a full-batch action
+    dict (build / move / train / force_build); the caller copies only its rows.
+    The HQ upgrade is emitted on the ``force_build`` channel so it bypasses the
+    env's free-worker build gating, matching rush_bot's "upgrade whenever a friendly
+    is home, no enemy is home, and gold suffices"."""
+    B, N, dev = env.B, env.N, env.device
+    W, T = env.W, env.mb.T
+    opp = 1 - side
+    me_own = OWN_LEFT if side == 0 else OWN_RIGHT
+    op_own = OWN_RIGHT if side == 0 else OWN_LEFT
+    turn = env.day                                       # [B] per-game turn
+    my_hq = env.hq_region[:, side]                       # [B]
+    opp_hq = env.hq_region[:, opp]                       # [B]
+
+    sd = env.slot_side[None, :].expand(B, W)
+    alive = env.w_hp > 0
+    mine = alive & (sd == side)
+    enemy = alive & (sd == opp)
+    my_count = mine.sum(1)                               # [B]
+    stat_mine = mine & (~env.w_move)
+
+    my_reg = env._scatter_region(mine)                   # [B,N]
+    opp_reg = env._scatter_region(enemy)                 # [B,N]
+    home_stat = env._scatter_region(stat_mine).gather(1, my_hq[:, None]).squeeze(1)
+    my_at_hq = my_reg.gather(1, my_hq[:, None]).squeeze(1)
+    away_count = my_count - my_at_hq
+    opp_at_ownhq = opp_reg.gather(1, opp_hq[:, None]).squeeze(1)
+    opp_off_base = enemy.sum(1) > opp_at_ownhq           # opp warrior off its HQ
+    opp_at_myhq = opp_reg.gather(1, my_hq[:, None]).squeeze(1)
+    opp_has_base = ((env.b_owner == op_own) & (env.b_kind == KIND_BASE)).any(1)
+    enemy_hq_alive = env.b_owner.gather(1, opp_hq[:, None]).squeeze(1) == op_own
+    hq_level = env.b_level.gather(1, my_hq[:, None]).squeeze(1).clamp(max=HQ_MAXLEVEL)
+
+    # ---- distances (in turns) via the token travel table ----
+    tok = env.mb.token_ids                              # [B,T] sorted ascending
+    tt = env.mb.travel_turns                            # [B,N,T]
+
+    def tok_idx(region):                                # region [B] -> token index [B]
+        q = region[:, None].contiguous()
+        return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
+
+    opp_hq_ti = tok_idx(opp_hq)
+    my_hq_ti = tok_idx(my_hq)
+    eta = tt.gather(1, my_hq[:, None, None].expand(B, 1, T)).squeeze(1) \
+            .gather(1, opp_hq_ti[:, None]).squeeze(1)   # [B] dist my_hq -> opp_hq
+    defend_hops = torch.clamp((eta + 1) // 2, min=3)
+    tt_to_myhq = tt.gather(2, my_hq_ti[:, None, None].expand(B, N, 1)).squeeze(2)  # [B,N]
+    w_dist = tt_to_myhq.gather(1, env.w_region)         # [B,W] dist of each warrior -> my_hq
+    off_opphq = env.w_region != opp_hq[:, None]
+    enemy_threat = (enemy & off_opphq & (w_dist <= defend_hops[:, None])).any(1)  # [B]
+
+    # ---- transitions ----
+    rstate.opp_attacked |= enemy_threat
+    mode = rstate.mode
+    to_up_passive = (mode == _MODE_MASS) & (turn >= PASSIVE_UPGRADE_TURN) \
+        & (~opp_has_base) & (~rstate.opp_attacked) & (~enemy_threat)
+    mode = torch.where(to_up_passive, torch.full_like(mode, _MODE_UPGRADE), mode)
+    st = rstate.send_turn
+    spent = (my_count == 0) \
+        | ((away_count == 0) & (st >= 0) & (turn > st + 1)) \
+        | ((st >= 0) & (turn > st + eta + SIEGE_MARGIN))
+    to_up_spent = (mode == _MODE_RUSH_SENT) & enemy_hq_alive & spent
+    mode = torch.where(to_up_spent, torch.full_like(mode, _MODE_UPGRADE), mode)
+
+    gold = env.gold[:, side]
+    traincap = rstate.HQ_TRAINCAP[hq_level]
+    build = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    move = torch.full((B, N), -1, dtype=torch.long, device=dev)
+    force = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    train = torch.zeros(B, dtype=torch.long, device=dev)
+
+    # ---- MASS: launch the wave when ready, else mass toward RUSH_SIZE ----
+    is_mass = mode == _MODE_MASS
+    ready = is_mass & (~enemy_threat) & (home_stat >= RUSH_SIZE) \
+        & (opp_has_base | rstate.opp_attacked)
+    lrows = ready.nonzero(as_tuple=True)[0]
+    if lrows.numel() > 0:
+        # per-region move keeps the HQ's work_cap (=1 at level 1) worker home and
+        # sends the rest at the enemy HQ -- matches rush_bot's send-all-but-KEEP_HOME.
+        move[lrows, my_hq[lrows]] = opp_hq[lrows]
+    train_mass = is_mass & (~ready) & (my_count < RUSH_SIZE)
+    n_mass = torch.minimum(torch.minimum(traincap, (RUSH_SIZE - my_count).clamp(min=0)),
+                           gold // TRAIN_COST)
+    train = torch.where(train_mass, n_mass, train)
+
+    # ---- RUSH_SENT: keep one worker home for income ----
+    is_rs = mode == _MODE_RUSH_SENT
+    train_rs = is_rs & (my_at_hq < KEEP_HOME)
+    n_rs = torch.minimum(torch.minimum(traincap, (KEEP_HOME - my_at_hq).clamp(min=0)),
+                         gold // TRAIN_COST)
+    train = torch.where(train_rs, n_rs, train)
+
+    # ---- UPGRADE: keep the work slots filled, pour gold into the HQ ----
+    is_up = mode == _MODE_UPGRADE
+    work_cap = rstate.HQ_WCAP[hq_level]
+    friendly_home = my_at_hq > 0
+    enemy_at_home = opp_at_myhq > 0
+    hq_can_up = hq_level < HQ_MAXLEVEL
+    hq_upcost = rstate.HQ_UPCOST[(hq_level + 1).clamp(max=HQ_MAXLEVEL)]
+    do_up = is_up & friendly_home & (~enemy_at_home) & hq_can_up & (gold >= hq_upcost)
+    # heal a maxed, damaged HQ (rush_bot keeps a 200-gold cushion past the heal cost)
+    hq_hp = env.b_hp.gather(1, my_hq[:, None]).squeeze(1)
+    hq_maxhp = rstate.HQ_HP[hq_level]
+    do_heal = is_up & friendly_home & (~enemy_at_home) & (~hq_can_up) \
+        & (hq_hp < hq_maxhp) & (gold >= HQ_HEAL + 200)
+    do_hq = do_up | do_heal
+    hrows = do_hq.nonzero(as_tuple=True)[0]
+    if hrows.numel() > 0:
+        force[hrows, my_hq[hrows]] = True
+    # the env charges the build (HQ upgrade) before training, so size training from
+    # the gold left after the upgrade to avoid driving gold negative.
+    spend = torch.where(do_up, hq_upcost,
+                        torch.where(do_heal, torch.full_like(gold, HQ_HEAL),
+                                    torch.zeros_like(gold)))
+    gold_after = gold - spend
+    train_up = is_up & (my_at_hq < work_cap)
+    n_up = torch.minimum(torch.minimum(traincap, (work_cap - my_at_hq).clamp(min=0)),
+                         gold_after // TRAIN_COST)
+    train = torch.where(train_up, n_up, train)
+
+    # ---- commit the launch transition ----
+    rstate.mode = torch.where(ready, torch.full_like(mode, _MODE_RUSH_SENT), mode)
+    rstate.send_turn = torch.where(ready, turn, st)
+    return {'build': build, 'move': move, 'train': train, 'force_build': force}
+
+
+def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev, rstate):
     """Sample opponent actions, grouping batch slots by their assigned opponent so
     each opponent runs once over its subset of games. Unified index 0 is the fixed
-    scripted rusher; index p>=1 maps to net snapshot pool_t1[p-1]/pool_t2[p-1]."""
+    scripted rusher (see rusher_action); index p>=1 maps to net snapshot
+    pool_t1[p-1]/pool_t2[p-1]. Returns (action, new_hq_commit) -- the rusher never
+    commits."""
     build_full = torch.zeros(B, N, dtype=torch.bool, device=dev)
     move_full = torch.full((B, N), -1, dtype=torch.long, device=dev)
     train_full = torch.zeros(B, dtype=torch.long, device=dev)
+    force_full = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    commit_full = torch.zeros(B, dtype=torch.bool, device=dev)
     for p in torch.unique(opp_assign).tolist():
         rows = (opp_assign == p).nonzero(as_tuple=True)[0]
         if p == RUSHER_IDX:
-            act = rusher_action(env, side)
+            act = rusher_action(env, side, rstate)
             build_full[rows] = act['build'][rows]
             move_full[rows] = act['move'][rows]
             train_full[rows] = act['train'][rows]
+            force_full[rows] = act['force_build'][rows]
         else:
             sub = slice_obs(o_op, rows)
-            act, _, _ = sample_policy(pool_t1[p - 1], pool_t2[p - 1], sub, N)
+            act, _, _, ncommit = sample_policy(pool_t1[p - 1], pool_t2[p - 1], sub, N)
             build_full[rows] = act['build']
             move_full[rows] = act['move']
             train_full[rows] = act['train']
-    return {'build': build_full, 'move': move_full, 'train': train_full}
+            force_full[rows] = act['force_build']
+            commit_full[rows] = ncommit
+    return ({'build': build_full, 'move': move_full, 'train': train_full,
+             'force_build': force_full}, commit_full)
 
 
 def train(cfg: Config, device=None, seed=0, log_every=1):
@@ -756,6 +955,10 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     # persists across iterations; reset to 0 per game at episode boundaries.
     prev_take = torch.zeros(cfg.B, env.mb.T, 2, device=device)
 
+    # per-game state for the scripted rush opponent (index 0). Fresh, not
+    # checkpointed: episodes never resume across runs (env is reset on resume).
+    rstate = RusherState(cfg.B, device)
+
     for it in range(start_iter, cfg.iters):
         # ---- checkpoint before starting this iter (for crash-safe resume) ----
         save_ckpt(cfg.ckpt_path, {
@@ -784,12 +987,16 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         for s in range(steps):
             o_ag = extract(env, 0)
             with torch.no_grad():
-                act_ag, store, _ = sample_policy(actor_t1, actor_t2, o_ag, N)
+                act_ag, store, _, ncommit_ag = sample_policy(actor_t1, actor_t2, o_ag, N)
                 val = critic.value(o_ag['t1'], o_ag['glob'], o_ag['tmask'])
                 o_op = extract(env, 1)
-                act_op = opponent_actions(pool_t1, pool_t2, o_op, opp_assign,
-                                          env, 1, cfg.B, N, device)
+                act_op, ncommit_op = opponent_actions(pool_t1, pool_t2, o_op, opp_assign,
+                                                      env, 1, cfg.B, N, device, rstate)
             env.step({'left': act_ag, 'right': act_op})
+            # carry the HQ-upgrade commitment to next turn (regen resets it for
+            # finished games below).
+            env.hq_commit[:, 0] = ncommit_ag
+            env.hq_commit[:, 1] = ncommit_op
             r, done = reward_done(env)
             # gold-production change this turn (per 거점, [me, opp]); label for o_ag
             cur_take = env.token_take(0)
@@ -821,6 +1028,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 env.regen(done)
                 # new map -> no prior production; baseline the aux delta at 0
                 prev_take[drows] = 0
+                # restart the scripted rusher's state machine for the new games
+                rstate.reset_rows(drows)
 
         with torch.no_grad():
             o_ag = extract(env, 0)
@@ -842,8 +1051,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         # ---- flatten ----
         keys = ['t1', 'glob', 'tmask', 'extra4', 'tok_dist', 'normx', 'normy',
                 'build_mask', 'build_outcome', 'train_mask', 'train_cat',
-                'valid_src', 'tgt', 'surplus_pb', 'old_logp', 'adv', 'ret', 'value',
-                'gold_aux']
+                'valid_src', 'tgt', 'surplus_pb', 'tgt_allowed', 'old_logp',
+                'adv', 'ret', 'value', 'gold_aux']
         flat = {k: torch.cat([buf[t][k] for t in range(steps)], dim=0) for k in keys}
         Ntot = flat['t1'].shape[0]
         a = flat['adv']

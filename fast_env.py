@@ -303,6 +303,9 @@ class FastEnv:
         # per-region realized work 'take' (= gold/WORK_INCOME) from the last work
         # phase, per side; used to build the gold-production aux-prediction label.
         self.last_region_take = z(B, N, 2)
+        # per-side "saving to upgrade the HQ" commitment flag (set by the policy's
+        # HQ-upgrade macro; while True, costly actions are masked off in sampling).
+        self.hq_commit = torch.zeros((B, 2), dtype=torch.bool, device=dev)
 
     def reset(self, mask=None):
         """Reset all games (mask=None) or only the games where mask[b] is True
@@ -323,6 +326,7 @@ class FastEnv:
             t[m] = 0
         self.w_move[m] = False
         self.last_region_take[m] = 0
+        self.hq_commit[m] = False
         rows = m.nonzero(as_tuple=True)[0]
         if rows.numel() > 0:
             rhq = self.mb.hq_right[rows]
@@ -493,6 +497,17 @@ class FastEnv:
                     build_new = build_new & keep
                     can_up = can_up & keep
 
+            # forced builds (the committed HQ-upgrade macro): bypass the n_free
+            # gating and the cap, respecting only the game rules (own warrior present,
+            # no enemy in the region). Still subject to force-staffing below.
+            fb = actions['left' if side == 0 else 'right'].get('force_build') \
+                if apply_agent_rules else None
+            if fb is not None:
+                f_legal = fb & (fr > 0) & (en == 0)
+                build_new = build_new | (f_legal & is_empty & is_strong & (~is_hq))
+                can_up = can_up | (f_legal & is_mine & (self.b_level < maxlev))
+                can_heal = can_heal | (f_legal & is_mine & (self.b_level >= maxlev))
+
             # costs
             upcost = torch.where(
                 self.b_kind == KIND_HQ,
@@ -516,9 +531,11 @@ class FastEnv:
             changed = build_new | can_up | can_heal
             self.b_hp = torch.where(changed, newhp, self.b_hp)
 
-            # auto-staff understaffed new/upgraded bases (heal excluded)
+            # auto-staff understaffed new/upgraded BASES (heal and the HQ excluded:
+            # the HQ is always staffed at home, so it neither needs force-staffing
+            # nor the free-worker gate).
             if apply_agent_rules:
-                self._force_staff(side, me, build_new | can_up)
+                self._force_staff(side, me, (build_new | can_up) & (~self.is_hq_mask))
 
     def _force_staff(self, side, me, nu_mask):
         """For each region in ``nu_mask`` (this side's new builds / upgrades this

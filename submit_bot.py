@@ -61,7 +61,7 @@ OWN_LEFT, OWN_RIGHT = 1, 2
 KIND_HQ, KIND_BASE = 1, 2
 
 TOK_FEAT = 26
-GLOB_FEAT = 11
+GLOB_FEAT = 12          # 11 + HQ-upgrade "turns to afford" (log1p)
 T2_EXTRA = 8
 COST_INF = 1_000_000_000
 BIG = 1 << 20            # unreachable travel marker (matches fast_env)
@@ -284,6 +284,7 @@ class Bot:
         self.weights_path = weights_path
         self.net = None                  # loaded lazily, after the handshake (see _ensure_ready)
         self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
+        self.hq_commit = False           # saving-for-HQ-upgrade macro (see _select_action)
 
         self.my_side = 'A'
         self.me_code = OWN_LEFT
@@ -453,6 +454,7 @@ class Bot:
             plog1p(self.gold[me] / 100), plog1p(self.gold[opp] / 100),
             plog1p(self.income[me] / 10), plog1p(self.income[opp] / 10),
             plog1p(lvl_sum_me / 5), plog1p(lvl_sum_op / 5),
+            self._hq_turns_feature(my_hq_level, my_total),
         ])
 
         # action masking quantities
@@ -497,6 +499,17 @@ class Bot:
         r = 0 if side == 'A' else self.N - 1
         b = self.buildings.get(r)
         return b.level if (b is not None and b.kind == 'HQ' and b.side == side) else 0
+
+    def _hq_turns_feature(self, my_hq_level, my_total):
+        """log1p of 'turns to afford the next HQ upgrade by saving' = max(0, cost-gold)
+        / net_income (last building income - 2*warriors). Denominator floored at 1 so
+        net<=0 reads as 'very far'. 0 when the HQ is already max level."""
+        if my_hq_level >= HQ_MAXLEVEL:
+            return 0.0
+        cost = HQ_UPCOST[my_hq_level + 1]
+        net = self.income[self.my_side] - 2 * my_total
+        need = max(0, cost - self.gold[self.my_side])
+        return float(plog1p(need / max(net, 1)))
 
     # -------------------------------------------------------- action selection
     def _ensure_ready(self):
@@ -557,21 +570,43 @@ class Bot:
             kc = _workcap(b.kind, b.level) if (b is not None and b.side == self.my_side) else 0
             n_free += max(len(ws) - kc, 0)
 
-        # ---------------- BUILD ----------------
+        # ---------------- BUILD (with HQ-upgrade commitment macro) ----------------
+        committed = self.hq_commit
+        my_hq_region = 0 if self.my_side == 'A' else self.N - 1
+        hq_tok = self.tok2idx.get(my_hq_region)
+        hq_can_up = (hq_tok is not None) and bool(o['can_up_hq'][hq_tok])
+        hq_cost = HQ_UPCOST[o['hq_level'] + 1] if hq_can_up else COST_INF
+        hq_afford = hq_can_up and (o['gold'] >= hq_cost)
+
         p_build = 1.0 / (1.0 + np.exp(-head5[:, 0]))
-        # gating: build/upgrade only when >=1 free (non-moving, non-labouring) worker
-        build_mask = o['build_cand'] & (o['build_cost'] <= o['gold']) & (n_free >= 1)
+        # normal builds need a free worker (gating); the HQ token is sampleable even
+        # when unaffordable (to commit to saving). No builds at all while committed.
+        normal_build_mask = o['build_cand'] & (o['build_cost'] <= o['gold']) & (n_free >= 1)
+        if committed:
+            build_mask = np.zeros(T, dtype=bool)
+        else:
+            build_mask = normal_build_mask.copy()
+            if hq_can_up:
+                build_mask[hq_tok] = True
         if sto:
             outcome = (self.rng.random(T) < (p_build * build_mask)).astype(bool)
         else:
             outcome = (p_build > 0.5) & build_mask
+
+        hq_sampled = hq_can_up and bool(outcome[hq_tok])
+        do_hq_now = hq_afford and (committed or hq_sampled)
+        self.hq_commit = (not hq_afford) and (committed or hq_sampled) and hq_can_up
+
+        # HQ upgrade takes gold priority; greedily allocate the rest to non-HQ builds.
+        gold_after_hq = int(o['gold']) - (int(hq_cost) if do_hq_now else 0)
+        non_hq_outcome = outcome.copy()
+        if hq_tok is not None:
+            non_hq_outcome[hq_tok] = False
         prio = np.where(build_mask, p_build, -1.0)
         order = np.argsort(-prio, kind='stable')
-        exec_build, gold1 = self._greedy(outcome, o['build_cost'], o['gold'], order)
+        exec_build, _ = self._greedy(non_hq_outcome, o['build_cost'], gold_after_hq, order)
 
-        # cap new-build/upgrade actions (heal exempt) to n_nonmoving: keep a random
-        # subset if more were chosen, so we never build more bases than we have
-        # workers to staff.
+        # cap new-build/upgrade actions (heal exempt) to n_nonmoving (HQ excluded)
         nu_exec = exec_build & o['nu']
         if int(nu_exec.sum()) > n_nonmoving:
             idx = np.nonzero(nu_exec)[0]
@@ -579,7 +614,11 @@ class Bot:
             capped = np.zeros(T, dtype=bool)
             capped[keep_idx] = True
             exec_build = (exec_build & ~o['nu']) | capped
-            gold1 = int(o['gold']) - int(np.where(exec_build, o['build_cost'], 0.0).sum())
+        gold1 = gold_after_hq - int(np.where(exec_build, o['build_cost'], 0.0).sum())
+
+        # add the committed/forced HQ upgrade (bypasses our gating) for emission + staffing
+        if do_hq_now and hq_tok is not None:
+            exec_build[hq_tok] = True
 
         # plan force-staffing: one nearest surplus warrior per understaffed base
         force_moves, force_ids = self._plan_force_staff(o, exec_build)
@@ -587,11 +626,12 @@ class Bot:
         wc_pb = np.where(exec_build, o['wc_after'], o['wc_cur'])
         surplus_pb = np.maximum(o['stat_cnt'] - wc_pb, 0)
         owner_me_pb = o['owner_me'] | (exec_build & o['build_new'])
-        hq_up = bool(np.any(exec_build & o['can_up_hq']))
-        hq_after = min(o['hq_level'] + (1 if hq_up else 0), HQ_MAXLEVEL)
+        hq_after = min(o['hq_level'] + (1 if do_hq_now else 0), HQ_MAXLEVEL)
 
         # ---------------- MOVE (T2) ----------------
+        # while committed: only free moves -> restrict targets to our own buildings
         valid_src = (surplus_pb > 0) & (MOVE_COST * surplus_pb <= gold1)
+        tgt_allowed = owner_me_pb if committed else np.ones(T, dtype=bool)
         tgt = np.arange(T)
         src_list = np.nonzero(valid_src)[0]
         if src_list.size > 0:
@@ -603,6 +643,8 @@ class Bot:
                 dy = (o['normy'] - o['normy'][si])[:, None]
                 X[j] = np.concatenate([h1, o['extra4'], sf, tv, dx, dy], axis=1)
             logits = self.net.t2(X)                      # [S,T]
+            if committed:
+                logits = np.where(tgt_allowed[None, :], logits, -1e9)
             for j, si in enumerate(src_list):
                 if sto:
                     p = softmax(logits[j])
@@ -625,6 +667,8 @@ class Bot:
         cap = HQ_TRAINCAP[hq_after]
         cats = np.arange(4)
         tmask = (cats <= cap) & (cats * TRAIN_COST <= gold2)
+        if committed:                                    # no training while saving
+            tmask = cats == 0
         tl_m = np.where(tmask, tl, -1e9)
         if sto:
             train_cat = int(self.rng.choice(4, p=softmax(tl_m)))
@@ -643,8 +687,12 @@ class Bot:
         tok = o['tok_ids']
         nu, stat_cnt = o['nu'], o['stat_cnt']
         wc_after, wc_cur = o['wc_after'], o['wc_cur']
+        is_hq_me = o['is_hq_me']
+        # exclude the HQ: it is always staffed at home, so HQ upgrades never trigger
+        # a force-staffing move.
         needing = [ti for ti in range(len(tok))
-                   if exec_build[ti] and nu[ti] and stat_cnt[ti] < wc_after[ti]]
+                   if exec_build[ti] and nu[ti] and stat_cnt[ti] < wc_after[ti]
+                   and not is_hq_me[ti]]
         if not needing:
             return [], set()
         # post-build keep-cap per 거점 region (non-거점 regions keep 0)
