@@ -4,18 +4,18 @@
 
 # ---- rollout / batch ----
 B: 256                  # parallel games stepped together
-steps_per_iter: 250000  # env-steps collected per iteration (horizon = steps_per_iter / B)
-iters: 500              # number of training iterations
+steps_per_iter: 200000  # env-steps collected per iteration (horizon = steps_per_iter / B)
+iters: 250              # number of training iterations
 
 # ---- PPO ----
 gamma: 0.997            # discount
 lam: 0.95               # GAE lambda
 clip: 0.2               # PPO clip range
-lr: 0.0003              # Adam lr (shared by actor & critic optimizers)
-epochs: 4               # PPO epochs per iteration
+lr: 0.0005              # Adam lr (shared by actor & critic optimizers)
+epochs: 5               # PPO epochs per iteration
 minibatch: 4096         # minibatch size
-target_kl: 0.01         # KL early stop: end the iter's epochs once mean approx_kl exceeds this (null disables)
-ent_coef: 0.005         # entropy bonus (actor loss)
+target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
+ent_coef: 0.01         # entropy bonus (actor loss)
 aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
@@ -26,10 +26,11 @@ store_device: cpu       # device for the rollout buffer (cpu keeps GPU mem free)
 # ---- opponent pool ----
 opp_ema_alpha: 0.02     # EMA rate for per-opponent win rate
 pool_add_threshold: 0.6 # snapshot the agent into the pool when min win rate exceeds this
-pool_max_size: 10       # max opponents; oldest is evicted (FIFO) when full
+pool_max_size: 7        # INITIAL total pool cap (incl. rusher+japper); +1 per permanent snapshot
+pool_snapshot_every: 100 # every N iters add a PERMANENT (never-evicted) actor snapshot & bump cap
 opp_sample_floor: 0.05  # minimum sampling weight per opponent
 
 # ---- logging / checkpointing ----
 use_wandb: true
 ckpt_path: checkpoint.pt  # written at the start of every iter; resumed from on restart
-resume: true              # resume from ckpt_path if it exists
+resume: false              # resume from ckpt_path if it exists

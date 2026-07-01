@@ -60,7 +60,7 @@ START_WARRIORS = 3
 OWN_LEFT, OWN_RIGHT = 1, 2
 KIND_HQ, KIND_BASE = 1, 2
 
-TOK_FEAT = 26
+TOK_FEAT = 31           # 14 + 5 arrive + 5 reach + 2 coords + 5 reach-delta vs prev turn
 GLOB_FEAT = 12          # 11 + HQ-upgrade "turns to afford" (log1p)
 T2_EXTRA = 8
 COST_INF = 1_000_000_000
@@ -285,6 +285,7 @@ class Bot:
         self.net = None                  # loaded lazily, after the handshake (see _ensure_ready)
         self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
         self.hq_commit = False           # saving-for-HQ-upgrade macro (see _select_action)
+        self.prev_reach = None           # last turn's raw enemy-reachability [T,5] for the delta feature
 
         self.my_side = 'A'
         self.me_code = OWN_LEFT
@@ -437,7 +438,16 @@ class Bot:
         if self.my_side == 'B':
             normx = -normx
             normy = -normy
-        t1 = np.concatenate([raw24, normx[:, None], normy[:, None]], axis=1)  # [T,26]
+        # per-turn CHANGE in enemy reachability (this turn's raw reach minus last
+        # turn's, per token per horizon); on turn 1 prev is 0 (matches training's
+        # episode-reset baseline). Orientation-invariant (per-token counts).
+        prev = getattr(self, 'prev_reach', None)     # getattr: some harnesses skip __init__
+        if prev is None:
+            prev = np.zeros((T, 5))
+        reach_delta = slog1p(reach - prev)                            # [T,5]
+        self.prev_reach = reach.copy()
+        t1 = np.concatenate([raw24, normx[:, None], normy[:, None], reach_delta],
+                            axis=1)  # [T,31]
 
         # global features
         my_total = sum(1 for w in self.warriors.values() if w.side == me and w.hp > 0)
@@ -576,39 +586,49 @@ class Bot:
             kc = _workcap(b.kind, b.level) if (b is not None and b.side == self.my_side) else 0
             n_free += max(len(ws) - kc, 0)
 
-        # ---------------- BUILD (with HQ-upgrade commitment macro) ----------------
+        # ---------------- BUILD (with level-split HQ-upgrade macro) ----------------
         committed = self.hq_commit
         my_hq_region = 0 if self.my_side == 'A' else self.N - 1
         hq_tok = self.tok2idx.get(my_hq_region)
-        # hq_room: HQ has room to upgrade (ignores occupancy) -> drives saving/sampling.
-        # hq_legal: ALSO satisfies the judge's legality (friendly present, no enemy) ->
-        # gates whether the upgrade may actually be emitted this turn.
+        # hq_room: HQ has room to upgrade (ignores occupancy). hq_legal: ALSO judge-legal
+        # (friendly present, no enemy). Split by target level:
+        #  * level < 3 (reach 2 or 3): base-like -- sampleable only when affordable+legal
+        #    this turn, no commitment -- but still exempt from the free-worker gate.
+        #  * level >= 3 (reach 4 or 5): keep the save-commit macro (sampleable when
+        #    unaffordable / enemy on HQ; deferred emission).
         hq_room = (hq_tok is not None) and bool(o['can_up_hq_room'][hq_tok])
         hq_legal = (hq_tok is not None) and bool(o['can_up_hq'][hq_tok])
         hq_cost = HQ_UPCOST[o['hq_level'] + 1] if hq_room else COST_INF
         hq_afford = hq_room and (o['gold'] >= hq_cost)
+        hq_macro = hq_room and (o['hq_level'] >= 3)         # level 3->4 / 4->5: macro
+        hq_normal = hq_room and (o['hq_level'] < 3)         # level 1->2 / 2->3: base-like
+        hq_normal_ok = hq_normal and hq_legal and (o['gold'] >= hq_cost)
 
         p_build = 1.0 / (1.0 + np.exp(-head5[:, 0]))
-        # normal builds need a free worker (gating); the HQ token is sampleable even
-        # when unaffordable (to commit to saving). No builds at all while committed.
+        # normal builds need a free worker (gating). The HQ token is overridden per the
+        # level rules (worker-gate exempt); macro HQ stays sampleable when unaffordable
+        # (to commit to saving). No builds at all while committed.
         normal_build_mask = o['build_cand'] & (o['build_cost'] <= o['gold']) & (n_free >= 1)
         if committed:
             build_mask = np.zeros(T, dtype=bool)
         else:
             build_mask = normal_build_mask.copy()
-            if hq_room:
-                build_mask[hq_tok] = True
+            if hq_tok is not None:
+                build_mask[hq_tok] = hq_macro or hq_normal_ok
         if sto:
             outcome = (self.rng.random(T) < (p_build * build_mask)).astype(bool)
         else:
             outcome = (p_build > 0.5) & build_mask
 
         hq_sampled = hq_room and bool(outcome[hq_tok])
-        want_hq = hq_afford and (committed or hq_sampled)   # intend + can afford
-        do_hq_now = want_hq and hq_legal                    # emit only if legal this turn
-        # Keep saving while we still intend to upgrade but haven't emitted yet -- whether
-        # because it's unaffordable OR because an enemy is on the HQ (defer, don't drop).
-        self.hq_commit = (committed or hq_sampled) and hq_room and (not do_hq_now)
+        # macro path: intend (committed or sampled) + affordable, emit only if legal;
+        # otherwise keep/enter saving mode (defer while unaffordable or enemy on HQ).
+        sampled_macro = hq_sampled and hq_macro
+        do_hq_macro = hq_afford and (committed or sampled_macro) and hq_legal
+        self.hq_commit = (committed or sampled_macro) and hq_macro and (not do_hq_macro)
+        # normal path: only sampleable when already affordable + legal, so just execute.
+        do_hq_normal = hq_sampled and hq_normal
+        do_hq_now = do_hq_macro or do_hq_normal
 
         # HQ upgrade takes gold priority; greedily allocate the rest to non-HQ builds.
         gold_after_hq = int(o['gold']) - (int(hq_cost) if do_hq_now else 0)
