@@ -25,6 +25,10 @@ def main():
         arrays["t1." + k] = v.detach().cpu().numpy().astype(np.float32)
     for k, v in ck["actor_t2"].items():
         arrays["t2." + k] = v.detach().cpu().numpy().astype(np.float32)
+    # critic net: needed by the submission's lookahead search to value leaf states
+    # (the numpy Net.value() mirrors Critic.value: encoder -> per-token head -> mean).
+    for k, v in ck["critic"].items():
+        arrays["critic." + k] = v.detach().cpu().numpy().astype(np.float32)
     # metadata (numpy scalars)
     arrays["meta.d_model"] = np.int64(d_model)
     arrays["meta.heads"] = np.int64(4)        # ActorT1/ActorT2 default

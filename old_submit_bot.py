@@ -2,15 +2,6 @@
 """Submission bot (numpy-only) — plays the protocol in `sample-code.py`'s I/O
 format, choosing actions by running the trained PPO actor net.
 
-Action selection (default): a shallow lookahead SEARCH. Each turn we sample
-`n_cand` (=5) candidate action sets from the stochastic policy, roll each forward
-`depth` (=2) turns with the actor picking BOTH sides' moves greedily, value the
-leaf state with the critic, and play the best candidate. The forward model is a
-faithful numpy port of testing-tool.py's per-turn resolution (see _sim_step and
-the engine helpers; validated against the judge engine). Pass `--no-search` to
-fall back to a single policy action; search auto-disables if `data.bin` has no
-critic (old exports). The board's all-pairs next-hop table is precomputed once.
-
 Why numpy: the handshake budget is 1000ms, but importing torch alone is ~2.3s.
 numpy imports in ~0.15s, so we run inference with numpy and load the actor
 weights from a torch-free `data.bin` (an .npz produced offline by `export_weights.py`).
@@ -65,10 +56,6 @@ WORK_INCOME = 15
 UPKEEP_PER_WARRIOR = 2
 START_GOLD = 500
 START_WARRIORS = 3
-MAX_DAYS = 200          # game ends after day 200 (testing-tool.py); timeout decided by HQ hp
-WIN_REWARD = 10.0       # terminal reward magnitude (matches ppo_selfplay.reward_done)
-GAMMA_SEARCH = 0.8      # per-turn discount for combining the lookahead's per-turn values
-SEARCH_BUDGET_S = 0.090 # per-turn wall-clock budget for the lookahead (< judge's ~100ms cap)
 
 OWN_LEFT, OWN_RIGHT = 1, 2
 KIND_HQ, KIND_BASE = 1, 2
@@ -118,7 +105,9 @@ def softmax(x, axis=-1):
 class Net:
     """Holds weights and runs the T1 / T2 / encoder forward passes in numpy."""
     def __init__(self, npz):
-        self.W = {k: npz[k] for k in npz.files}
+        # data.bin may now also carry the critic net (for the new search-based bot);
+        # this actor-only bot ignores those arrays and loads just the actor + meta.
+        self.W = {k: npz[k] for k in npz.files if not k.startswith("critic.")}
         self.heads = int(npz["meta.heads"])
         self.d_model = int(npz["meta.d_model"])
 
@@ -170,40 +159,6 @@ class Net:
         head = linear(gelu(linear(h, W["t2.head.0.weight"], W["t2.head.0.bias"])),
                       W["t2.head.2.weight"], W["t2.head.2.bias"])
         return head[..., 0]
-
-    def t1_batch(self, t1s, globs):              # t1s:[K,T,31], globs:[K,GLOB] -> ([K,T,d],[K,T,5])
-        """Batched T1 over K states (fixed T). Same math as t1(), one encoder pass."""
-        W = self.W
-        K, T, _ = t1s.shape
-        x = np.concatenate([t1s, np.broadcast_to(globs[:, None, :], (K, T, GLOB_FEAT))], axis=2)
-        h = self._encoder("t1.enc", x)               # [K,T,d]
-        head = linear(gelu(linear(h, W["t1.head.0.weight"], W["t1.head.0.bias"])),
-                      W["t1.head.2.weight"], W["t1.head.2.bias"])   # [K,T,5]
-        return h, head
-
-    def has_critic(self):
-        return "critic.enc.embed.weight" in self.W
-
-    def value(self, t1, glob):                   # t1:[T,31], glob:[12] -> scalar
-        """Critic state value from t1/glob (no padding: all T tokens valid). Mirrors
-        ppo_selfplay.Critic.value = encoder -> per-token head -> mean over tokens."""
-        W = self.W
-        T = t1.shape[0]
-        x = np.concatenate([t1, np.broadcast_to(glob, (T, GLOB_FEAT))], axis=1)
-        h = self._encoder("critic.enc", x[None])     # [1,T,d]
-        v = linear(gelu(linear(h, W["critic.head.0.weight"], W["critic.head.0.bias"])),
-                   W["critic.head.2.weight"], W["critic.head.2.bias"])   # [1,T,1]
-        return float(v[0, :, 0].mean())
-
-    def value_batch(self, t1s, globs):           # t1s:[K,T,31], globs:[K,GLOB] -> [K]
-        """Batched critic value over K states (fixed T). Same math as value()."""
-        W = self.W
-        K, T, _ = t1s.shape
-        x = np.concatenate([t1s, np.broadcast_to(globs[:, None, :], (K, T, GLOB_FEAT))], axis=2)
-        h = self._encoder("critic.enc", x)           # [K,T,d]
-        v = linear(gelu(linear(h, W["critic.head.0.weight"], W["critic.head.0.bias"])),
-                   W["critic.head.2.weight"], W["critic.head.2.bias"])   # [K,T,1]
-        return v[:, :, 0].mean(axis=1)               # [K]
 
 
 def slog1p(x):
@@ -265,37 +220,6 @@ def compute_travel(N, x, y, adj, tok_ids):
     return tt
 
 
-def compute_next_hop(N, x, y, adj):
-    """All-pairs next-hop matrix nxt[u][t] = the neighbour a warrior at region u
-    steps to when heading for region t, replicating testing-tool.apply_day_movement:
-    pick the adjacent v minimising edge_weight(u,v)+dijkstra_dist(v,t), smallest
-    index on ties. The board is fixed, so this is precomputed once at map load and
-    reused by the lookahead simulator for every rollout step. -1 = no move."""
-    INF = BIG
-    w = np.full((N, N), INF, dtype=np.int64)
-    adj_mask = np.zeros((N, N), dtype=bool)
-    for u in range(N):
-        for v in adj[u]:
-            dx, dy = x[u] - x[v], y[u] - y[v]
-            w[u, v] = math.ceil(math.sqrt(dx * dx + dy * dy))
-            adj_mask[u, v] = True
-    for i in range(N):
-        w[i, i] = 0
-    dist = w.copy()
-    for k in range(N):
-        dist = np.minimum(dist, dist[:, k][:, None] + dist[k, :][None, :])
-    nxt = np.full((N, N), -1, dtype=np.int64)
-    best = np.full((N, N), INF, dtype=np.int64)
-    for nb in range(N):                          # nb ascending -> smallest index wins ties
-        score = w[:, nb][:, None] + dist[nb, :][None, :]
-        cand = adj_mask[:, nb][:, None] & (score < best)
-        best = np.where(cand, score, best)
-        nxt = np.where(cand, nb, nxt)
-    di = np.arange(N)
-    nxt[di, di] = di
-    return nxt
-
-
 # --------------------------------------------------------------------------- #
 # protocol I/O
 # --------------------------------------------------------------------------- #
@@ -354,28 +278,13 @@ def _workcap(kind, level):
     return HQ_WCAP[level] if kind == 'HQ' else BASE_WCAP[level]
 
 
-class St:
-    """A lightweight, cloneable game state for the lookahead simulator. Uses the
-    same Warrior/Building objects as the live tracker so encode/_select_action can
-    run on it unchanged (via Bot._plan's temp-swap)."""
-    __slots__ = ("warriors", "buildings", "gold", "income", "next_sfx")
-
-
 class Bot:
-    def __init__(self, weights_path, stochastic=False, search=True,
-                 n_cand=5, depth=16, time_budget=SEARCH_BUDGET_S):
+    def __init__(self, weights_path, stochastic=False):
         import os  # already loaded at startup; lazy here to keep module-top imports minimal
         self.debug = bool(os.environ.get("BOT_DEBUG"))
         self.stochastic = stochastic
         self.weights_path = weights_path
-        self.search = search             # lookahead search over sampled candidate actions
-        self.n_cand = n_cand             # candidate action sets sampled per turn
-        self.depth = depth               # HARD ceiling on lookahead horizon (safety cap)
-        self.time_budget = time_budget   # per-turn wall-clock budget; horizon grows until the
-                                         # predicted next level would exceed it (None -> fixed depth)
-        self._t0 = 0.0                   # decide() entry timestamp (for the adaptive horizon)
         self.net = None                  # loaded lazily, after the handshake (see _ensure_ready)
-        self.nxt = None                  # all-pairs next-hop for the simulator (see _ensure_ready)
         self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
         self.hq_commit = False           # saving-for-HQ-upgrade macro (see _select_action)
         self.prev_reach = None           # last turn's raw enemy-reachability [T,5] for the delta feature
@@ -501,12 +410,14 @@ class Bot:
             k = int(self.tt[w.region, ti])
             if 1 <= k <= 5:
                 arrive[ti, k - 1] += 1
-        # enemy reachable within 1..5 turns at each token: reach[t,k] = sum over regions
-        # r of cnt_op[r] * (travel(r->t) <= k+1). Vectorized as cnt_op @ (tt <= k) per
-        # horizon (equivalent to the per-region python loop, ~27x faster).
-        reach = np.empty((T, 5))
-        for k in range(1, 6):
-            reach[:, k - 1] = cnt_op @ (self.tt <= k)     # [N] @ [N,T] -> [T]
+        # enemy reachable within 1..5 turns at each token
+        reach = np.zeros((T, 5))
+        for r in range(N):
+            if cnt_op[r] == 0:
+                continue
+            d = self.tt[r, :]               # [T]
+            for k in range(1, 6):
+                reach[:, k - 1] += cnt_op[r] * (d <= k)
 
         tok_dist = self.tt[g, :].astype(np.float64)    # [T,T]
 
@@ -636,576 +547,19 @@ class Bot:
             self.tok2idx = {int(r): i for i, r in enumerate(self.tok_ids)}
             self.net = Net(np.load(self.weights_path))
             self.tt = compute_travel(N, self.x, self.y, self.adj, self.tok_ids)
-            # next-hop table for the lookahead simulator (only if we will actually
-            # search: needs the critic in data.bin). Fixed board -> computed once.
-            self.nxt = compute_next_hop(N, self.x, self.y, self.adj) \
-                if (self.search and self.net.has_critic()) else None
             self.rng = np.random.default_rng()
 
     def decide(self, turn):
         import time as _t
         t0 = _t.perf_counter()
-        self._t0 = t0                    # search horizon budgets against total turn time
         self._ensure_ready()
-        if self.search and self.net.has_critic() and self.nxt is not None:
-            try:
-                cmds = self._decide_search(turn)
-            except Exception as e:   # never crash the match: fall back to a single action
-                if self.debug:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"turn {turn}: search failed ({e!r}); fallback",
-                          file=sys.stderr, flush=True)
-                cmds = self._decide_single(turn)
-        else:
-            cmds = self._decide_single(turn)
+        o = self.encode(turn)
+        plan = self._select_action(o)
+        cmds = self._to_commands(plan, o)
         if self.debug:
             print(f"turn {turn}: decide {(_t.perf_counter()-t0)*1000:.1f}ms",
                   file=sys.stderr, flush=True)
         return cmds
-
-    def _decide_single(self, turn):
-        o = self.encode(turn)
-        plan = self._select_action(o)
-        return self._to_commands(plan, o)
-
-    # ============================ lookahead search =========================== #
-    def _decide_search(self, turn):
-        """Sample `n_cand` candidate action sets from the (stochastic) policy for THIS
-        turn, roll each forward `depth` turns with the actor picking both sides' moves
-        greedily, and play the candidate whose discounted per-turn value is best (see
-        `_rollout_score`: (v1 + g*v2 + ...)/(1 + g + ...), terminal states scored by
-        reward instead of the critic). The current state's encode happens once (shared
-        by all candidates) and is the real prev_reach update; rollouts use cloned states
-        so nothing here leaks into the live tracker until we commit the winner."""
-        K = self.n_cand
-        depth = self.depth
-        my = self.my_side
-        opp = self.opp
-        cur_commit = self.hq_commit
-        orig_sto = self.stochastic
-
-        live = self.build_live_state()
-
-        # --- candidate generation (self is already in the live "my" configuration) ---
-        o0 = self.encode(turn)              # performs the real prev_reach update
-        reach0 = self.prev_reach
-        t1_cache = self.net.t1(o0['t1'], o0['glob'])   # actor T1 is identical for all K samples
-        cands = []                          # (cmds, resulting hq_commit)
-        self.stochastic = True
-        try:
-            for _ in range(K):
-                self.hq_commit = cur_commit          # each sample starts from the real commit
-                plan = self._select_action(o0, t1_cache)
-                cands.append((self._to_commands(plan, o0), self.hq_commit))
-        finally:
-            self.stochastic = orig_sto
-            self.hq_commit = cur_commit
-
-        # --- opponent's simultaneous action this turn (greedy; same for all my cands) ---
-        _, opp_cmds0, _, _ = self._plan(live, opp, turn, False, False, None)
-
-        # --- evaluate all candidates together, batching the net over candidates ---
-        scores = self._rollout_batch(live, cands, opp_cmds0, reach0, turn)
-        best_i = int(np.argmax(scores))
-        best_val = float(scores[best_i])
-
-        # commit the winner's side-effects to the live tracker
-        self.hq_commit = cands[best_i][1]
-        self.prev_reach = reach0
-        if self.debug:
-            print(f"turn {turn}: search {K}x depth{depth} best={best_i} "
-                  f"val={best_val:.3f}", file=sys.stderr, flush=True)
-        return cands[best_i][0]
-
-    def _rollout_score(self, live, cmds, commit, opp_cmds0, reach0, turn):
-        """Score ONE candidate by rolling it forward up to `self.depth` turns and
-        combining the per-turn state values with a geometric discount:
-
-            score = (v1 + g*v2 + g^2*v3 + ... ) / (1 + g + g^2 + ...)      (g=GAMMA_SEARCH)
-
-        where v_t is the critic value of the state t turns ahead (my perspective).
-        If the state t turns ahead is TERMINAL, its terminal reward r_t is used in
-        place of v_t and the rollout stops there (shorter horizons are normalised by
-        their own truncated weight sum -- e.g. terminal at t=1 -> score = r1;
-        terminal at t=2 -> score = (v1 + g*r2)/(1+g)). Extensible to any depth."""
-        st = self._clone_state(live)
-        my, opp = self.my_side, self.opp
-        self._sim_step(st, {my: cmds, opp: opp_cmds0})   # resolve THIS turn (day `turn`)
-        my_prev = reach0
-        my_commit = commit
-        num = den = 0.0
-        w = 1.0
-        for t in range(1, self.depth + 1):
-            r, done = self._sim_reward_done(st, turn + t - 1)   # state = start of day turn+t
-            if done:
-                num += w * r
-                den += w
-                break
-            if t == self.depth:                       # leaf: value only, no move planning
-                v = self._sim_value(st, turn + t, my_prev)
-                num += w * v
-                den += w
-                break
-            # intermediate turn: one my-perspective encode drives both the value AND
-            # the next move (reach threads through my_prev like the live tracker).
-            o, my_c, my_prev, my_commit = self._plan(st, my, turn + t, False,
-                                                     my_commit, my_prev)
-            num += w * self.net.value(o['t1'], o['glob'])
-            den += w
-            _, opp_c, _, _ = self._plan(st, opp, turn + t, False, False, None)
-            self._sim_step(st, {my: my_c, opp: opp_c})
-            w *= GAMMA_SEARCH
-        return num / den if den > 0 else 0.0
-
-    def _rollout_batch(self, live, cands, opp_cmds0, reach0, turn):
-        """Batched-over-candidates rollout with a TIME-ADAPTIVE horizon. Each level:
-        (game step already applied) -> batched critic value v_t for all still-live
-        candidates; then, if we go deeper, batched actor sampling for BOTH sides +
-        batched game step to advance. After each level we estimate the mean per-level
-        cost and stop before the predicted TOTAL turn time would exceed `time_budget`
-        (`self.depth` is a hard ceiling; at least one level always runs). Critic / actor
-        T1 / T2 are each ONE batched net call across all live candidates. Returns the
-        list of discounted-average scores (terminal states scored by reward). This is
-        the batched twin of `_rollout_score` (which stays as the fixed-depth reference)."""
-        import time
-        roll_t0 = time.perf_counter()
-        t0_ref = getattr(self, '_t0', roll_t0)
-        my, opp = self.my_side, self.opp
-        K = len(cands)
-        states = []
-        for cmds, _commit in cands:
-            st = self._clone_state(live)
-            self._sim_step(st, {my: cmds, opp: opp_cmds0})   # resolve THIS turn (day `turn`)
-            states.append(st)
-        my_prev = [reach0] * K
-        my_commit = [c for (_cmds, c) in cands]
-        num = [0.0] * K
-        den = [0.0] * K
-        done = [False] * K
-        w = 1.0
-        t = 0
-        while True:
-            t += 1
-            for i in range(K):                       # terminal check (state = start of day turn+t)
-                if done[i]:
-                    continue
-                r, dn = self._sim_reward_done(states[i], turn + t - 1)
-                if dn:
-                    num[i] += w * r; den[i] += w; done[i] = True
-            active = [i for i in range(K) if not done[i]]
-            if not active:
-                break
-            # value this level (my perspective): one encode drives BOTH the critic value
-            # and (if we continue) the next move. Batched over all live candidates.
-            my_obs = [self._encode_at(states[i], my, turn + t, my_prev[i]) for i in active]
-            t1s = np.stack([o['t1'] for o, _ in my_obs]).astype(np.float32)
-            globs = np.stack([o['glob'] for o, _ in my_obs]).astype(np.float32)
-            h1s, head5s = self.net.t1_batch(t1s, globs)
-            vt = self.net.value_batch(t1s, globs)
-            for j, i in enumerate(active):
-                num[i] += w * float(vt[j]); den[i] += w
-            # ---- stop or go one level deeper? (hard ceiling + adaptive time budget) ----
-            if t >= self.depth:
-                break
-            if self.time_budget is not None:
-                now = time.perf_counter()
-                avg_step = (now - roll_t0) / t                # mean over the t levels done
-                if (now - t0_ref) + avg_step > self.time_budget:  # predicted total after +1
-                    break
-            # advance one turn: batched actor (my then opp) + batched game step
-            my_items = [(states[i], my, my_obs[j][0], (h1s[j], head5s[j]), my_commit[i])
-                        for j, i in enumerate(active)]
-            my_res = self._select_batch(my_items)               # batched T2 over candidates
-            my_cmds = {}
-            for j, i in enumerate(active):
-                my_cmds[i] = my_res[j][0]
-                my_prev[i] = my_obs[j][1]
-                my_commit[i] = my_res[j][1]
-            # opponent (greedy, no reach history / no commit -- matches _rollout_score)
-            opp_obs = [self._encode_at(states[i], opp, turn + t, None) for i in active]
-            t1so = np.stack([o['t1'] for o, _ in opp_obs]).astype(np.float32)
-            globso = np.stack([o['glob'] for o, _ in opp_obs]).astype(np.float32)
-            h1so, head5so = self.net.t1_batch(t1so, globso)
-            opp_items = [(states[i], opp, opp_obs[j][0], (h1so[j], head5so[j]), False)
-                         for j, i in enumerate(active)]
-            opp_res = self._select_batch(opp_items)             # batched T2 over candidates
-            for j, i in enumerate(active):
-                self._sim_step(states[i], {my: my_cmds[i], opp: opp_res[j][0]})
-            w *= GAMMA_SEARCH
-        return [num[i] / den[i] if den[i] > 0 else 0.0 for i in range(K)]
-
-    def _sim_reward_done(self, st, resolved_day):
-        """Terminal test + reward for a simulated state, from my perspective. Mirrors
-        ppo_selfplay.reward_done: a side is out when its HQ is gone; on timeout
-        (resolved_day >= MAX_DAYS) the higher-HP HQ wins. Reward is +/-WIN_REWARD, 0 on
-        a draw. Returns (reward, done)."""
-        my_hq = self._hq_of(st, self.my_side)
-        opp_hq = self._hq_of(st, self.opp)
-        my_alive = my_hq is not None
-        opp_alive = opp_hq is not None
-        if not opp_alive and my_alive:
-            return WIN_REWARD, True
-        if not my_alive and opp_alive:
-            return -WIN_REWARD, True
-        if not my_alive and not opp_alive:
-            return 0.0, True
-        if resolved_day >= MAX_DAYS:
-            if my_hq.hp > opp_hq.hp:
-                return WIN_REWARD, True
-            if my_hq.hp < opp_hq.hp:
-                return -WIN_REWARD, True
-            return 0.0, True
-        return 0.0, False
-
-    def build_live_state(self):
-        st = St()
-        st.warriors = {}
-        for (s, num), w in self.warriors.items():
-            if w.hp <= 0:
-                continue
-            nw = Warrior(s, num, w.region, w.hp)
-            nw.moving = w.moving
-            nw.target = w.target
-            st.warriors[(s, num)] = nw
-        st.buildings = {r: Building(b.region, b.side, b.kind, b.level, b.hp)
-                        for r, b in self.buildings.items()}
-        st.gold = dict(self.gold)
-        st.income = dict(self.income)
-        nsA = max([num for (s, num) in self.warriors if s == 'A'], default=START_WARRIORS) + 1
-        nsB = max([num for (s, num) in self.warriors if s == 'B'], default=START_WARRIORS) + 1
-        st.next_sfx = {'A': nsA, 'B': nsB}
-        return st
-
-    def _clone_state(self, st):
-        ns = St()
-        ns.warriors = {}
-        for key, w in st.warriors.items():
-            nw = Warrior(w.side, w.num, w.region, w.hp)
-            nw.moving = w.moving
-            nw.target = w.target
-            ns.warriors[key] = nw
-        ns.buildings = {r: Building(b.region, b.side, b.kind, b.level, b.hp)
-                        for r, b in st.buildings.items()}
-        ns.gold = dict(st.gold)
-        ns.income = dict(st.income)
-        ns.next_sfx = dict(st.next_sfx)
-        return ns
-
-    def _swap(self, st, side, hq_commit, prev, stochastic=False):
-        """Point self.* at state `st` / perspective `side` so the UNCHANGED inference
-        code (encode/_select_action/_to_commands) can run on it. Returns the saved
-        state to restore with _unswap()."""
-        saved = (self.warriors, self.buildings, self.gold, self.income, self.my_side,
-                 self.me_code, self.opp, self.stochastic, self.hq_commit,
-                 getattr(self, 'prev_reach', None))
-        self.warriors = st.warriors
-        self.buildings = st.buildings
-        self.gold = st.gold
-        self.income = st.income
-        self.my_side = side
-        self.me_code = OWN_LEFT if side == 'A' else OWN_RIGHT
-        self.opp = 'B' if side == 'A' else 'A'
-        self.stochastic = stochastic
-        self.hq_commit = hq_commit
-        self.prev_reach = prev
-        return saved
-
-    def _unswap(self, saved):
-        (self.warriors, self.buildings, self.gold, self.income, self.my_side,
-         self.me_code, self.opp, self.stochastic, self.hq_commit,
-         self.prev_reach) = saved
-
-    def _plan(self, st, side, turn, stochastic, hq_commit, prev):
-        """encode + _select_action + _to_commands for `side` on `st` (temp-swap). Returns
-        (obs, cmds, this-turn raw reach, new hq_commit). Reference (unbatched) path."""
-        saved = self._swap(st, side, hq_commit, prev, stochastic)
-        try:
-            o = self.encode(turn)
-            reach = self.prev_reach
-            plan = self._select_action(o)
-            commit = self.hq_commit
-            cmds = self._to_commands(plan, o)
-            return o, cmds, reach, commit
-        finally:
-            self._unswap(saved)
-
-    def _encode_at(self, st, side, turn, prev):
-        """encode `side`'s obs on `st` (temp-swap). Returns (obs, new reach)."""
-        saved = self._swap(st, side, False, prev)
-        try:
-            o = self.encode(turn)
-            return o, self.prev_reach
-        finally:
-            self._unswap(saved)
-
-    def _build_at(self, st, side, o, t1_cache, hq_commit):
-        """Build phase of action selection for `side` on `st` (temp-swap, greedy).
-        Returns (ctx, new hq_commit); ctx['X'] is the T2 input (or None)."""
-        saved = self._swap(st, side, hq_commit, None)
-        try:
-            ctx = self._select_build(o, t1_cache)
-            return ctx, self.hq_commit
-        finally:
-            self._unswap(saved)
-
-    def _finish_at(self, st, side, o, ctx, logits):
-        """Finish phase (given T2 logits) + _to_commands for `side` on `st`."""
-        saved = self._swap(st, side, False, None)
-        try:
-            plan = self._select_finish(ctx, logits)
-            return self._to_commands(plan, o)
-        finally:
-            self._unswap(saved)
-
-    def _select_batch(self, items):
-        """Batched action selection over several (state, side) at once: run each build
-        phase, evaluate ALL their T2 inputs in ONE net.t2 call (sources concatenated),
-        then finish each. items: list of (st, side, o, t1_cache, hq_commit_in).
-        Returns list of (cmds, new hq_commit) aligned with items."""
-        ctxs, commits = [], []
-        for (st, side, o, cache, cin) in items:
-            ctx, commit = self._build_at(st, side, o, cache, cin)
-            ctxs.append(ctx); commits.append(commit)
-        logits_list = [None] * len(ctxs)
-        have = [k for k, c in enumerate(ctxs) if c['X'] is not None]
-        if have:
-            sizes = [ctxs[k]['X'].shape[0] for k in have]
-            big = np.concatenate([ctxs[k]['X'] for k in have], axis=0)   # [sum S, T, d_in]
-            alllog = self.net.t2(big)                                    # [sum S, T]
-            off = 0
-            for k, s in zip(have, sizes):
-                logits_list[k] = alllog[off:off + s]; off += s
-        out = []
-        for k, (st, side, o, cache, cin) in enumerate(items):
-            cmds = self._finish_at(st, side, o, ctxs[k], logits_list[k])
-            out.append((cmds, commits[k]))
-        return out
-
-    def _sim_value(self, st, turn, prev):
-        """Critic value of `st` from my perspective (self.my_side unchanged)."""
-        sv = (self.warriors, self.buildings, self.gold, self.income,
-              getattr(self, 'prev_reach', None))
-        try:
-            self.warriors = st.warriors
-            self.buildings = st.buildings
-            self.gold = st.gold
-            self.income = st.income
-            self.prev_reach = prev
-            o = self.encode(turn)
-            return self.net.value(o['t1'], o['glob'])
-        finally:
-            (self.warriors, self.buildings, self.gold, self.income,
-             self.prev_reach) = sv
-
-    # -------------------------- forward simulator --------------------------- #
-    # A faithful port of testing-tool.py's per-turn resolution. Phase order:
-    #   upgrades -> moves -> train-charge (per side); then day movement,
-    #   spawn, combat (+turret siege accrual), siege, evening work, upkeep.
-    def _hq_of(self, st, side):
-        r = 0 if side == 'A' else self.N - 1
-        b = st.buildings.get(r)
-        return b if (b is not None and b.kind == 'HQ' and b.side == side) else None
-
-    def _sim_step(self, st, cmds_by_side):
-        train = {}
-        for side in ('A', 'B'):
-            ups, moves, tn = cmds_by_side.get(side, ([], [], 0))
-            self._sim_upgrades(st, side, ups)
-            self._sim_moves(st, side, moves)
-            train[side] = self._sim_train_charge(st, side, tn)
-        self._sim_movement(st)
-        for side in ('A', 'B'):
-            self._sim_spawn(st, side, train[side])
-        siege = self._sim_combat(st)
-        self._sim_siege(st, siege)
-        self._sim_work(st)
-        self._sim_upkeep(st)
-
-    def _sim_upgrades(self, st, side, upgrades):
-        for r in upgrades:
-            b = st.buildings.get(r)
-            if b is None:
-                if r == 0 or r == self.N - 1:      # cannot build on an HQ region
-                    continue
-                if st.gold[side] < BASE_COST[1]:
-                    continue
-                st.gold[side] -= BASE_COST[1]
-                st.buildings[r] = Building(r, side, 'BASE', 1, BASE_HP[1])
-            elif b.side != side:
-                continue
-            elif b.level >= _maxlevel(b.kind):
-                cost = _heal_cost(b.kind)
-                if st.gold[side] < cost:
-                    continue
-                st.gold[side] -= cost
-                b.hp = _maxhp(b.kind, b.level)
-            else:
-                cost = _upgrade_cost(b.kind, b.level)
-                if st.gold[side] < cost:
-                    continue
-                st.gold[side] -= cost
-                b.level += 1
-                b.hp = _maxhp(b.kind, b.level)
-
-    def _sim_moves(self, st, side, moves):
-        for (_s, num, treg) in moves:
-            w = st.warriors.get((side, num))
-            if w is None or w.hp <= 0 or w.moving:
-                continue
-            b = st.buildings.get(treg)
-            cost = 0 if (b is not None and b.side == side) else MOVE_COST
-            if st.gold[side] < cost:
-                continue
-            st.gold[side] -= cost
-            w.moving = True
-            w.target = treg
-
-    def _sim_train_charge(self, st, side, n):
-        if n <= 0:
-            return 0
-        hq = self._hq_of(st, side)
-        if hq is None:
-            return 0
-        n = min(n, HQ_TRAINCAP[hq.level])
-        while n > 0 and n * TRAIN_COST > st.gold[side]:
-            n -= 1
-        st.gold[side] -= n * TRAIN_COST
-        return n
-
-    def _sim_movement(self, st):
-        enemyA = set()      # regions with a B warrior (enemies of A)
-        enemyB = set()      # regions with an A warrior (enemies of B)
-        for w in st.warriors.values():
-            if w.hp <= 0:
-                continue
-            if w.side == 'B':
-                enemyA.add(w.region)
-            else:
-                enemyB.add(w.region)
-        for w in st.warriors.values():
-            if w.hp <= 0 or not w.moving:
-                continue
-            t = w.target
-            if w.region == t:
-                w.moving = False
-                continue
-            eset = enemyA if w.side == 'A' else enemyB
-            if w.region in eset:            # pinned by an enemy in the same region
-                continue
-            nb = int(self.nxt[w.region, t])
-            if nb < 0:
-                continue
-            w.region = nb
-            if w.region == t:
-                w.moving = False
-
-    def _sim_spawn(self, st, side, n):
-        if n <= 0:
-            return
-        hq = self._hq_of(st, side)
-        if hq is None:
-            return
-        whp = HQ_WHP[hq.level]
-        for _ in range(n):
-            num = st.next_sfx[side]
-            st.next_sfx[side] += 1
-            st.warriors[(side, num)] = Warrior(side, num, hq.region, whp)
-
-    def _damage_tick(self, st, region, side):
-        best = None
-        bkey = None
-        for w in st.warriors.values():
-            if w.region != region or w.side != side or w.hp <= 0:
-                continue
-            key = (w.hp, w.num)
-            if bkey is None or key < bkey:
-                bkey = key
-                best = w
-        if best is None:
-            return False
-        best.hp -= 1
-        return True
-
-    def _sim_combat(self, st):
-        counts = {}
-        for w in st.warriors.values():
-            if w.hp > 0:
-                c = counts.setdefault(w.region, [0, 0])
-                c[0 if w.side == 'A' else 1] += 1
-        for r in st.buildings:
-            counts.setdefault(r, [0, 0])
-        siege = {}
-        for region in sorted(counts.keys()):
-            lc, rc = counts[region]
-            b = st.buildings.get(region)
-            b_left = b is not None and b.side == 'A'
-            b_right = b is not None and b.side == 'B'
-            turret = _turret(b.kind, b.level) if b is not None else 0
-            left_present = lc > 0 or b_left
-            right_present = rc > 0 or b_right
-            if not (left_present and right_present):
-                continue
-            left_cap = lc + (turret if b_left else 0)
-            right_cap = rc + (turret if b_right else 0)
-            left_idle = 0
-            for _ in range(left_cap):            # A hits B (lowest hp, then suffix)
-                if not self._damage_tick(st, region, 'B'):
-                    left_idle += 1
-            right_idle = 0
-            for _ in range(right_cap):           # B hits A
-                if not self._damage_tick(st, region, 'A'):
-                    right_idle += 1
-            if b is not None:
-                attacker_idle = right_idle if b_left else left_idle
-                if attacker_idle > 0:
-                    siege[region] = attacker_idle
-        return siege
-
-    def _sim_siege(self, st, siege):
-        destroyed = []
-        for r in sorted(st.buildings.keys()):
-            dmg = siege.get(r, 0)
-            if dmg <= 0:
-                continue
-            b = st.buildings[r]
-            dealt = min(dmg, b.hp)
-            b.hp -= dealt
-            if b.hp <= 0:
-                destroyed.append(r)
-        for r in destroyed:
-            del st.buildings[r]
-
-    def _sim_work(self, st):
-        consumed = set()
-        inc = {'A': 0, 'B': 0}
-        for r in sorted(st.buildings.keys()):
-            b = st.buildings[r]
-            eligible = sorted(
-                (w.num, k) for k, w in st.warriors.items()
-                if w.side == b.side and w.region == r and w.hp > 0 and k not in consumed)
-            take = min(_workcap(b.kind, b.level), len(eligible))
-            for i in range(take):
-                consumed.add(eligible[i][1])
-                inc[b.side] += WORK_INCOME
-        st.gold['A'] += inc['A']
-        st.gold['B'] += inc['B']
-        st.income['A'] = inc['A']
-        st.income['B'] = inc['B']
-
-    def _sim_upkeep(self, st):
-        for side in ('A', 'B'):
-            keys = sorted((k for k, w in st.warriors.items()
-                           if w.side == side and w.hp > 0), key=lambda k: k[1])
-            for k in keys:
-                w = st.warriors[k]
-                if st.gold[side] >= UPKEEP_PER_WARRIOR:
-                    st.gold[side] -= UPKEEP_PER_WARRIOR
-                else:
-                    w.hp -= 1
-        dead = [k for k, w in st.warriors.items() if w.hp <= 0]
-        for k in dead:
-            del st.warriors[k]
 
     def _greedy(self, item, cost, gold, order):
         remaining = int(gold)
@@ -1215,26 +569,10 @@ class Bot:
                 remaining -= int(cost[k]); ex[k] = True
         return ex, remaining
 
-    def _select_action(self, o, t1_cache=None):
-        """Full action selection = build phase + T2 net + finish phase. Split so the
-        T2 pass can be batched across candidates in the search (_select_batch)."""
-        ctx = self._select_build(o, t1_cache)
-        X = ctx['X']
-        logits = self.net.t2(X) if X is not None else None
-        return self._select_finish(ctx, logits)
-
-    def _select_build(self, o, t1_cache=None):
-        # t1_cache = (h1, head5) precomputed by net.t1 for THIS obs. The T1 pass depends
-        # only on o -- so when we sample several candidate actions from one state (search),
-        # we compute it once and reuse it here instead of re-running the actor net.
-        # Runs everything up to (and including) assembling the T2 input X; the actual T2
-        # net call + move/train selection happen in _select_finish (so T2 can be batched).
+    def _select_action(self, o):
         T = len(o['tok_ids'])
         sto = self.stochastic
-        if t1_cache is None:
-            h1, head5 = self.net.t1(o['t1'], o['glob'])
-        else:
-            h1, head5 = t1_cache
+        h1, head5 = self.net.t1(o['t1'], o['glob'])
 
         # Non-moving friendly warriors board-wide (caps builds), and of those the
         # "free" ones not currently labouring -- surplus beyond each region's
@@ -1325,12 +663,12 @@ class Bot:
         owner_me_pb = o['owner_me'] | (exec_build & o['build_new'])
         hq_after = min(o['hq_level'] + (1 if do_hq_now else 0), HQ_MAXLEVEL)
 
-        # ---------------- MOVE (T2 input assembly) ----------------
+        # ---------------- MOVE (T2) ----------------
         # while committed: only free moves -> restrict targets to our own buildings
         valid_src = (surplus_pb > 0) & (MOVE_COST * surplus_pb <= gold1)
         tgt_allowed = owner_me_pb if committed else np.ones(T, dtype=bool)
+        tgt = np.arange(T)
         src_list = np.nonzero(valid_src)[0]
-        X = None
         if src_list.size > 0:
             X = np.empty((src_list.size, T, h1.shape[1] + T2_EXTRA), dtype=np.float32)
             for j, si in enumerate(src_list):
@@ -1339,29 +677,7 @@ class Bot:
                 dx = (o['normx'] - o['normx'][si])[:, None]
                 dy = (o['normy'] - o['normy'][si])[:, None]
                 X[j] = np.concatenate([h1, o['extra4'], sf, tv, dx, dy], axis=1)
-
-        return {
-            'o': o, 'T': T, 'sto': sto, 'head5': head5, 'committed': committed,
-            'exec_build': exec_build, 'wc_pb': wc_pb, 'surplus_pb': surplus_pb,
-            'owner_me_pb': owner_me_pb, 'gold1': gold1, 'hq_after': hq_after,
-            'force_moves': force_moves, 'force_ids': force_ids,
-            'valid_src': valid_src, 'tgt_allowed': tgt_allowed, 'src_list': src_list,
-            'X': X,
-        }
-
-    def _select_finish(self, ctx, logits):
-        """Given the T2 logits (or None if the state has no move-sources), finish move
-        target selection + greedy move allocation + training. Mirrors the original
-        _select_action tail exactly. Returns the plan tuple."""
-        T = ctx['T']; sto = ctx['sto']; committed = ctx['committed']
-        src_list = ctx['src_list']; tgt_allowed = ctx['tgt_allowed']
-        surplus_pb = ctx['surplus_pb']; owner_me_pb = ctx['owner_me_pb']
-        valid_src = ctx['valid_src']; gold1 = ctx['gold1']
-        exec_build = ctx['exec_build']; wc_pb = ctx['wc_pb']; hq_after = ctx['hq_after']
-        force_moves = ctx['force_moves']; force_ids = ctx['force_ids']; head5 = ctx['head5']
-
-        tgt = np.arange(T)
-        if src_list.size > 0:
+            logits = self.net.t2(X)                      # [S,T]
             if committed:
                 logits = np.where(tgt_allowed[None, :], logits, -1e9)
             for j, si in enumerate(src_list):
@@ -1442,14 +758,11 @@ class Bot:
     def _to_commands(self, plan, o):
         exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids = plan
         tok = o['tok_ids']
-        # moves are keyed (side, num, target_region) -- side-agnostic to the warrior
-        # objects, so the same command list drives emission, my-action bookkeeping,
-        # and the lookahead simulator (which operates on cloned state).
         upgrades, moves = [], []
         for t in np.nonzero(exec_build)[0]:
             upgrades.append(int(tok[t]))
         for w, treg in force_moves:          # force-staffing (nearest surplus warrior)
-            moves.append((w.side, w.num, treg))
+            moves.append((w, treg))
         for s in np.nonzero(exec_move)[0]:
             sreg = int(tok[s]); treg = int(tok[int(tgt[s])]); keep = int(wc_pb[s])
             here = [w for w in self.warriors.values()
@@ -1457,14 +770,14 @@ class Bot:
                     and not w.moving and w.region == sreg and id(w) not in force_ids]
             here.sort(key=lambda w: (w.hp, w.num))
             for w in here[keep:]:
-                moves.append((w.side, w.num, treg))
+                moves.append((w, treg))
         return upgrades, moves, int(train_cat)
 
     def emit(self, commands):
         upgrades, moves, train_n = commands
         out = ["COMMAND"]
-        for side, num, treg in moves:
-            out.append(f"MOVE {side}{num} {treg}")
+        for w, treg in moves:
+            out.append(f"MOVE {w.side}{w.num} {treg}")
         for r in upgrades:
             out.append(f"UPGRADE {r}")
         if train_n > 0:
@@ -1489,10 +802,7 @@ class Bot:
                 self.gold[self.my_side] -= _upgrade_cost(b.kind, b.level)
                 b.level += 1
                 b.hp = _maxhp(b.kind, b.level)
-        for side, num, treg in moves:
-            w = self.warriors.get((side, num))
-            if w is None:
-                continue
+        for w, treg in moves:
             b = self.buildings.get(treg)
             cost = 0 if (b is not None and b.side == self.my_side) else MOVE_COST
             self.gold[self.my_side] -= cost
@@ -1618,32 +928,14 @@ class Bot:
 
 def main():
     # Manual argv parse (no argparse) -- supports `--weights X`, `--weights=X`,
-    # `--stochastic`, `--no-search`, `--cand N`, `--depth D` (hard ceiling),
-    # `--budget MS` (per-turn wall-clock budget; the horizon grows adaptively up to it).
-    # Defaults match the submission (data.bin, 5 candidates, adaptive depth <= 16, 90ms).
+    # and `--stochastic`; defaults match the submission (data.bin, argmax).
     weights, stochastic = "data.bin", True
-    search, n_cand, depth = True, 5, 16
-    time_budget = SEARCH_BUDGET_S
     args = sys.argv[1:]
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--stochastic":
             stochastic = True
-        elif a == "--no-search":
-            search = False
-        elif a == "--cand":
-            i += 1
-            if i < len(args):
-                n_cand = int(args[i])
-        elif a == "--depth":
-            i += 1
-            if i < len(args):
-                depth = int(args[i])
-        elif a == "--budget":
-            i += 1
-            if i < len(args):
-                time_budget = float(args[i]) / 1000.0     # milliseconds -> seconds
         elif a == "--weights":
             i += 1
             if i < len(args):
@@ -1651,8 +943,7 @@ def main():
         elif a.startswith("--weights="):
             weights = a.split("=", 1)[1]
         i += 1
-    Bot(weights, stochastic=stochastic, search=search,
-        n_cand=n_cand, depth=depth, time_budget=time_budget).run()
+    Bot(weights, stochastic=stochastic).run()
 
 
 if __name__ == "__main__":
