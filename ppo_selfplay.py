@@ -47,7 +47,7 @@ from fast_env import (OWN_LEFT, OWN_RIGHT, KIND_HQ, KIND_BASE, MOVE_COST,
 
 TOK_FEAT = 31          # 14 scalars + 5 arrive + 5 reach (all log1p) + 2 norm coords
                        #                                   + 5 reach-delta vs prev turn
-GLOB_FEAT = 12         # 11 + HQ-upgrade "turns to afford" (log1p)
+GLOB_FEAT = 15         # 11 + HQ-upgrade "turns to afford" + 거점-count + x/y map-span (log1p)
 T2_EXTRA = 8           # 4 logged + surplus + travel + 2 norm coord diffs
 COST_INF = 1_000_000_000
 
@@ -214,6 +214,20 @@ def extract(env, side, prev_reach=None):
     turns = torch.where(hq_can_up, need / net_income.clamp(min=1).float(),
                         torch.zeros(B, device=glob_t.device))
     glob_t = torch.cat([glob_t, plog1p(turns)[:, None]], dim=1)
+
+    # static map-geometry globals: 거점 count (K+2 tokens) and physical map size.
+    # Spans are over ALL regions; coords are point-symmetric about the origin, so the
+    # zero-padded nonexistent-region slots stay interior and don't skew min/max. The
+    # span is ~2*GEN_L (~21000) and nearly constant across maps; /10000 (the disk
+    # radius) keeps it O(1) like the other globals instead of saturating log1p.
+    n_tok = info['token_mask'].sum(1).float()
+    cx, cy = env.mb.cx.float(), env.mb.cy.float()
+    x_span = cx.max(1).values - cx.min(1).values
+    y_span = cy.max(1).values - cy.min(1).values
+    glob_t = torch.cat([glob_t,
+                        plog1p(n_tok / 7.0)[:, None],
+                        plog1p(x_span / 10000.0)[:, None],
+                        plog1p(y_span / 10000.0)[:, None]], dim=1)
 
     tmask = info['token_mask']
     tok_ids = info['token_ids']

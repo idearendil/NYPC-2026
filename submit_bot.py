@@ -83,7 +83,7 @@ OWN_LEFT, OWN_RIGHT = 1, 2
 KIND_HQ, KIND_BASE = 1, 2
 
 TOK_FEAT = 31           # 14 + 5 arrive + 5 reach + 2 coords + 5 reach-delta vs prev turn
-GLOB_FEAT = 12          # 11 + HQ-upgrade "turns to afford" (log1p)
+GLOB_FEAT = 15          # 11 + HQ-upgrade "turns to afford" + 거점-count + x/y map-span (log1p)
 T2_EXTRA = 8
 COST_INF = 1_000_000_000
 BIG = 1 << 20            # unreachable travel marker (matches fast_env)
@@ -572,6 +572,7 @@ class Bot:
             plog1p(self.income[me] / 10), plog1p(self.income[opp] / 10),
             plog1p(lvl_sum_me / 5), plog1p(lvl_sum_op / 5),
             self._hq_turns_feature(my_hq_level, my_total),
+            *self._geom_glob,
         ])
 
         # action masking quantities
@@ -650,6 +651,14 @@ class Bot:
             self.is_hq[N - 1] = True
             self.tok_ids = np.array(sorted(set(self._strongholds) | {0, N - 1}), dtype=np.int64)
             self.tok2idx = {int(r): i for i, r in enumerate(self.tok_ids)}
+            # static map-geometry globals (거점 count + physical map span), mirroring
+            # extract() in ppo_selfplay: /7 for the count, /10000 (disk radius) for the
+            # near-constant spans so log1p stays O(1). Computed once (fixed board).
+            self._geom_glob = np.array([
+                plog1p(len(self.tok_ids) / 7),
+                plog1p((max(self.x) - min(self.x)) / 10000),
+                plog1p((max(self.y) - min(self.y)) / 10000),
+            ], dtype=np.float64)
             self.net = Net(np.load(self.weights_path))
             self.tt = compute_travel(N, self.x, self.y, self.adj, self.tok_ids)
             # all-pairs next-hop, used by BOTH the lookahead simulator and the opp move-cost
