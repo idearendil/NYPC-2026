@@ -810,6 +810,29 @@ class FastEnv:
         return torch.stack([lt[:, :, me].gather(1, tok_g),
                             lt[:, :, opp].gather(1, tok_g)], dim=2).float()
 
+    def aux_label(self, side: int = 0):
+        """Auxiliary-prediction labels for ``side`` from the CURRENT (post-step)
+        state, i.e. what ``side`` will SEE next turn. Returns:
+          - tok [B,T,6] raw counts: col0 = enemy warriors garrisoned at the 거점,
+            cols1..5 = enemy warriors that can REACH it within 1..5 turns.
+          - opp_gold [B]: the opponent's gold.
+        Both are the same quantities ``observe`` packs as features next turn (op_cnt
+        and reach[19:24]); the caller applies the log transform. Token order matches
+        ``observe``. Padded tokens are ignored by the (tmask-)masked aux loss."""
+        B, N, T = self.B, self.N, self.mb.T
+        dev = self.device
+        opp = 1 - side
+        tok_g = self.mb.token_ids.clamp(max=N - 1)
+        cnt, _ = self._side_counts()
+        op_region_cnt = cnt[:, :, opp]                          # [B,N]
+        garrison = op_region_cnt.gather(1, tok_g).float()       # [B,T]
+        tt = self.mb.travel_turns                              # [B,N,T]
+        reach = torch.empty((B, T, 5), dtype=torch.float32, device=dev)
+        for k in range(1, 6):
+            reach[:, :, k - 1] = (op_region_cnt[:, :, None] * (tt <= k)).sum(1).float()
+        tok = torch.cat([garrison[:, :, None], reach], dim=2)  # [B,T,6]
+        return tok, self.gold[:, opp].float()
+
     # --------------------------------------------------------------- observe
     def observe(self, side: int):
         """Return token features [B,T,F], global features [B,G], and the action

@@ -124,9 +124,11 @@ class ActorT1(nn.Module):
         super().__init__()
         self.enc = Encoder(TOK_FEAT + GLOB_FEAT, d, heads, ff, layers)
         self.head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 5))
-        # auxiliary head: per-token next-turn gold-production change (/WORK_INCOME)
-        # for [me, opp]. Shapes the shared encoder; unused at inference.
-        self.aux = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2))
+        # auxiliary head (per token, 7 dims; shapes the shared encoder, unused at
+        # inference). 0..5 = ln(1 + enemy garrison / reachable-within-1..5-turns) at
+        # this 거점 NEXT turn; 6 = per-token contribution to the GLOBAL opp-gold
+        # target, masked-averaged across tokens (see aux_losses).
+        self.aux = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 7))
         self.d = d
 
     def forward(self, t1, glob, tmask):
@@ -153,9 +155,10 @@ class Critic(nn.Module):
         super().__init__()
         self.enc = Encoder(TOK_FEAT + GLOB_FEAT, d, heads, ff, layers)
         self.head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
-        # auxiliary head: per-token next-turn gold-production change (/WORK_INCOME)
-        # for [me, opp]. Shapes the critic's encoder.
-        self.aux = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2))
+        # auxiliary head (per token, 7 dims; shapes the critic's encoder). Same
+        # targets as ActorT1.aux: 0..5 = ln(1 + enemy garrison / reachable-within-
+        # 1..5-turns) NEXT turn, 6 = per-token piece of the global opp-gold target.
+        self.aux = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 7))
 
     def _encode(self, t1, glob, tmask):
         B, T, _ = t1.shape
@@ -537,9 +540,24 @@ def masked_token_mse(pred, target, tmask):
     return se.sum() / (m.sum().clamp(min=1) * pred.shape[-1])
 
 
+def aux_losses(aux_pred, gold_aux, gold_glob, tmask):
+    """Combined auxiliary loss for the [B,T,7] aux head:
+      - channels 0..5: per-token MSE vs ``gold_aux`` [B,T,6] (enemy garrison +
+        reachable-within-1..5-turns, log1p'd), masked over valid tokens.
+      - channel 6: a GLOBAL scalar per game, formed by masked-averaging the 7th
+        channel across tokens, regressed (MSE) onto ``gold_glob`` [B] = ln(1 +
+        opp_gold/100).
+    Returned as their sum; the caller scales by aux_coef."""
+    tok_loss = masked_token_mse(aux_pred[:, :, :6], gold_aux, tmask)
+    m = tmask.float()
+    gpred = (aux_pred[:, :, 6] * m).sum(1) / m.sum(1).clamp(min=1)      # [B]
+    glob_loss = F.mse_loss(gpred, gold_glob)
+    return tok_loss + glob_loss
+
+
 def evaluate_policy(t1net, t2net, b):
     h1, head5 = t1net(b['t1'], b['glob'], b['tmask'])
-    aux_pred = t1net.aux(h1)                 # [B,T,2] gold-production change pred
+    aux_pred = t1net.aux(h1)                 # [B,T,7] enemy-count + opp-gold aux
     B, T = b['tmask'].shape
 
     # build
@@ -612,9 +630,10 @@ class Config:
     target_kl: Optional[float] = 0.02
     ent_coef: float = 0.005
     vf_coef: float = 0.5
-    # auxiliary task: predict each 거점's next-turn gold-production change
-    # (/WORK_INCOME, for [me, opp]) from the token encodings, on BOTH the actor and
-    # critic. Shapes the encoders with a dense economy signal. 0 disables.
+    # auxiliary task (BOTH actor & critic, shapes the encoders): per-거점, predict
+    # ln(1 + next-turn enemy garrison) and ln(1 + enemy reachable-within-1..5-turns),
+    # plus a GLOBAL ln(1 + opp_gold/100) from the token-averaged 7th aux channel.
+    # aux_coef scales the summed aux loss. 0 disables.
     aux_coef: float = 0.25
     max_grad_norm: float = 1.0
     d_model: int = 64
@@ -624,7 +643,7 @@ class Config:
     pool_add_threshold: float = 0.6  # add agent to pool when min win rate exceeds this
     pool_max_size: int = 7           # INITIAL total pool cap (incl. fixed rusher+japper);
                                      # grows +1 each time a permanent snapshot is added
-    pool_snapshot_every: int = 100   # every N iters, snapshot the current actor as a
+    pool_snapshot_every: int = 80    # every N iters, snapshot the current actor as a
                                      # PERMANENT (never-evicted) opponent and bump the cap
     opp_sample_floor: float = 0.05   # min sampling weight per opponent
     use_wandb: bool = True
@@ -1218,11 +1237,16 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     start_iter = 0
     if cfg.resume and os.path.exists(cfg.ckpt_path):
         ck = torch.load(cfg.ckpt_path, map_location=device, weights_only=False)
-        # strict=False so checkpoints predating the gold-production aux heads still
-        # load (the backbone/policy/critic transfer; the new aux heads start fresh).
-        a1_miss = actor_t1.load_state_dict(ck['actor_t1'], strict=False)
+        # strict=False so checkpoints predating the aux heads still load; also drop
+        # shape-mismatched keys so a checkpoint with the OLD 2-dim aux head (now 7)
+        # transfers its backbone/policy/critic and re-inits the aux head fresh.
+        def _compat(model, sd):
+            cur = model.state_dict()
+            return {k: v for k, v in sd.items()
+                    if k in cur and cur[k].shape == v.shape}
+        a1_miss = actor_t1.load_state_dict(_compat(actor_t1, ck['actor_t1']), strict=False)
         actor_t2.load_state_dict(ck['actor_t2'])
-        c_miss = critic.load_state_dict(ck['critic'], strict=False)
+        c_miss = critic.load_state_dict(_compat(critic, ck['critic']), strict=False)
         try:
             opt_actor.load_state_dict(ck['opt_actor'])
             opt_critic.load_state_dict(ck['opt_critic'])
@@ -1270,11 +1294,6 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         os.environ["WANDB_API_KEY"] = (
             "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")
         run = wandb.init(project="nypc2026-selfplay", config=vars(cfg))
-
-    # per-token realized work 'take' from the previous step, for the gold-production
-    # aux label (Δtake = this turn's production change). Episodes span iters, so this
-    # persists across iterations; reset to 0 per game at episode boundaries.
-    prev_take = torch.zeros(cfg.B, env.mb.T, 2, device=device)
 
     # previous turn's raw enemy-reachability (per side) for the reach-delta token
     # feature; reset to 0 per game at episode boundaries (fresh map = no prior turn).
@@ -1331,10 +1350,12 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             env.hq_commit[:, 0] = ncommit_ag
             env.hq_commit[:, 1] = ncommit_op
             r, done = reward_done(env)
-            # gold-production change this turn (per 거점, [me, opp]); label for o_ag
-            cur_take = env.token_take(0)
-            gold_aux = cur_take - prev_take
-            prev_take = cur_take
+            # auxiliary labels: what the agent (side 0) will SEE next turn -- per
+            # 거점 enemy garrison + reachable-within-1..5-turns, and the opp gold.
+            # Computed on the post-step state (before regen), attached to o_ag.
+            tok_tgt, opp_gold = env.aux_label(0)
+            gold_aux = torch.log1p(tok_tgt)                 # [B,T,6] ln(1+count)
+            gold_glob = torch.log1p(opp_gold / 100.0)       # [B]     ln(1+gold/100)
             if done.any():
                 ep_rewards += float(r[done].sum()); ep_count += int(done.sum())
             rec = {k: v.to(sdev) for k, v in store.items()}
@@ -1342,6 +1363,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             rec['reward'] = r.to(sdev)
             rec['done'] = done.float().to(sdev)
             rec['gold_aux'] = gold_aux.to(sdev)
+            rec['gold_glob'] = gold_glob.to(sdev)
             buf.append(rec)
             if done.any():
                 drows = done.nonzero(as_tuple=True)[0]
@@ -1359,8 +1381,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 opp_assign[drows] = sample_opponents(
                     drows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
                 env.regen(done)
-                # new map -> no prior turn; baseline the aux + reach deltas at 0
-                prev_take[drows] = 0
+                # new map -> no prior turn; baseline the reach deltas at 0
                 prev_reach_ag[drows] = 0
                 prev_reach_op[drows] = 0
                 # restart the scripted opponents' state machines for the new games
@@ -1390,7 +1411,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         keys = ['t1', 'glob', 'tmask', 'extra4', 'tok_dist', 'normx', 'normy',
                 'build_mask', 'build_outcome', 'train_mask', 'train_cat',
                 'valid_src', 'tgt', 'surplus_pb', 'tgt_allowed', 'old_logp',
-                'adv', 'ret', 'value', 'gold_aux']
+                'adv', 'ret', 'value', 'gold_aux', 'gold_glob']
         flat = {k: torch.cat([buf[t][k] for t in range(steps)], dim=0) for k in keys}
         Ntot = flat['t1'].shape[0]
         a = flat['adv']
@@ -1420,7 +1441,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 s2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv_b
                 ploss = -torch.min(s1, s2).mean()
                 eloss = -ent.mean()
-                aux_loss_a = masked_token_mse(aux_a, mb['gold_aux'], mb['tmask'])
+                aux_loss_a = aux_losses(aux_a, mb['gold_aux'], mb['gold_glob'], mb['tmask'])
                 actor_loss = ploss + cfg.ent_coef * eloss + cfg.aux_coef * aux_loss_a
                 opt_actor.zero_grad()
                 actor_loss.backward()
@@ -1430,7 +1451,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 # ---- critic update (value regression + gold-production aux) ----
                 value, aux_c = critic.value_aux(mb['t1'], mb['glob'], mb['tmask'])
                 vloss = F.mse_loss(value, mb['ret'])
-                aux_loss_c = masked_token_mse(aux_c, mb['gold_aux'], mb['tmask'])
+                aux_loss_c = aux_losses(aux_c, mb['gold_aux'], mb['gold_glob'], mb['tmask'])
                 critic_loss = vloss + cfg.aux_coef * aux_loss_c
                 opt_critic.zero_grad()
                 critic_loss.backward()

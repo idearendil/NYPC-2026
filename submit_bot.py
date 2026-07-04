@@ -32,7 +32,10 @@ Key behaviours (identical to training):
 
 The opponent's gold and income are never sent by the protocol; we reconstruct them
 from the visible economy (their builds/upgrades/heals, trains, moves, work income,
-upkeep). This is exact except for rare opponent move-cost edge cases.
+upkeep). Move cost is the only inexact part (the target is hidden): we infer each opp
+warrior's move target from its trajectory using the exact next-hop model -- a new move
+costs 10, and it is refunded once the inferred target is known to be an opp-owned
+building (a free garrison move). See read_turn_result.
 """
 from __future__ import annotations
 
@@ -318,7 +321,7 @@ def read_tokens():
 
 class Warrior:
     __slots__ = ("side", "num", "region", "hp", "moving", "target",
-                 "moved_last", "moved_now")
+                 "moved_last", "moved_now", "tgt_set", "move_chg")
 
     def __init__(self, side, num, region, hp):
         self.side, self.num, self.region, self.hp = side, num, region, hp
@@ -326,6 +329,8 @@ class Warrior:
         self.target = 0
         self.moved_last = False
         self.moved_now = False
+        self.tgt_set = 0            # consistent-target bitmask for the current move (0 = not moving)
+        self.move_chg = False       # this move carries an outstanding (refundable) 10-gold charge
 
 
 class Building:
@@ -375,7 +380,8 @@ class Bot:
         self.stochastic = stochastic
         self.weights_path = weights_path
         self.search = search             # lookahead search over sampled candidate actions
-        self.n_cand = n_cand             # candidate action sets sampled per turn
+        self.n_cand = n_cand             # stochastic opponent replies per turn (+1 argmax);
+                                         # each reply is weighted by its own policy probability
         self.depth = depth               # optional HARD ceiling on the horizon; 0 = UNLIMITED
                                          # (rollout runs as deep as time allows, bounded only by
                                          # the time budget and the game-end terminal at day 200)
@@ -384,6 +390,8 @@ class Bot:
         self._t0 = 0.0                   # decide() entry timestamp (for the adaptive horizon)
         self.net = None                  # loaded lazily, after the handshake (see _ensure_ready)
         self.nxt = None                  # all-pairs next-hop for the simulator (see _ensure_ready)
+        self.tvia = None                 # tvia[a][b] = bitmask of targets whose next hop from a
+                                         # is b; drives opp move-cost target inference (see below)
         self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
         self.hq_commit = False           # saving-for-HQ-upgrade macro (see _select_action)
         self.prev_reach = None           # last turn's raw enemy-reachability [T,5] for the delta feature
@@ -644,10 +652,20 @@ class Bot:
             self.tok2idx = {int(r): i for i, r in enumerate(self.tok_ids)}
             self.net = Net(np.load(self.weights_path))
             self.tt = compute_travel(N, self.x, self.y, self.adj, self.tok_ids)
-            # next-hop table for the lookahead simulator (only if we will actually
-            # search: needs the critic in data.bin). Fixed board -> computed once.
-            self.nxt = compute_next_hop(N, self.x, self.y, self.adj) \
-                if (self.search and self.net.has_critic()) else None
+            # all-pairs next-hop, used by BOTH the lookahead simulator and the opp move-cost
+            # target inference. Fixed board -> computed once.
+            self.nxt = compute_next_hop(N, self.x, self.y, self.adj)
+            # tvia[a][b] = bitmask of targets t whose next hop from a is b (i.e. a step a->b
+            # is consistent with heading to t). Lets the opp-gold reconstruction infer each
+            # opp warrior's move target from its trajectory (see read_turn_result).
+            self.tvia = [dict() for _ in range(N)]
+            for a in range(N):
+                row = self.nxt[a]
+                tv = self.tvia[a]
+                for t in range(N):
+                    nb = int(row[t])
+                    if nb >= 0:
+                        tv[nb] = tv.get(nb, 0) | (1 << t)
             self.rng = np.random.default_rng()
 
     def decide(self, turn):
@@ -679,21 +697,31 @@ class Bot:
 
     # ============================ lookahead search =========================== #
     def _decide_search(self, turn):
-        """1-step MAXIMIN search, repeated as long as time allows:
-          * sample ONE my-action A from the stochastic policy;
-          * sample `n_opp` (=n_cand=5) opponent actions from the stochastic policy;
-          * resolve each pair (A, B_j) for THIS turn -> next state, score it with the
-            critic (my perspective), or the terminal reward if the game ended;
-          * A's value = the MEAN over those n_opp opponent replies (expected value);
-        then play the A with the LARGEST value (max-expected over sampled my-candidates).
+        """1-step search over sampled my-candidates, repeated as long as time allows.
 
-        Optimisations: the actor T1 (encoder) runs ONCE per side and is reused for every
-        sample (T2 / move-target logits still run per sample because the move-source set
-        depends on the sampled build); the n_opp next-state critic values are ONE batched
-        `net.value_batch` call per my-candidate. Sampling goes through the full build->move
-        ->train pipeline with all the real filtering (via `_select_action`)."""
+        This is a SIMULTANEOUS-move game: the opponent commits its commands WITHOUT
+        seeing mine, so a candidate A is scored by its EXPECTED value against the
+        opponent's reply distribution (a plain min / best-response is theoretically
+        wrong here -> too pessimistic). Play the A with the LARGEST expected value.
+
+        Design (variance-reduction / robustness over the plain-mean version):
+          (1) COMMON RANDOM NUMBERS -- the opponent reply set is sampled ONCE and REUSED
+              for every my-candidate A, so comparing A_i vs A_j is against IDENTICAL
+              opponents (far lower comparison variance -> a better pick in the same
+              budget). It also lifts opp sampling out of the per-A loop, freeing budget
+              for more A candidates.
+          (2) PROBABILITY-WEIGHTED OPP SET -- the fixed set is the opponent's argmax reply
+              PLUS `n_cand` stochastic replies (n_cand+1 total, e.g. 6), and A's value is
+              the weighted mean of the per-reply values with each reply weighted by its OWN
+              policy probability `exp(logp)` (the argmax reply included -- weighted by its
+              probability too, not a flat 1). So more-likely opponent replies count more.
+
+        Optimisations: actor T1 (encoder) runs ONCE per side, reused for every sample; the
+        opponent replies are sampled ONCE; each A's next-state critic values are ONE batched
+        `net.value_batch` call. Sampling goes through the full build->move->train pipeline
+        with all the real filtering (via `_select_action`)."""
         import time
-        n_opp = max(self.n_cand, 1)             # opponent samples per my-candidate (=5)
+        n_stoch = max(self.n_cand, 1)           # stochastic opponent replies (+1 argmax)
         my, opp = self.my_side, self.opp
         cur_commit = self.hq_commit
         orig_sto = self.stochastic
@@ -711,6 +739,29 @@ class Bot:
         finally:
             self._unswap(saved)
 
+        # --- (1)+(3) fixed opponent reply set: argmax + n_stoch stochastic, sampled ONCE,
+        # reused for every A; each reply weighted by its own policy probability exp(logp). ---
+        opp_cmds, opp_logp = [], []
+        saved = self._swap(live, opp, False, None, stochastic=False)
+        try:
+            # argmax reply (weighted by its OWN probability, not a flat 1)
+            self.hq_commit = False
+            self.stochastic = False
+            plan, lp = self._select_action(o_opp, t1_opp, return_logp=True)
+            opp_cmds.append(self._to_commands(plan, o_opp)); opp_logp.append(lp)
+            # n_stoch stochastic replies
+            self.stochastic = True
+            for _ in range(n_stoch):
+                self.hq_commit = False
+                plan, lp = self._select_action(o_opp, t1_opp, return_logp=True)
+                opp_cmds.append(self._to_commands(plan, o_opp)); opp_logp.append(lp)
+        finally:
+            self._unswap(saved)
+        # self-normalised probability weights (max-subtracted for numerical stability)
+        lp_arr = np.array(opp_logp, dtype=np.float64)
+        opp_w = np.exp(lp_arr - lp_arr.max())
+        w_sum = float(opp_w.sum())
+
         best_val = -1e30
         best_cmds = None
         best_commit = cur_commit
@@ -720,22 +771,13 @@ class Bot:
         n = 0
         while True:
             n += 1
-            # --- sample one my-action A (self is already the live "my" configuration) ---
+            # sample one my-candidate A (always stochastic)
             self.stochastic = True
             self.hq_commit = cur_commit
             a_cmds = self._to_commands(self._select_action(o_my, t1_my), o_my)
             a_commit = self.hq_commit
-            # --- sample n_opp opponent actions (opp perspective via temp-swap) ---
-            opp_cmds = []
-            saved = self._swap(live, opp, False, None, stochastic=True)
-            try:
-                for _ in range(n_opp):
-                    self.hq_commit = False
-                    opp_cmds.append(self._to_commands(self._select_action(o_opp, t1_opp), o_opp))
-            finally:
-                self._unswap(saved)
-            # --- resolve each pair -> next state; critic value (batched) or terminal reward ---
-            vals = [None] * n_opp
+            # --- resolve A vs each fixed opponent reply; critic value (batched) or terminal ---
+            vals = [None] * len(opp_cmds)
             enc, idx = [], []
             for j, b_cmds in enumerate(opp_cmds):
                 st = self._clone_state(live)
@@ -752,7 +794,8 @@ class Bot:
                 vb = self.net.value_batch(t1s, globs)
                 for k, j in enumerate(idx):
                     vals[j] = float(vb[k])
-            a_val = sum(vals) / len(vals)        # expected value over the sampled opponent replies
+            # probability-weighted expected value over the fixed opponent set
+            a_val = float(np.dot(opp_w, np.asarray(vals, dtype=np.float64)) / w_sum)
             if a_val > best_val:
                 best_val = a_val
                 best_cmds = a_cmds
@@ -764,15 +807,15 @@ class Bot:
                 prev_lvl = now
                 if (now - getattr(self, '_t0', roll_t0)) + max_step > self.time_budget:
                     break
-            elif n >= n_opp:
+            elif n >= n_stoch:
                 break
 
         self.stochastic = orig_sto
         self.hq_commit = best_commit
         self.prev_reach = reach0
         if self.debug:
-            print(f"turn {turn}: search {n} cands x{n_opp} opp (mean)  best_val={best_val:.3f}",
-                  file=sys.stderr, flush=True)
+            print(f"turn {turn}: search {n} cands x{len(opp_cmds)} opp (CRN, prob-wt)  "
+                  f"best_val={best_val:.3f}", file=sys.stderr, flush=True)
         return best_cmds
 
     def _sim_reward_done(self, st, resolved_day):
@@ -1082,13 +1125,16 @@ class Bot:
                 remaining -= int(cost[k]); ex[k] = True
         return ex, remaining
 
-    def _select_action(self, o, t1_cache=None):
+    def _select_action(self, o, t1_cache=None, return_logp=False):
         """Full action selection = build phase + T2 net + finish phase. Split so the
-        T2 pass can be batched across candidates in the search (_select_batch)."""
+        T2 pass can be batched across candidates in the search (_select_batch).
+        With return_logp=True also returns the joint policy log-prob of the sampled
+        action (used to weight opponent replies by their probability in the search)."""
         ctx = self._select_build(o, t1_cache)
         X = ctx['X']
         logits = self.net.t2(X) if X is not None else None
-        return self._select_finish(ctx, logits)
+        plan, logp = self._select_finish(ctx, logits)
+        return (plan, logp) if return_logp else plan
 
     def _select_build(self, o, t1_cache=None):
         # t1_cache = (h1, head5) precomputed by net.t1 for THIS obs. The T1 pass depends
@@ -1150,6 +1196,14 @@ class Bot:
             outcome = (self.rng.random(T) < (p_build * build_mask)).astype(bool)
         else:
             outcome = (p_build > 0.5) & build_mask
+
+        # log-prob of this build Bernoulli sampling path (sampleable tokens only; the
+        # deterministic non-sampleable ones contribute 1). Used to weight opponent
+        # replies by their policy probability in the search. (Argmax path: the same
+        # per-token prob p if built else 1-p, which is max(p,1-p) for the >0.5 choice.)
+        pb = np.clip(p_build, 1e-6, 1.0 - 1e-6)
+        lp_build = float(np.where(build_mask, np.where(outcome, np.log(pb),
+                                                       np.log1p(-pb)), 0.0).sum())
 
         hq_sampled = hq_room and bool(outcome[hq_tok])
         # macro path: intend (committed or sampled) + affordable, emit only if legal;
@@ -1213,7 +1267,7 @@ class Bot:
             'owner_me_pb': owner_me_pb, 'gold1': gold1, 'hq_after': hq_after,
             'force_moves': force_moves, 'force_ids': force_ids,
             'valid_src': valid_src, 'tgt_allowed': tgt_allowed, 'src_list': src_list,
-            'X': X,
+            'X': X, 'lp_build': lp_build,
         }
 
     def _select_finish(self, ctx, logits):
@@ -1228,15 +1282,17 @@ class Bot:
         force_moves = ctx['force_moves']; force_ids = ctx['force_ids']; head5 = ctx['head5']
 
         tgt = np.arange(T)
+        lp_move = 0.0                                    # log-prob of the move-target picks
         if src_list.size > 0:
             if committed:
                 logits = np.where(tgt_allowed[None, :], logits, -1e9)
             for j, si in enumerate(src_list):
+                p = softmax(logits[j])
                 if sto:
-                    p = softmax(logits[j])
                     tgt[si] = self.rng.choice(T, p=p)
                 else:
                     tgt[si] = int(np.argmax(logits[j]))
+                lp_move += float(np.log(max(p[tgt[si]], 1e-12)))
             chosen = logits[np.arange(src_list.size), tgt[src_list]]
         tgt_is_self = tgt == np.arange(T)
         tgt_mine = owner_me_pb[tgt]
@@ -1256,12 +1312,16 @@ class Bot:
         if committed:                                    # no training while saving
             tmask = cats == 0
         tl_m = np.where(tmask, tl, -1e9)
+        sm = softmax(tl_m)
         if sto:
-            train_cat = int(self.rng.choice(4, p=softmax(tl_m)))
+            train_cat = int(self.rng.choice(4, p=sm))
         else:
             train_cat = int(np.argmax(tl_m))
+        lp_train = float(np.log(max(sm[train_cat], 1e-12)))
 
-        return exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids
+        plan = (exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids)
+        logp = ctx['lp_build'] + lp_move + lp_train     # joint policy log-prob of this action
+        return plan, logp
 
     def _plan_force_staff(self, o, exec_build):
         """For each new/upgraded base whose non-moving friendly count is below its
@@ -1431,6 +1491,20 @@ class Bot:
         for w in self.warriors.values():                # MOVE
             w.moved_now = False
         n = int(read_tokens()[1])
+        # Opp move-cost via nxt-path TARGET INFERENCE (exact movement model). Each opp
+        # warrior carries `tgt_set` = the bitmask of targets still consistent with its
+        # current move (the judge always steps along a shortest path via nxt, so a genuine
+        # continuation keeps the set nonempty). A NEW move is charged 10 (target unknown);
+        # a move is FREE iff its target is an opp-owned building, detected when the set
+        # collapses inside `owned` or when the move concludes (stop / re-dispatch) on an
+        # owned building -> the 10 is refunded. This replaces the old euclid re-dispatch
+        # test + land-and-stop refund.
+        owned = 0
+        for b in self.buildings.values():
+            if b.side == opp:
+                owned |= 1 << b.region
+        opp_delta = 0                                    # net opp gold spent on moves this turn
+        moved = set()
         for _ in range(n):
             r = read_tokens()
             s = 'A' if r[0][0] == 'A' else 'B'
@@ -1438,13 +1512,37 @@ class Bot:
             region = int(r[1])
             w = self.warriors.get((s, num))
             if w is not None:
+                old = w.region
                 w.moved_now = True
                 w.region = region
                 if s == self.my_side and w.moving and w.region == w.target:
                     w.moving = False
-        opp_new = sum(1 for w in self.warriors.values()
-                      if w.side == opp and w.moved_now and not w.moved_last)
-        self.gold[opp] -= MOVE_COST * opp_new
+                if s == opp:
+                    moved.add((s, num))
+                    cons = self.tvia[old].get(region, 0)     # targets a step old->region fits
+                    if (not w.moved_last) or (w.tgt_set & cons) == 0:
+                        # NEW move (fresh dispatch, or a re-dispatch: this step fits NO target
+                        # of the previous move). If re-dispatching from an owned building, the
+                        # concluded previous move was free -> refund it before charging anew.
+                        if w.move_chg and (owned >> old) & 1:
+                            opp_delta -= MOVE_COST
+                        opp_delta += MOVE_COST               # charge the new move
+                        w.tgt_set = cons
+                        w.move_chg = True
+                    else:
+                        w.tgt_set &= cons                    # continuation
+                    if w.move_chg and w.tgt_set and (w.tgt_set & ~owned) == 0:
+                        opp_delta -= MOVE_COST               # every possible target owned -> free
+                        w.move_chg = False
+        # opp warriors mid-move that did NOT move this turn -> the move concluded (stopped);
+        # refund if it stopped on an owned building (was a free garrison move).
+        for k, w in self.warriors.items():
+            if w.side == opp and w.tgt_set and k not in moved:
+                if w.move_chg and (owned >> w.region) & 1:
+                    opp_delta -= MOVE_COST
+                w.tgt_set = 0
+                w.move_chg = False
+        self.gold[opp] -= opp_delta
         for w in self.warriors.values():
             w.moved_last = w.moved_now
 
