@@ -1,71 +1,44 @@
 #!/usr/bin/env python3
 """
-japper_bot.py - two-base "japper" expansion bot.
-
-A scripted opponent that opens with a fast double expansion, reads the enemy's
-turn-6 posture, defends an early all-in if it comes, then settles into a
-rally-point war machine. It is deliberately simple and deterministic so it makes
-a stable sparring partner in the self-play opponent pool (mirrored by
-``ppo_selfplay.japper_action``; see that batched port for the RL side).
-
-Strategy (state machine):
-
-  SETUP  : Turn 1 keep one starting warrior home and send the other two to the
-           two nearest EMPTY strongholds (거점) -- one each. The nearer one is
-           reached first: build a base there immediately. The second warrior just
-           waits at its stronghold until turn 6.
-
-  turn 6 : Count the enemy warriors that have LEFT their HQ. If >= 5 (call this
-           group size n) it is very likely an early all-in at our HQ -> DEFENSE.
-           Otherwise -> MAIN (settle the second stronghold as the rally point).
-
-  DEFENSE: Recall the waiting warrior home and train every turn until the HQ
-           garrison reaches n-1 (the returning warrior counts). Once massed,
-           watch the enemy group: if it stalls or veers off toward some other
-           stronghold, or if it crashes into our HQ and is wiped out (garrison +
-           turret hold), transition on -> TRANSITION.
-
-  TRANSITION: Push back out. If >= 2 warriors are home, keep one and send the
-           rest to the nearest empty stronghold; otherwise train up to two first,
-           then send one. When a warrior reaches the stronghold -> MAIN.
-
-  MAIN   : Build a base at the warriors' stronghold: this is the rally point.
-           Thereafter train whenever gold allows and funnel every warrior through
-           the rally point. When the rally holds >= 6, keep one and send five at
-           the nearest enemy base/HQ. If that target falls with >= 5 survivors,
-           chain to the next nearest enemy building; with <= 4 survivors, retreat
-           to the rally and rebuild the wave. Repeat to the end of the game.
-
-Only the Brain state machine and decide() differ from rush_bot.py; the I/O
-protocol, parsing and bookkeeping are the shared boilerplate (mirrors
-sample-code.py / rush_bot.py).
+전략 봇
+1. 시작 시 내 본부와 가까운 거점 2곳에 전사를 보내 기지를 건설한다.
+2. 본부에서 금화가 허락하는 한 계속 전사를 훈련한다.
+3. 훈련된 전사는 "상대 본부와 가장 가까운 내 기지"(집결지)로 보내 모은다.
+   (내 기지가 없으면 본부에서 모은다. 본부에는 노동 담당 1명만 남긴다.)
+4. 집결지에 전사가 6명 모이면 5명을 공격대로 보낸다.
+   - 공격 목표: 상대 기지 중 "그 구역의 상대 전사 수가 가장 적은 곳" 우선,
+     같으면 더 가까운 곳, 그것도 같으면 구역 번호가 작은 곳.
+   - 목표 기지를 파괴하면 다음 기지로 이동, 상대 기지가 전부 없어지면 상대 본부 공격.
+5. 그동안에도 계속 훈련→집결하다가 다시 6명이 모이면 또 5명을 보낸다. (반복)
+6. 본진 방어: 적 전사가 본부 또는 본부 인접 구역에 나타나면, 집결 중이던
+   병사를 즉시 본부로 보내 수비한다. 위협이 사라지면 다시 집결지로 돌아간다.
+   (이미 출격한 공격대는 그대로 공격을 계속한다.)
 """
 from __future__ import annotations
 
+import math
 import sys
-from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import NamedTuple
 
-# ---- constants -------------------------------------------------------------
-MAX_TURN = 200
-START_GOLD = 500
-START_WARRIORS = 3
-MOVE_COST = 10
-TRAIN_COST = 120
-WORK_INCOME = 15
-UPKEEP_PER_WARRIOR = 2
-HQ_MAX_LEVEL = 5
-BASE_MAX_LEVEL = 3
-HQ_HEAL_COST = 1000
-BASE_HEAL_COST = 500
+MAX_TURN = 200          # maximum turn (days)
+START_GOLD = 500        # initial gold
+START_WARRIORS = 3      # initial warriors
+MOVE_COST = 10          # move cost
+TRAIN_COST = 120        # train cost
+WORK_INCOME = 15        # income per warrior
+UPKEEP_PER_WARRIOR = 2  # upkeep per warrior
+HQ_MAX_LEVEL = 5        # HQ max level
+BASE_MAX_LEVEL = 3      # base max level
+HQ_HEAL_COST = 1000     # HQ fix cost
+BASE_HEAL_COST = 500    # base fix cost
 
-# ---- tunable strategy knobs ------------------------------------------------
-RUSH_DETECT_TURN = 6    # turn we read the enemy's posture on
-RUSH_GROUP_MIN = 5      # enemy warriors off their HQ at turn 6 => treat as all-in
-WAVE_SIZE = 5           # warriors sent per attack wave
-WAVE_TRIGGER = 6        # rally garrison that launches a wave (keep 1, send 5)
+# --- 전략 파라미터 ---
+WAVE_TRIGGER = 6        # 본부에 이 인원이 모이면 공격대 출발
+WAVE_SIZE = 5           # 공격대 인원
+GOLD_RESERVE = 30       # 식비 등을 위해 항상 남겨둘 금화
+SETTLE_GIVEUP_TURN = 30 # 이 턴까지 기지 2개를 못 지으면 그냥 훈련 시작
 
 
 class HqLevelEntry(NamedTuple):
@@ -137,6 +110,7 @@ class WarriorId:
 
     @classmethod
     def parse(cls, tok: str) -> "WarriorId":
+        assert tok and tok[0] in ("A", "B")
         return cls(Side.from_char(tok[0]), int(tok[1:]))
 
 
@@ -168,7 +142,10 @@ class Building:
         self.hp = self.current_hp()
 
     def upgrade_cost(self) -> int:
-        return HQ_LEVELS[self.level + 1].upgrade_cost if self.type is BType.HQ else BASE_LEVELS[self.level + 1].cost
+        if self.type is BType.HQ:
+            return HQ_LEVELS[self.level + 1].upgrade_cost
+        else:
+            return BASE_LEVELS[self.level + 1].cost
 
 
 @dataclass
@@ -190,6 +167,8 @@ class GameMap:
 @dataclass
 class GameState:
     gold: int = START_GOLD
+    my_countdown: int = 5
+    opp_countdown: int = 5
     warriors: list[Warrior] = field(default_factory=list)
     buildings: list[Building] = field(default_factory=list)
 
@@ -211,39 +190,37 @@ def make_base(region: int, s: Side) -> Building:
     return Building(region, s, BType.BASE, 1, BASE_LEVELS[1].hp)
 
 
-# ---- I/O -------------------------------------------------------------------
-_token_queue: deque = deque()
+def readln() -> str:
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return line.rstrip("\n")
 
 
-def next_token() -> str:
-    while not _token_queue:
-        line = sys.stdin.readline()
-        if not line:
-            sys.exit(0)
-        line = line.strip()
-        if line == "FINISH":
-            sys.exit(0)
-        if line:
-            _token_queue.extend(line.split())
-    return _token_queue.popleft()
+def read_tokens() -> list[str]:
+    return readln().split()
 
 
 def parse_init() -> tuple[GameMap, GameState]:
     M = GameMap()
-    assert next_token() == "READY"
-    M.my_side = Side.from_word(next_token())
 
-    M.N = int(next_token())
-    M.K = int(next_token())
+    t = read_tokens()
+    assert len(t) >= 2 and t[0] == "READY"
+    M.my_side = Side.from_word(t[1])
 
-    M.x = [int(next_token()) for _ in range(M.N)]
-    M.y = [int(next_token()) for _ in range(M.N)]
-    M.strongholds = sorted(int(next_token()) for _ in range(M.K))
+    t = read_tokens()
+    M.N, M.K = int(t[0]), int(t[1])
+
+    M.x = [int(v) for v in read_tokens()]  # x_0 x_1 ... x_{N-1}
+    M.y = [int(v) for v in read_tokens()]  # y_0 y_1 ... y_{N-1}
+
+    M.strongholds = sorted(int(v) for v in read_tokens())  # K strongholds
 
     M.adj = [[] for _ in range(M.N)]
     for r in range(M.N):
-        deg = int(next_token())
-        M.adj[r] = sorted(int(next_token()) for _ in range(deg))
+        t = read_tokens()  # deg n_1 n_2 ...
+        deg = int(t[0])
+        M.adj[r] = sorted(int(v) for v in t[1:1 + deg])
 
     M.my_hq = M.hq_of(M.my_side)
     M.opp_hq = M.hq_of(M.my_side.opposite)
@@ -253,18 +230,24 @@ def parse_init() -> tuple[GameMap, GameState]:
     for sfx in range(1, START_WARRIORS + 1):
         S.warriors.append(Warrior(WarriorId(M.my_side, sfx), M.my_hq, HQ_LEVELS[1].warrior_hp))
         S.warriors.append(Warrior(WarriorId(opp, sfx), M.opp_hq, HQ_LEVELS[1].warrior_hp))
-    S.buildings.append(Building(0, Side.LEFT, BType.HQ, 1, HQ_LEVELS[1].hp))
-    S.buildings.append(Building(M.N - 1, Side.RIGHT, BType.HQ, 1, HQ_LEVELS[1].hp))
+    S.buildings.append(
+        Building(0, Side.LEFT, BType.HQ, 1, HQ_LEVELS[1].hp)
+    )
+    S.buildings.append(
+        Building(M.N - 1, Side.RIGHT, BType.HQ, 1, HQ_LEVELS[1].hp)
+    )
+
+    print("OK", flush=True)
     return M, S
 
 
 def read_turn_start() -> int | None:
-    t = next_token()
-    if t == "FINISH":
+    line = readln()
+    if line == "FINISH":
         return None
-    assert t == "START"
-    assert next_token() == "TURN"
-    return int(next_token())
+    t = line.split()
+    assert t and t[0] == "START"
+    return int(t[2])
 
 
 def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
@@ -276,7 +259,8 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
         else:
             max_level = HQ_MAX_LEVEL if b.type is BType.HQ else BASE_MAX_LEVEL
             if b.level >= max_level:
-                S.gold -= HQ_HEAL_COST if b.type is BType.HQ else BASE_HEAL_COST
+                cost = HQ_HEAL_COST if b.type is BType.HQ else BASE_HEAL_COST
+                S.gold -= cost
                 b.hp = b.current_hp()
             else:
                 S.gold -= b.upgrade_cost()
@@ -293,17 +277,23 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
 
     S.gold -= TRAIN_COST * submitted.train_n
 
-    assert next_token() == "TURN"
-    next_token()
+    line = readln()
+    if line == "FINISH":
+        sys.exit(0)
+    t = line.split()
+    assert t and t[0] == "TURN"
 
-    assert next_token() == "TIME"
-    next_token(); next_token(); next_token(); next_token()
+    t = read_tokens()
+    S.my_countdown = int(t[2])
+    S.opp_countdown = int(t[4])
 
-    assert next_token() == "UPGRADE"
-    for _ in range(int(next_token())):
-        s_str = next_token()
-        region = int(next_token())
-        s = Side.from_char(s_str[0])
+    # UPGRADE
+    t = read_tokens()  # "UPGRADE N"
+    n = int(t[1])
+    for _ in range(n):
+        r = read_tokens()  # "<A|B> <region>"
+        s = Side.from_char(r[0][0])
+        region = int(r[1])
         b = S.find_building(region)
         if b is None:
             S.buildings.append(make_base(region, s))
@@ -314,79 +304,146 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
             else:
                 b.apply_upgrade()
 
-    assert next_token() == "TRAIN"
-    for _ in range(int(next_token())):
-        wid = WarriorId.parse(next_token())
-        hq_region = M.hq_of(wid.side)
-        hq_b = S.find_building(hq_region)
-        hq_level = hq_b.level if hq_b is not None else 1
-        S.warriors.append(Warrior(wid, hq_region, HQ_LEVELS[hq_level].warrior_hp))
+    # TRAIN
+    t = read_tokens()  # "TRAIN N"
+    n = int(t[1])
+    if n > 0:
+        ids = read_tokens()
+        for i in range(n):
+            wid = WarriorId.parse(ids[i])
+            hq_region = M.hq_of(wid.side)
+            hq_b = S.find_building(hq_region)
+            hq_level = hq_b.level if hq_b is not None else 1
+            S.warriors.append(Warrior(wid, hq_region, HQ_LEVELS[hq_level].warrior_hp))
 
-    assert next_token() == "MOVE"
-    for _ in range(int(next_token())):
-        wid = WarriorId.parse(next_token())
-        region = int(next_token())
+    # MOVE
+    t = read_tokens()  # "MOVE N"
+    n = int(t[1])
+    for _ in range(n):
+        r = read_tokens()
+        wid = WarriorId.parse(r[0])
+        region = int(r[1])
         w = S.find_warrior(wid)
         if w is not None:
             w.region = region
-            if wid.side is M.my_side and w.state is WState.MOVING and w.region == w.target:
+            if (wid.side is M.my_side
+                    and w.state is WState.MOVING
+                    and w.region == w.target):
                 w.state = WState.STATIONARY
 
-    assert next_token() == "DAMAGE"
-    for _ in range(int(next_token())):
-        next_token()
-        wid = WarriorId.parse(next_token())
-        dmg = int(next_token())
+    # DAMAGE
+    t = read_tokens()  # "DAMAGE N"
+    n = int(t[1])
+    for _ in range(n):
+        r = read_tokens()
+        wid = WarriorId.parse(r[1])
+        damage = int(r[2])
         w = S.find_warrior(wid)
         if w is not None:
-            w.hp -= dmg
+            w.hp -= damage
     S.warriors = [w for w in S.warriors if w.hp > 0]
 
-    assert next_token() == "SIEGE"
-    for _ in range(int(next_token())):
-        next_token()
-        region = int(next_token())
-        dmg = int(next_token())
+    # SIEGE
+    t = read_tokens()  # "SIEGE N"
+    n = int(t[1])
+    for _ in range(n):
+        r = read_tokens()
+        region = int(r[1])
+        dmg = int(r[2])
         b = S.find_building(region)
         if b is not None:
             b.hp -= dmg
     S.buildings = [b for b in S.buildings if b.hp > 0]
 
-    assert next_token() == "END"
+    readln()  # "END"
 
     income = 0
     for b in S.buildings:
-        if b.side is M.my_side:
-            count = sum(1 for w in S.warriors if w.id.side is M.my_side and w.region == b.region)
-            income += WORK_INCOME * min(count, b.work_cap())
+        if b.side is not M.my_side:
+            continue
+        count = sum(
+            1 for w in S.warriors
+            if w.id.side is M.my_side and w.region == b.region
+        )
+        income += WORK_INCOME * min(count, b.work_cap())
     S.gold += income
+
     alive = sum(1 for w in S.warriors if w.id.side is M.my_side)
     S.gold = max(0, S.gold - UPKEEP_PER_WARRIOR * alive)
 
 
 @dataclass
 class Paths:
-    hops: list[list[int]]
+    dist: list[list[float]]
+    nxt: list[list[int]]
+
+
+def euclid_ceil(M: GameMap, u: int, v: int) -> float:
+    return math.ceil(math.hypot(M.x[u] - M.x[v], M.y[u] - M.y[v]))
 
 
 def calculate_paths(M: GameMap) -> Paths:
+    INF = math.inf
     N = M.N
-    BIG = 1 << 30
-    hops = [[BIG] * N for _ in range(N)]
-    for s in range(N):
-        hops[s][s] = 0
-        q = deque([s])
-        while q:
-            u = q.popleft()
-            for v in M.adj[u]:
-                if hops[s][v] == BIG:
-                    hops[s][v] = hops[s][u] + 1
-                    q.append(v)
-    return Paths(hops)
+    dist = [[INF] * N for _ in range(N)]
+    nxt = [[-1] * N for _ in range(N)]
+
+    for i in range(N):
+        dist[i][i] = 0.0
+        nxt[i][i] = i
+    for u in range(N):
+        for v in M.adj[u]:
+            w = euclid_ceil(M, u, v)
+            if w < dist[u][v]:
+                dist[u][v] = w
+
+    # Floyd-Warshall
+    for k in range(N):
+        dk = dist[k]
+        for u in range(N):
+            du = dist[u]
+            duk = du[k]
+            if duk == INF:
+                continue
+            for v in range(N):
+                cand = duk + dk[v]
+                if cand < du[v]:
+                    du[v] = cand
+
+    for u in range(N):
+        du = dist[u]
+        for v in range(N):
+            if u == v or du[v] == INF:
+                continue
+            best_score = INF
+            for nb in M.adj[u]:
+                if dist[nb][v] == INF:
+                    continue
+                score = euclid_ceil(M, u, nb) + dist[nb][v]
+                if score < best_score:
+                    best_score = score
+                    nxt[u][v] = nb
+    return Paths(dist, nxt)
+
+
+def next_step(P: Paths, u: int, v: int) -> int:
+    """Returns the next step on the path from u to v. Returns -1 if the path is not reachable."""
+    return P.nxt[u][v]
+
+
+def path(P: Paths, u: int, v: int) -> list[int]:
+    """Returns the path from u to v as [u, ..., v]. Returns an empty list if the path is not reachable."""
+    if P.nxt[u][v] == -1:
+        return []
+    out = [u]
+    while u != v:
+        u = P.nxt[u][v]
+        out.append(u)
+    return out
 
 
 def emit(a: Actions) -> None:
-    out = ["COMMAND"]
+    out: list[str] = ["COMMAND"]
     for wid, target in a.moves:
         out.append(f"MOVE {wid} {target}")
     for r in a.upgrades:
@@ -398,313 +455,195 @@ def emit(a: Actions) -> None:
     sys.stdout.flush()
 
 
-# ==============================================================================
-# Strategy
-# ==============================================================================
-@dataclass
-class Brain:
-    mode: str = "SETUP"             # SETUP, DEFENSE, TRANSITION, MAIN
-    sa: int | None = None           # nearest empty stronghold (first base)
-    sb: int | None = None           # 2nd nearest empty stronghold (waits/recalled)
-    sa_wid: WarriorId | None = None  # warrior sent to sa
-    sb_wid: WarriorId | None = None  # warrior sent to sb
-    dispatched: bool = False        # turn-1 split issued?
-    n: int = 0                      # enemy all-in group size (turn 6)
-    gathered: bool = False          # DEFENSE reached n-1 at home?
-    defend_hops: int | None = None  # enemies within this many hops of our HQ = threat
-    threat_min: int | None = None   # closest the strike group has ever gotten to us
-    threat_prev: int | None = None  # its distance last turn (to detect approach/stall)
-    threat_stall: int = 0           # turns the group has NOT gotten closer
-    trans_tgt: int | None = None    # TRANSITION destination stronghold
-    rally: int | None = None        # MAIN rally point (a base region)
+# ---------------------------------------------------------------------------
+# 전략
+# ---------------------------------------------------------------------------
+class Strategy:
+    def __init__(self, M: GameMap, P: Paths) -> None:
+        # 내 본부에서 경로 거리가 가장 가까운 거점 2곳 선택
+        sh = sorted(M.strongholds, key=lambda r: (P.dist[M.my_hq][r], r))
+        self.targets2: list[int] = sh[:2]
+        # 거점별 개척 담당 전사
+        self.settler: dict[int, WarriorId | None] = {r: None for r in self.targets2}
+        # 공격대로 이미 내보낸 전사들
+        self.attackers: set[WarriorId] = set()
 
+    # -- 유틸 ---------------------------------------------------------------
+    @staticmethod
+    def _enemy_counts(S: GameState, M: GameMap) -> dict[int, int]:
+        cnt: dict[int, int] = {}
+        for w in S.warriors:
+            if w.id.side is not M.my_side:
+                cnt[w.region] = cnt.get(w.region, 0) + 1
+        return cnt
 
-BRAIN = Brain()
+    @staticmethod
+    def _target_pool(S: GameState, M: GameMap) -> list[Building]:
+        """공격 후보: 상대 기지가 남아 있으면 기지들, 없으면 상대 본부."""
+        enemy = [b for b in S.buildings if b.side is not M.my_side]
+        bases = [b for b in enemy if b.type is BType.BASE]
+        return bases if bases else enemy
 
+    @staticmethod
+    def _pick_target(pool: list[Building], counts: dict[int, int],
+                     P: Paths, from_region: int) -> Building:
+        """인원수 적은 곳 → 가까운 곳 → 번호 작은 곳 순."""
+        return min(pool, key=lambda b: (counts.get(b.region, 0),
+                                        P.dist[from_region][b.region],
+                                        b.region))
 
-def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
-    a = Actions()
-    B = BRAIN
-    mine = M.my_side
-    opp = mine.opposite
-    my_hq = M.my_hq
-    opp_hq = M.opp_hq
-    my_w = [w for w in S.warriors if w.id.side is mine]
-    opp_w = [w for w in S.warriors if w.id.side is opp]
-    hq = S.find_building(my_hq)
-    g = [S.gold]     # boxed so nested helpers can spend
-    moved_ids: set = set()   # at most one move command per warrior per turn
+    # -- 메인 ---------------------------------------------------------------
+    def decide(self, S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
+        a = Actions()
+        gold = S.gold
+        my = M.my_side
 
-    def hops(u: int, v: int) -> int:
-        d = P.hops[u][v]
-        return d if d < (1 << 29) else M.N
+        my_ws = [w for w in S.warriors if w.id.side is my]
+        alive = {w.id for w in my_ws}
+        counts = self._enemy_counts(S, M)
+        pool = self._target_pool(S, M)
 
-    if B.defend_hops is None:
-        B.defend_hops = max(3, (hops(my_hq, opp_hq) + 1) // 2)
+        # 죽은 전사 정리
+        self.attackers &= alive
+        for r, wid in self.settler.items():
+            if wid is not None and wid not in alive:
+                self.settler[r] = None
 
-    def move_w(w: Warrior, target: int) -> bool:
-        if w.id in moved_ids:
-            return False
-        b = S.find_building(target)
-        cost = 0 if (b is not None and b.side is mine) else MOVE_COST
-        if g[0] >= cost:
-            a.moves.append((w.id, target))
-            g[0] -= cost
-            moved_ids.add(w.id)
-            return True
-        return False
+        settler_ids = {wid for wid in self.settler.values() if wid is not None}
+        ordered = set()  # 이번 턴에 명령을 내린 전사
 
-    def train_to(target_home: int) -> None:
-        # train toward `target_home` stationary+inbound warriors at our HQ
-        if hq is None:
-            return
-        home = sum(1 for w in my_w if w.region == my_hq
-                   and w.state is WState.STATIONARY)
-        inbound = sum(1 for w in my_w if w.state is WState.MOVING
-                      and w.target == my_hq)
-        cap = HQ_LEVELS[hq.level].train_cap
-        n = min(cap, target_home - home - inbound, g[0] // TRAIN_COST)
-        if n > 0:
-            a.train_n += n
-            g[0] -= n * TRAIN_COST
+        # 집결지: 상대 본부와 가장 가까운 내 기지 (기지가 없으면 내 본부)
+        my_bases = [b for b in S.buildings if b.side is my and b.type is BType.BASE]
+        if my_bases:
+            rally = min(my_bases,
+                        key=lambda b: (P.dist[b.region][M.opp_hq], b.region)).region
+        else:
+            rally = M.my_hq
 
-    def empty_strongholds() -> list[int]:
-        return [r for r in M.strongholds if S.find_building(r) is None]
+        # 본부 노동 담당(지킴이): 공격대/개척자가 아닌 전사 중 번호가 가장 앞선 전사
+        guard = min((w for w in my_ws
+                     if w.id not in self.attackers and w.id not in settler_ids),
+                    key=lambda w: w.id.num, default=None)
+        guard_id = guard.id if guard is not None else None
 
-    def nearest_empty(src: int) -> int | None:
-        es = empty_strongholds()
-        return min(es, key=lambda r: hops(src, r)) if es else None
+        # 본진 방어 모드: 적 전사가 본부 또는 본부 인접 구역에 있으면 발동
+        threat_zone = {M.my_hq, *M.adj[M.my_hq]}
+        defending = any(counts.get(r, 0) > 0 for r in threat_zone)
+        gather_to = M.my_hq if defending else rally  # 집결 목적지
 
-    def nearest_enemy_building(src: int) -> int | None:
-        eb = [b.region for b in S.buildings if b.side is opp]
-        return min(eb, key=lambda r: hops(src, r)) if eb else None
+        # ---- 1) 초반 확장: 가까운 거점 2곳에 기지 건설 -------------------
+        for r in self.targets2:
+            b = S.find_building(r)
+            if b is not None:
+                continue  # 이미 건물이 있음(내 기지면 완료, 적 건물이면 포기)
 
-    def home_stationary() -> list[Warrior]:
-        return [w for w in my_w if w.region == my_hq and w.state is WState.STATIONARY]
+            wid = self.settler[r]
+            if wid is None:
+                # 본부에 있는 여유 전사 하나를 개척자로 지정
+                spare = sorted(
+                    (w for w in my_ws
+                     if w.state is WState.STATIONARY
+                     and w.region == M.my_hq
+                     and w.id not in self.attackers
+                     and w.id not in settler_ids),
+                    key=lambda w: w.id.num,
+                )
+                if len(spare) >= 2:  # 최소 1명은 본부에 남긴다
+                    wid = spare[-1].id
+                    self.settler[r] = wid
+                    settler_ids.add(wid)
 
-    # ---- SETUP -------------------------------------------------------------
-    if B.mode == "SETUP":
-        if not B.dispatched:
-            # turn 1: keep one warrior home, send the other two to the two
-            # nearest empty strongholds (one each). Nearer = sa (builds first).
-            es = sorted(empty_strongholds(), key=lambda r: hops(my_hq, r))
-            starters = sorted(home_stationary(), key=lambda w: w.id.num)
-            if es and len(starters) >= 2:
-                B.sa = es[0]
-                B.sb = es[1] if len(es) >= 2 else None
-                move_w(starters[1], B.sa)
-                B.sa_wid = starters[1].id
-                if B.sb is not None:
-                    move_w(starters[2], B.sb)
-                    B.sb_wid = starters[2].id
-            B.dispatched = True
+            if wid is None:
+                continue
+            w = S.find_warrior(wid)
+            if w is None or w.state is not WState.STATIONARY:
+                continue
 
-        # the first-reached stronghold (sa) builds a base as soon as its warrior
-        # arrives; the sb warrior just waits there until turn 6.
-        if B.sa is not None and S.find_building(B.sa) is None:
-            sa_w = S.find_warrior(B.sa_wid) if B.sa_wid else None
-            if sa_w is not None and sa_w.region == B.sa \
-                    and sa_w.state is WState.STATIONARY and g[0] >= BASE_LEVELS[1].cost:
-                a.upgrades.append(B.sa)
-                g[0] -= BASE_LEVELS[1].cost
-
-        if turn >= RUSH_DETECT_TURN:
-            n = sum(1 for w in opp_w if w.region != opp_hq)
-            if n >= RUSH_GROUP_MIN:
-                B.mode = "DEFENSE"
-                B.n = n
-                B.gathered = False
-                B.threat_min = B.threat_prev = None
-                B.threat_stall = 0
-                sb_w = S.find_warrior(B.sb_wid) if B.sb_wid else None
-                if sb_w is not None and sb_w.region != my_hq \
-                        and sb_w.state is WState.STATIONARY:
-                    move_w(sb_w, my_hq)
+            if w.region != r:
+                if gold >= MOVE_COST:
+                    a.moves.append((wid, r))
+                    ordered.add(wid)
+                    gold -= MOVE_COST
             else:
-                # settle the second stronghold (where our warrior waits) as rally
-                B.mode = "MAIN"
-                B.rally = B.sb if B.sb is not None else nearest_empty(my_hq)
+                # 도착함: 적 전사가 없고 금화가 충분하면 기지 건설
+                if counts.get(r, 0) == 0 and gold >= BASE_LEVELS[1].cost:
+                    a.upgrades.append(r)
+                    gold -= BASE_LEVELS[1].cost
 
-    # ---- DEFENSE -----------------------------------------------------------
-    # elif: on a turn that changes mode, only the entering block runs; the new
-    # mode's block takes over next turn (avoids double-commanding a warrior).
-    elif B.mode == "DEFENSE":
-        sb_w = S.find_warrior(B.sb_wid) if B.sb_wid else None
-        if sb_w is not None and sb_w.region != my_hq \
-                and sb_w.state is WState.STATIONARY:
-            move_w(sb_w, my_hq)          # keep recalling until home
+        # ---- 2) 기존 공격대: 목표 재설정 ---------------------------------
+        for w in my_ws:
+            if w.id not in self.attackers or w.state is not WState.STATIONARY:
+                continue
+            if not pool:
+                break
+            tgt = self._pick_target(pool, counts, P, w.region)
+            if w.region != tgt.region and gold >= MOVE_COST:
+                a.moves.append((w.id, tgt.region))
+                ordered.add(w.id)
+                gold -= MOVE_COST
+            # 목표 구역에 이미 있으면 그대로 서서 전투/공성
 
-        home = home_stationary()
-        if not B.gathered:
-            if len(home) >= B.n - 1:
-                B.gathered = True
-            else:
-                train_to(B.n - 1)
-        if B.gathered:
-            # Watch the strike group by its distance to our HQ. While it keeps
-            # closing in, HOLD. Leave DEFENSE only once the threat resolves: the
-            # group reaches us and is wiped/pushed off (came & cleared), it never
-            # arrives and stalls for a few turns (stopped or veered to another
-            # stronghold), or no off-HQ enemy remains at all.
-            offhq = [hops(w.region, my_hq) for w in opp_w if w.region != opp_hq]
-            cur = min(offhq) if offhq else None
-            enemy_at_hq = any(w.region == my_hq for w in opp_w)
-            if cur is not None:
-                B.threat_min = cur if B.threat_min is None else min(B.threat_min, cur)
-                if B.threat_prev is not None and cur >= B.threat_prev:
-                    B.threat_stall += 1
-                else:
-                    B.threat_stall = 0
-                B.threat_prev = cur
-            engaged = B.threat_min is not None and B.threat_min <= B.defend_hops
-            if enemy_at_hq:
-                leave = False                              # battle at the HQ: hold
-            elif cur is None:
-                leave = True                               # group spent / repelled
-            elif engaged and cur > B.defend_hops:
-                leave = True                               # wave came and has passed
-            elif not engaged and B.threat_stall >= 3:
-                leave = True                               # stopped or diverted away
-            else:
-                leave = False                              # still approaching: hold
-            if leave:
-                B.mode = "TRANSITION"
-                B.trans_tgt = None
+        # ---- 3) 집결/수비: 훈련된 전사를 집결지로, 본진 위협 시 본부로 ----
+        for w in my_ws:
+            if (w.id in self.attackers or w.id in settler_ids
+                    or w.id == guard_id or w.id in ordered
+                    or w.state is not WState.STATIONARY
+                    or w.region == gather_to):
+                continue
+            b = S.find_building(gather_to)
+            cost = 0 if (b is not None and b.side is my) else MOVE_COST
+            if gold >= cost:
+                a.moves.append((w.id, gather_to))
+                ordered.add(w.id)
+                gold -= cost
 
-    # ---- TRANSITION --------------------------------------------------------
-    elif B.mode == "TRANSITION":
-        if B.trans_tgt is None or S.find_building(B.trans_tgt) is not None:
-            B.trans_tgt = nearest_empty(my_hq)
-        tgt = B.trans_tgt
-        if tgt is not None:
-            home = home_stationary()
-            if len(home) >= 2:
-                for w in home[1:]:       # keep one home, push the rest out
-                    move_w(w, tgt)
-            else:
-                train_to(2)
-            arrived = [w for w in my_w if w.region == tgt
-                       and w.state is WState.STATIONARY]
-            if arrived:
-                B.mode = "MAIN"
-                B.rally = tgt
+        # ---- 4) 새 공격대 출발: 집결지에 6명 모이면 5명 출격 --------------
+        #        (본진 방어 중에는 출격하지 않는다)
+        at_rally = [w for w in my_ws
+                    if w.state is WState.STATIONARY
+                    and w.region == rally
+                    and w.id not in self.attackers
+                    and w.id not in ordered]
+        if not defending and len(at_rally) >= WAVE_TRIGGER and pool:
+            # 개척자(기지 노동)와 본부 지킴이는 남기고 나머지 중 5명 출격
+            sendable = sorted(
+                (w for w in at_rally
+                 if w.id not in settler_ids and w.id != guard_id),
+                key=lambda w: w.id.num,
+            )
+            group = sendable[:WAVE_SIZE]
+            if len(group) == WAVE_SIZE and gold >= MOVE_COST * WAVE_SIZE:
+                tgt = self._pick_target(pool, counts, P, rally)
+                for w in group:
+                    a.moves.append((w.id, tgt.region))
+                    self.attackers.add(w.id)
+                    ordered.add(w.id)
+                    gold -= MOVE_COST
 
-    # ---- MAIN --------------------------------------------------------------
-    elif B.mode == "MAIN":
-        rally = B.rally
-        if rally is not None:
-            rb = S.find_building(rally)
-            rally_here = [w for w in my_w if w.region == rally
-                          and w.state is WState.STATIONARY]
+        # ---- 5) 훈련: 초반 기지 2개를 확보한 뒤 계속 훈련 -----------------
+        expansion_done = all(
+            S.find_building(r) is not None or r in a.upgrades
+            for r in self.targets2
+        ) or turn >= SETTLE_GIVEUP_TURN
+        hq = S.find_building(M.my_hq)
+        if expansion_done and hq is not None and hq.side is my:
+            cap = HQ_LEVELS[hq.level].train_cap
+            n = 0
+            while n < cap and gold - TRAIN_COST >= GOLD_RESERVE:
+                n += 1
+                gold -= TRAIN_COST
+            a.train_n = n
 
-            # funnel HQ warriors to the rally, but keep the HQ work slots filled
-            # so income never collapses (the spec sends *trained* warriors to the
-            # rally; the home worker that funds them stays put).
-            def funnel_hq() -> None:
-                hq_keep = HQ_LEVELS[hq.level].work_cap if hq is not None else 1
-                hq_here = sorted((w for w in my_w if w.region == my_hq
-                                  and w.state is WState.STATIONARY),
-                                 key=lambda w: w.id.num)
-                surplus = hq_here[hq_keep:]
-                if not surplus:
-                    return
-                # other owned BASES (not the rally) that currently have no friendly
-                # warrior stationed and none inbound -> restaff them first (keeps
-                # their income up) before feeding the rally.
-                empty_bases = []
-                for b in S.buildings:
-                    if b.side is mine and b.type is BType.BASE and b.region != rally:
-                        here = sum(1 for w in my_w if w.region == b.region
-                                   and w.state is WState.STATIONARY)
-                        inbound = sum(1 for w in my_w if w.state is WState.MOVING
-                                      and w.target == b.region)
-                        if here + inbound == 0:
-                            empty_bases.append(b.region)
-                empty_bases.sort(key=lambda r: hops(my_hq, r))
-                for i, w in enumerate(surplus):
-                    move_w(w, empty_bases[i] if i < len(empty_bases) else rally)
-
-            if rb is None:
-                # PRIORITY: stand up the rally base (the economic engine) before
-                # spending any gold on training -- otherwise 120-gold trains keep
-                # draining us below the 300 the base costs and it never gets built.
-                if rally_here and g[0] >= BASE_LEVELS[1].cost:
-                    a.upgrades.append(rally)
-                    g[0] -= BASE_LEVELS[1].cost
-                funnel_hq()
-                return a
-
-            # base is up. Do the (cheap) moves FIRST so a wave's move cost
-            # (MOVE_COST/warrior onto enemy ground) is funded before training drains
-            # gold below 120; only then train with whatever remains -- otherwise the
-            # leftover could pay for only part of a wave (a partial launch).
-            funnel_hq()
-
-            # attack: EVERY turn the rally reaches the trigger, send all but one at
-            # the nearest enemy building (concurrent waves -- no single-wave gate).
-            # ALL-OR-NOTHING: only launch if we can pay the whole wave's move cost,
-            # so it never dribbles out just some of the group.
-            rally_stat = sorted((w for w in my_w if w.region == rally
-                                 and w.state is WState.STATIONARY),
-                                key=lambda w: w.id.num)
-            if len(rally_stat) >= WAVE_TRIGGER:
-                wave = rally_stat[1:]               # keep one home to work
-                tgt = nearest_enemy_building(rally)
-                if tgt is not None and g[0] >= MOVE_COST * len(wave):
-                    for w in wave:
-                        move_w(w, tgt)
-
-            # warriors left standing on razed targets (regions that are neither my
-            # building nor a live enemy building). Treat them as ONE body: if >=5
-            # remain in TOTAL they ALL chain to the nearest enemy building (from
-            # where most of them stand) -- all-or-nothing, else hold this turn until
-            # affordable; otherwise (<=4) they ALL retreat to the rally (a free move).
-            my_bldg = {b.region for b in S.buildings if b.side is mine}
-            fieldw = []
-            for w in my_w:
-                if w.state is WState.STATIONARY and w.region not in my_bldg:
-                    eb = S.find_building(w.region)
-                    if eb is not None and eb.side is opp:
-                        continue                    # still besieging a live target
-                    fieldw.append(w)
-            if fieldw:
-                if len(fieldw) >= WAVE_SIZE:
-                    counts: dict[int, int] = {}
-                    for w in fieldw:
-                        counts[w.region] = counts.get(w.region, 0) + 1
-                    main_region = max(counts, key=counts.get)
-                    nt = nearest_enemy_building(main_region)
-                    if nt is not None and g[0] >= MOVE_COST * len(fieldw):
-                        for w in fieldw:
-                            move_w(w, nt)           # chain the whole body together
-                    # can't pay the full chain (or nothing left to hit) -> hold
-                else:
-                    for w in fieldw:                # <=4 survivors: retreat (free)
-                        move_w(w, rally)
-
-            # train with whatever gold remains after funding the moves
-            if hq is not None and g[0] >= TRAIN_COST:
-                cap = HQ_LEVELS[hq.level].train_cap
-                n = min(cap, g[0] // TRAIN_COST)
-                if n > 0:
-                    a.train_n += n
-                    g[0] -= n * TRAIN_COST
-
-    # note: g[] is only a local overspend guard; read_turn_result does the real
-    # gold accounting from the emitted actions (never write g[0] back to S.gold).
-    return a
+        return a
 
 
 def main() -> None:
     M, S = parse_init()
     P = calculate_paths(M)
-    print("OK", flush=True)
+    strategy = Strategy(M, P)
 
-    while True:
-        turn = read_turn_start()
-        if turn is None:
-            break
-        a = decide(S, M, P, turn)
+    while (turn := read_turn_start()) is not None:
+        a = strategy.decide(S, M, P, turn)
         emit(a)
         read_turn_result(S, M, a)
 

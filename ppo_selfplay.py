@@ -47,7 +47,7 @@ from fast_env import (OWN_LEFT, OWN_RIGHT, KIND_HQ, KIND_BASE, MOVE_COST,
 
 TOK_FEAT = 31          # 14 scalars + 5 arrive + 5 reach (all log1p) + 2 norm coords
                        #                                   + 5 reach-delta vs prev turn
-GLOB_FEAT = 15         # 11 + HQ-upgrade "turns to afford" + 거점-count + x/y map-span (log1p)
+GLOB_FEAT = 16         # 11 + HQ-turns + 거점-count + x/y map-span + own prev aux opp-gold pred
 T2_EXTRA = 8           # 4 logged + surplus + travel + 2 norm coord diffs
 COST_INF = 1_000_000_000
 
@@ -182,7 +182,7 @@ class Critic(nn.Module):
 # --------------------------------------------------------------------------- #
 # feature extraction from the env (one side's perspective)
 # --------------------------------------------------------------------------- #
-def extract(env, side, prev_reach=None):
+def extract(env, side, prev_reach=None, prev_gold_pred=None):
     B, N, T = env.B, env.N, env.mb.T
     me = OWN_LEFT if side == 0 else OWN_RIGHT          # owner code (1/2)
     opp_idx = 1 - side                                  # side index (0/1)
@@ -193,11 +193,16 @@ def extract(env, side, prev_reach=None):
     reach_raw = tokens[:, :, 19:24].float()            # [B,T,5]
 
     g = glob.float()
+    # The opponent's gold is HIDDEN in the real protocol, so we feed the same
+    # reconstructed ESTIMATE the submission uses (env.est_gold), not the exact value
+    # observe() reports at g[:,6] -- closing the train/inference gap and giving the
+    # opp-gold aux target real signal. Our OWN gold (g[:,5]) stays exact.
+    opp_gold_est = env.est_gold[:, opp_idx].float()
     glob_t = torch.stack([
         g[:, 0] / 10 - 10,
         plog1p(g[:, 1] / 10), plog1p(g[:, 2] / 10),
         plog1p(g[:, 3]),      plog1p(g[:, 4]),
-        plog1p(g[:, 5] / 100), plog1p(g[:, 6] / 100),
+        plog1p(g[:, 5] / 100), plog1p(opp_gold_est / 100),
         plog1p(g[:, 7] / 10), plog1p(g[:, 8] / 10),
         plog1p(g[:, 9] / 5),  plog1p(g[:, 10] / 5),
     ], dim=1)
@@ -228,6 +233,13 @@ def extract(env, side, prev_reach=None):
                         plog1p(n_tok / 7.0)[:, None],
                         plog1p(x_span / 10000.0)[:, None],
                         plog1p(y_span / 10000.0)[:, None]], dim=1)
+
+    # this side's OWN actor-aux prediction of the opponent's next-turn gold, made LAST
+    # step (in ln(1+gold/100) space, the aux target space) and fed back as a feature so
+    # the policy can condition on its prior belief. 0 on the first turn / after regen.
+    if prev_gold_pred is None:
+        prev_gold_pred = torch.zeros(B, device=glob_t.device)
+    glob_t = torch.cat([glob_t, prev_gold_pred[:, None].to(glob_t.dtype)], dim=1)
 
     tmask = info['token_mask']
     tok_ids = info['token_ids']
@@ -386,6 +398,11 @@ def sample_policy(t1net, t2net, o, N):
     B, T = o['tmask'].shape
     dev = o['t1'].device
     h1, head5 = t1net(o['t1'], o['glob'], o['tmask'])
+    # this net's aux prediction of the opponent's NEXT-turn gold (masked-mean of the
+    # aux head's global channel 6, in ln(1+gold/100) space) -- fed back as a feature
+    # next step. Cheap: one extra aux head forward on the already-computed h1.
+    m = o['tmask'].float()
+    gold_pred = (t1net.aux(h1)[:, :, 6] * m).sum(1) / m.sum(1).clamp(min=1)   # [B]
 
     committed = o['hq_commit']                        # [B] saving for an HQ upgrade
     not_committed = ~committed
@@ -517,7 +534,7 @@ def sample_policy(t1net, t2net, o, N):
         tgt_allowed=tgt_allowed,
         old_logp=old_logp,
     )
-    return action, store, old_logp, new_commit
+    return action, store, old_logp, new_commit, gold_pred
 
 
 _TRAINCAP = None
@@ -752,12 +769,10 @@ PASSIVE_UPGRADE_TURN = 100  # passive opponent by this turn -> economy/UPGRADE
 SIEGE_MARGIN = 20           # turns past ETA before a launched wave is "spent"
 _MODE_MASS, _MODE_RUSH_SENT, _MODE_UPGRADE = 0, 1, 2
 
-# japper-bot strategy knobs (mirror japper_bot.py).
-JAP_DETECT_TURN = 6         # turn we read the enemy posture on
-JAP_GROUP_MIN = 5           # enemy warriors off their HQ at turn 6 => all-in
-JAP_WAVE_TRIGGER = 6        # rally garrison that launches a wave
-JAP_STALL = 3               # turns without the strike group closing in => it stopped
-_JSETUP, _JDEFENSE, _JTRANS, _JMAIN = 0, 1, 2, 3
+# japper-bot strategy knobs (mirror the CURRENT japper_bot.py).
+JAP_WAVE_TRIGGER = 6        # warriors gathered at the rally before a wave launches
+JAP_GOLD_RESERVE = 30       # gold kept back (upkeep buffer) before training
+JAP_SETTLE_GIVEUP = 30      # give up the 2-base expansion after this turn -> just train
 _JBIG = 1 << 30
 
 
@@ -917,50 +932,36 @@ def rusher_action(env, side, rstate):
 
 
 class JapperState:
-    """Per-game persistent state for the scripted japper opponent -- a batched port
-    of japper_bot.py's Brain. All tensors are [B]; ``reset_rows`` clears a game's
-    state at its episode boundary. Not checkpointed (episodes never resume across
-    runs). Because fast_env's move channel is per-region (one target per source
-    region, moving every stationary warrior beyond a region's work-cap), the batched
-    port cannot split the two starting warriors to two strongholds in one turn like
-    the per-warrior submission does. Instead it expands sequentially: send the HQ
-    surplus to the nearest stronghold (sa), build there, then push its surplus on to
-    the second stronghold (sb) -- reaching the same turn-6 posture (HQ + sa base +
-    sb warrior) a couple turns later. Everything else mirrors japper_bot."""
+    """Per-game state for the scripted japper opponent -- a batched port of the CURRENT
+    japper_bot.py. That strategy is region-based enough that the per-warrior settler /
+    attacker bookkeeping is realized POSITIONALLY here (fast_env moves per region: one
+    target per source, moving every stationary warrior beyond a region's work-cap):
+    warriors sitting on the HQ / own bases gather & expand, those stranded on a razed
+    field region march on the weakest-then-nearest enemy building, those already on an
+    enemy building siege it. Everything is a deterministic function of the map + current
+    board (nearest-2 strongholds, rally = own base nearest the enemy HQ), so no
+    persistent state is needed beyond the train-cap table; reset_rows is a no-op."""
 
     def __init__(self, B, device):
-        f = lambda v: torch.full((B,), v, dtype=torch.long, device=device)
-        self.mode = torch.zeros(B, dtype=torch.long, device=device)      # SETUP
-        self.assigned = torch.zeros(B, dtype=torch.bool, device=device)
-        self.sa = f(-1); self.sb = f(-1); self.rally = f(-1)
-        self.n = torch.zeros(B, dtype=torch.long, device=device)
-        self.gathered = torch.zeros(B, dtype=torch.bool, device=device)
-        self.defend_hops = f(3)
-        self.threat_min = f(_JBIG); self.threat_prev = f(_JBIG)
-        self.threat_stall = torch.zeros(B, dtype=torch.long, device=device)
         self.HQ_TRAINCAP = torch.tensor(fe.HQ_TRAINCAP, device=device)
 
     def reset_rows(self, rows):
-        self.mode[rows] = _JSETUP
-        self.assigned[rows] = False
-        self.sa[rows] = -1; self.sb[rows] = -1; self.rally[rows] = -1
-        self.n[rows] = 0
-        self.gathered[rows] = False
-        self.defend_hops[rows] = 3
-        self.threat_min[rows] = _JBIG; self.threat_prev[rows] = _JBIG
-        self.threat_stall[rows] = 0
+        pass
 
 
 def japper_action(env, side, jstate):
-    """Scripted fixed opponent: a batched port of japper_bot.py. State machine over
-    SETUP (double expansion), DEFENSE (mass n-1 and hold while the enemy all-in
-    approaches, leave once it stalls/diverts/is repelled), TRANSITION (push back
-    out to a stronghold) and MAIN (rally-point war machine: build the rally base,
-    funnel every surplus warrior to it keeping the HQ/base work slots filled, and
-    send waves of ~5 at the nearest enemy building, chaining while >=5 survive).
-    Persistent per-game state lives in ``jstate``. Returns a full-batch action dict
-    (build / move / train / force_build); bases are emitted on the force_build
-    channel (bypasses the free-worker gate; the env auto-staffs the new base)."""
+    """Scripted fixed opponent: a batched, region-based port of the CURRENT japper_bot.py.
+      1) expand to the 2 nearest strongholds (build a base once a warrior stands on an
+         empty one, no enemy present, gold >= 300);
+      2) train up to the HQ cap while keeping a small gold reserve, once expansion is done;
+      3) funnel spare warriors to the RALLY (own base nearest the enemy HQ, else the HQ);
+      4) when >= WAVE_TRIGGER gather at the rally, launch its surplus (~5, work-cap stays
+         home) at the enemy building with the FEWEST enemies, then nearest, then lowest id;
+      5) field warriors chain to the next such enemy building; siegers hold;
+      6) if an enemy reaches the HQ or an adjacent region, recall gatherers home to defend
+         and hold the waves (attackers already out keep attacking).
+    Returns a full-batch action dict; bases go on the force_build channel (bypasses the
+    free-worker gate; the env auto-staffs the new base)."""
     B, N, dev = env.B, env.N, env.device
     W = env.W
     opp = 1 - side
@@ -969,202 +970,116 @@ def japper_action(env, side, jstate):
     turn = env.day                                       # [B] per-game turn
     my_hq = env.hq_region[:, side]
     opp_hq = env.hq_region[:, opp]
-    tt = env.mb.travel_turns                             # [B,N,T]
+    tt = env.mb.travel_turns                             # [B,N,T] hops region->token
     tok = env.mb.token_ids                               # [B,T] ascending
     T = env.mb.T
+    reg_ids = torch.arange(N, device=dev)[None, :]       # [1,N]
 
     sd = env.slot_side[None, :].expand(B, W)
     alive = env.w_hp > 0
     mine = alive & (sd == side)
     enemy = alive & (sd == opp)
     stat_mine = mine & (~env.w_move)
-    my_reg = env._scatter_region(mine)                   # [B,N]
-    stat_reg = env._scatter_region(stat_mine)            # [B,N]
-    opp_reg = env._scatter_region(enemy)                 # [B,N]
-    home_stat = stat_reg.gather(1, my_hq[:, None]).squeeze(1)
-    opp_at_myhq = opp_reg.gather(1, my_hq[:, None]).squeeze(1)
+    stat_reg = env._scatter_region(stat_mine)            # [B,N] my stationary per region
+    opp_reg = env._scatter_region(enemy)                 # [B,N] enemy per region
     gold = env.gold[:, side]
     hq_level = env.b_level.gather(1, my_hq[:, None]).squeeze(1).clamp(max=HQ_MAXLEVEL)
     traincap = jstate.HQ_TRAINCAP[hq_level]
+    owner = env.b_owner
 
     def tok_idx(region):                                 # region [B] -> token index [B]
         q = region.clamp(min=0)[:, None].contiguous()
         return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
 
-    def dist_to(region):                                 # [B,N] travel turns region->`region`
+    def dist_to(region):                                 # [B,N] hops each region -> `region`
         ti = tok_idx(region)
         return tt.gather(2, ti[:, None, None].expand(B, N, 1)).squeeze(2)
 
-    tt_to_myhq = dist_to(my_hq)                          # [B,N]
-    w_dist = tt_to_myhq.gather(1, env.w_region)          # [B,W] each warrior -> my_hq
-    eta = tt_to_myhq.gather(1, opp_hq[:, None]).squeeze(1)
-    defend = torch.clamp((eta + 1) // 2, min=3)
+    def at(field, region):                               # field[B,N] gathered at region[B]
+        return field.gather(1, region.clamp(min=0)[:, None]).squeeze(1)
 
-    is_strong = env.mb.is_stronghold
-    empty = is_strong & (env.b_owner == 0)               # OWN_NONE == 0
-    has_empty = empty.any(1)
-    d_empty = torch.where(empty, tt_to_myhq, torch.full_like(tt_to_myhq, _JBIG))
-    near1 = d_empty.argmin(1)                            # nearest empty stronghold
-    d_empty2 = d_empty.scatter(1, near1[:, None], _JBIG)
-    near2 = d_empty2.argmin(1)                           # 2nd nearest
+    tt_to_myhq = dist_to(my_hq)                          # [B,N]
+    tt_to_opphq = dist_to(opp_hq)                        # [B,N]
 
     build = torch.zeros(B, N, dtype=torch.bool, device=dev)
     move = torch.full((B, N), -1, dtype=torch.long, device=dev)
     force = torch.zeros(B, N, dtype=torch.bool, device=dev)
     train = torch.zeros(B, dtype=torch.long, device=dev)
 
-    mode0 = jstate.mode.clone()                          # snapshot: one block per row
-    m_setup = mode0 == _JSETUP
-    m_def = mode0 == _JDEFENSE
-    m_trans = mode0 == _JTRANS
-    m_main = mode0 == _JMAIN
-
-    def emit_move(mask, src, tgt):                        # move[src]=tgt for masked rows
-        rows = mask.nonzero(as_tuple=True)[0]
-        if rows.numel() > 0:
-            move[rows, src.clamp(min=0)[rows]] = tgt[rows]
-
     def emit_force(mask, reg):
         rows = mask.nonzero(as_tuple=True)[0]
         if rows.numel() > 0:
             force[rows, reg.clamp(min=0)[rows]] = True
 
-    def owner_at(reg):
-        return env.b_owner.gather(1, reg.clamp(min=0)[:, None]).squeeze(1)
+    # ---- static expansion targets: the 2 strongholds nearest my HQ -------------
+    is_strong = env.mb.is_stronghold
+    d_sh = torch.where(is_strong, tt_to_myhq, torch.full_like(tt_to_myhq, _JBIG))
+    sa = d_sh.argmin(1)                                  # nearest stronghold
+    d_sh2 = d_sh.scatter(1, sa[:, None], _JBIG)
+    sb = d_sh2.argmin(1)                                 # 2nd nearest
+    has_sh = is_strong.any(1)
+    sa_open = has_sh & (at(owner, sa) == 0)              # empty (OWN_NONE == 0)
+    sb_open = has_sh & (at(owner, sb) == 0)
+    expand_tgt = torch.where(sa_open, sa, torch.where(sb_open, sb, torch.full_like(sa, -1)))
+    expanding = expand_tgt >= 0
+    expansion_done = ((~sa_open) & (~sb_open)) | (turn >= JAP_SETTLE_GIVEUP)
 
-    # ---- assignment (turn 1): pick sa/sb, dispatch HQ surplus toward sa --------
-    need = ~jstate.assigned
-    jstate.sa = torch.where(need, near1, jstate.sa)
-    jstate.sb = torch.where(need, near2, jstate.sb)
-    jstate.defend_hops = torch.where(need, defend, jstate.defend_hops)
-    emit_move(need & has_empty, my_hq, jstate.sa)
-    jstate.assigned = jstate.assigned | need
+    # ---- rally: my BASE nearest the enemy HQ (tie: lower region), else the HQ ---
+    owned_base = (owner == me_own) & (env.b_kind == KIND_BASE)
+    d_rb = torch.where(owned_base, tt_to_opphq * 256 + reg_ids,
+                       torch.full_like(tt_to_opphq, _JBIG))
+    rally = torch.where(owned_base.any(1), d_rb.argmin(1), my_hq)
 
-    # ---- SETUP -----------------------------------------------------------------
-    sa = jstate.sa
-    sa_stat = stat_reg.gather(1, sa.clamp(min=0)[:, None]).squeeze(1)
-    sa_owner = owner_at(sa)
-    sa_enemy = opp_reg.gather(1, sa.clamp(min=0)[:, None]).squeeze(1)
-    do_sa_build = m_setup & (sa >= 0) & (sa_stat > 0) & (sa_owner == 0) \
-        & (gold >= fe.BASE_COST[1]) & (sa_enemy == 0)
-    emit_force(do_sa_build, sa)
-    # once sa is ours, push its surplus on to sb
-    emit_move(m_setup & (sa_owner == me_own) & (jstate.sb >= 0), sa, jstate.sb)
-    # turn-6 posture read
-    enemy_off = (enemy & (env.w_region != opp_hq[:, None])).sum(1)
-    at6 = m_setup & (turn >= JAP_DETECT_TURN)
-    to_def = at6 & (enemy_off >= JAP_GROUP_MIN)
-    to_main = at6 & (~to_def)
-    jstate.n = torch.where(to_def, enemy_off, jstate.n)
-    jstate.gathered = torch.where(to_def, torch.zeros_like(jstate.gathered),
-                                  jstate.gathered)
-    jstate.threat_min = torch.where(to_def, torch.full_like(jstate.threat_min, _JBIG),
-                                    jstate.threat_min)
-    jstate.threat_prev = torch.where(to_def, torch.full_like(jstate.threat_prev, _JBIG),
-                                     jstate.threat_prev)
-    jstate.threat_stall = torch.where(to_def, torch.zeros_like(jstate.threat_stall),
-                                      jstate.threat_stall)
-    emit_move(to_def & (jstate.sb >= 0), jstate.sb, my_hq)   # recall the sb warrior
-    jstate.rally = torch.where(to_main, jstate.sb, jstate.rally)
-    jstate.mode = torch.where(to_def, torch.full_like(jstate.mode, _JDEFENSE),
-                              jstate.mode)
-    jstate.mode = torch.where(to_main, torch.full_like(jstate.mode, _JMAIN),
-                              jstate.mode)
+    # ---- defense: an enemy on the HQ or an adjacent (<=1 hop) region -----------
+    defending = (opp_reg * (tt_to_myhq <= 1).long()).sum(1) > 0
+    gather_to = torch.where(defending, my_hq, rally)
 
-    # ---- DEFENSE ---------------------------------------------------------------
-    emit_move(m_def & (jstate.sb >= 0), jstate.sb, my_hq)    # keep recalling
-    tgt_home = (jstate.n - 1).clamp(min=0)
-    need_tr = (tgt_home - home_stat).clamp(min=0)
-    n_tr = torch.minimum(torch.minimum(traincap, need_tr), gold // TRAIN_COST)
-    train = torch.where(m_def & (~jstate.gathered) & (home_stat < tgt_home), n_tr, train)
-    jstate.gathered = jstate.gathered | (m_def & (home_stat >= tgt_home))
-    # watch the strike group by its closest distance to our HQ
-    off = enemy & (env.w_region != opp_hq[:, None])
-    cur = torch.where(off, w_dist, torch.full_like(w_dist, _JBIG)).min(1).values  # [B]
-    upd = m_def & jstate.gathered
-    jstate.threat_min = torch.where(upd, torch.minimum(jstate.threat_min, cur),
-                                    jstate.threat_min)
-    approach = (cur < _JBIG) & (jstate.threat_prev < _JBIG) & (cur >= jstate.threat_prev)
-    jstate.threat_stall = torch.where(upd & approach, jstate.threat_stall + 1,
-                                      jstate.threat_stall)
-    jstate.threat_stall = torch.where(upd & (cur < _JBIG) & (~approach),
-                                      torch.zeros_like(jstate.threat_stall),
-                                      jstate.threat_stall)
-    jstate.threat_prev = torch.where(upd & (cur < _JBIG), cur, jstate.threat_prev)
-    enemy_at_hq = opp_at_myhq > 0
-    engaged = jstate.threat_min <= jstate.defend_hops
-    leave = upd & (~enemy_at_hq) & (
-        (cur >= _JBIG)
-        | (engaged & (cur > jstate.defend_hops))
-        | ((~engaged) & (jstate.threat_stall >= JAP_STALL)))
-    jstate.mode = torch.where(leave, torch.full_like(jstate.mode, _JTRANS), jstate.mode)
-    jstate.rally = torch.where(leave, torch.full_like(jstate.rally, -1), jstate.rally)
+    # ---- pick_target(from_region): per-SOURCE weakest->nearest->lowest enemy bldg
+    enemy_bldg = owner == op_own
+    enemy_base = enemy_bldg & (env.b_kind == KIND_BASE)
+    pool = torch.where(enemy_base.any(1)[:, None], enemy_base, enemy_bldg)  # [B,N]
+    has_pool = pool.any(1)                               # [B]
+    tokreg = tok.clamp(max=N - 1)                        # [B,T] candidate region ids
+    pool_tok = pool.gather(1, tokreg)                    # [B,T]
+    cnt_tok = opp_reg.gather(1, tokreg)                  # [B,T] enemy count at candidate
+    # lexicographic key (count, hops-from-src, region) packed into one int64 per (src,tok)
+    score = cnt_tok[:, None, :] * 65536 + tt * 256 + tokreg[:, None, :]     # [B,N,T]
+    score = torch.where(pool_tok[:, None, :], score, torch.full_like(score, _JBIG))
+    best_tok = score.argmin(2)                           # [B,N] chosen candidate token per src
+    tgt_by_src = tok.gather(1, best_tok.clamp(max=T - 1))  # [B,N] chosen enemy-building region
 
-    # ---- TRANSITION ------------------------------------------------------------
-    set_rally = m_trans & has_empty & (jstate.rally < 0)
-    jstate.rally = torch.where(set_rally, near1, jstate.rally)
-    rally_t = jstate.rally.clamp(min=0)
-    emit_move(m_trans & (jstate.rally >= 0) & (home_stat >= 2), my_hq, jstate.rally)
-    need_t2 = (2 - home_stat).clamp(min=0)
-    n_tr2 = torch.minimum(torch.minimum(traincap, need_t2), gold // TRAIN_COST)
-    train = torch.where(m_trans & (home_stat < 2), n_tr2, train)
-    at_rally = stat_reg.gather(1, rally_t[:, None]).squeeze(1)
-    arrived = m_trans & (jstate.rally >= 0) & (at_rally > 0)
-    jstate.mode = torch.where(arrived, torch.full_like(jstate.mode, _JMAIN), jstate.mode)
+    # ---- build the per-region move plan (later layers override earlier) --------
+    # 1) own bases (not the rally): funnel their surplus to the gather point
+    ob = owned_base & (reg_ids != rally[:, None])
+    move = torch.where(ob, gather_to[:, None].expand(B, N), move)
+    # 2) HQ: settle the next open stronghold, else funnel to the gather point. Matches
+    # japper_bot: expansion (step 1) runs unconditionally, so the HQ keeps pushing a
+    # settler toward an open target even while defending (gather-to-HQ is a no-op for
+    # the HQ garrison anyway).
+    hq_tgt = torch.where(expanding, expand_tgt, gather_to)
+    move = torch.where(reg_ids == my_hq[:, None], hq_tgt[:, None].expand(B, N), move)
+    # 3) field (stationary warriors on a razed / non-building region): chain to a target
+    my_bldg = owner == me_own
+    field = (stat_reg > 0) & (~my_bldg) & (~enemy_bldg)
+    move = torch.where(field & has_pool[:, None], tgt_by_src, move)
+    # 4) rally: recall to HQ while defending, else launch a wave at the trigger
+    rally_stat = at(stat_reg, rally)
+    wave_tgt = tgt_by_src.gather(1, rally[:, None]).squeeze(1)
+    do_rally = defending | ((rally_stat >= JAP_WAVE_TRIGGER) & has_pool)
+    rally_tgt = torch.where(defending, my_hq, wave_tgt)
+    move = torch.where((reg_ids == rally[:, None]) & do_rally[:, None],
+                       rally_tgt[:, None].expand(B, N), move)
 
-    # ---- MAIN ------------------------------------------------------------------
-    rally_t = jstate.rally.clamp(min=0)
-    rb_mine = owner_at(jstate.rally) == me_own
-    rally_stat = stat_reg.gather(1, rally_t[:, None]).squeeze(1)
-    rally_enemy = opp_reg.gather(1, rally_t[:, None]).squeeze(1)
-    have_rally = m_main & (jstate.rally >= 0)
-    # priority: build the rally base (economic engine) before spending on training
-    do_rb = have_rally & (~rb_mine) & (rally_stat > 0) & (gold >= fe.BASE_COST[1]) \
-        & (rally_enemy == 0)
-    emit_force(do_rb, jstate.rally)
-    # funnel HQ surplus: prefer restaffing an owned BASE (not the rally) that has no
-    # friendly warrior stationed nor inbound; else feed the rally. (Per-region moves
-    # can pick only one target per source, so an empty base takes the whole HQ
-    # surplus that turn -- a couple over-sends vs the submission's exact 1-per-base,
-    # self-correcting once the base is no longer empty.)
-    owned_base = (env.b_owner == me_own) & (env.b_kind == KIND_BASE)
-    inc = torch.zeros(B, N, dtype=torch.long, device=dev)
-    inc.scatter_add_(1, env.w_tgt.clamp(min=0), (mine & env.w_move).long())
-    rally_oh = torch.zeros(B, N, dtype=torch.bool, device=dev)
-    rally_oh.scatter_(1, rally_t[:, None], True)
-    empty_base = owned_base & (~rally_oh) & ((stat_reg + inc) == 0)
-    d_eb0 = torch.where(empty_base, tt_to_myhq, torch.full_like(tt_to_myhq, _JBIG))
-    eob = d_eb0.argmin(1)
-    funnel_tgt = torch.where(d_eb0.min(1).values < _JBIG, eob, rally_t)
-    emit_move(have_rally, my_hq, funnel_tgt)
-    base_up = have_rally & rb_mine
-    train = torch.where(base_up, torch.minimum(traincap, gold // TRAIN_COST), train)
-    # launch: EVERY turn the rally reaches the trigger, send its surplus (per-region
-    # move keeps the base work_cap home) at the nearest enemy building. No single-
-    # wave gate -> concurrent waves, matching japper_bot.
-    enemy_bldg = env.b_owner == op_own
-    d_reb = torch.where(enemy_bldg, dist_to(rally_t), torch.full_like(tt_to_myhq, _JBIG))
-    launch_tgt = d_reb.argmin(1)
-    has_eb = d_reb.min(1).values < _JBIG
-    do_launch = base_up & (rally_stat >= JAP_WAVE_TRIGGER) & has_eb
-    emit_move(do_launch, rally_t, launch_tgt)
-    # react to warriors left standing on razed targets (regions that are neither my
-    # building nor a live enemy building). Treat them as ONE body PER GAME: if >=5
-    # remain in total they ALL chain to the nearest enemy building (from where most
-    # of them stand), else they ALL retreat to the rally -- never split forward/back.
-    my_bldg = env.b_owner == me_own
-    field = (stat_reg > 0) & (~my_bldg) & (~enemy_bldg)             # [B,N] razed spots
-    field_pop = stat_reg * field.long()
-    field_cnt = field_pop.sum(1)                                    # [B] total survivors
-    main_reg = field_pop.argmax(1)                                  # [B] main-body region
-    d_main = torch.where(enemy_bldg, dist_to(main_reg),
-                         torch.full_like(tt_to_myhq, _JBIG))        # [B,N]
-    chain_tgt = d_main.argmin(1)
-    has_eb2 = d_main.min(1).values < _JBIG
-    chain_game = base_up & (field_cnt >= 5) & has_eb2              # whole-game decision
-    dest = torch.where(chain_game, chain_tgt, rally_t)            # [B] one dest per game
-    apply_field = base_up[:, None] & field
-    move = torch.where(apply_field, dest[:, None].expand(B, N), move)
+    # ---- build a base on the current open expansion target (one per turn) -------
+    et_can = (expanding & (at(stat_reg, expand_tgt) > 0)
+              & (at(opp_reg, expand_tgt) == 0) & (gold >= fe.BASE_COST[1]))
+    emit_force(et_can, expand_tgt)
+
+    # ---- train once the 2 bases are secured (or given up), keeping the reserve --
+    n_afford = ((gold - JAP_GOLD_RESERVE) // TRAIN_COST).clamp(min=0)
+    n = torch.minimum(traincap, n_afford)
+    hq_mine = at(owner, my_hq) == me_own
+    train = torch.where(expansion_done & hq_mine, n, train)
 
     return {'build': build, 'move': move, 'train': train, 'force_build': force}
 
@@ -1181,6 +1096,9 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
     train_full = torch.zeros(B, dtype=torch.long, device=dev)
     force_full = torch.zeros(B, N, dtype=torch.bool, device=dev)
     commit_full = torch.zeros(B, dtype=torch.bool, device=dev)
+    # each net opponent's own aux opp-gold prediction (fed back as its feature next
+    # step); scripted bots have no net -> 0 (they ignore the observation anyway).
+    gold_pred_full = torch.zeros(B, dtype=torch.float32, device=dev)
     for p in torch.unique(opp_assign).tolist():
         rows = (opp_assign == p).nonzero(as_tuple=True)[0]
         if p < N_SCRIPTED:
@@ -1192,15 +1110,16 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
             force_full[rows] = act['force_build'][rows]
         else:
             sub = slice_obs(o_op, rows)
-            act, _, _, ncommit = sample_policy(pool_t1[p - N_SCRIPTED],
-                                               pool_t2[p - N_SCRIPTED], sub, N)
+            act, _, _, ncommit, gpred = sample_policy(pool_t1[p - N_SCRIPTED],
+                                                      pool_t2[p - N_SCRIPTED], sub, N)
             build_full[rows] = act['build']
             move_full[rows] = act['move']
             train_full[rows] = act['train']
             force_full[rows] = act['force_build']
             commit_full[rows] = ncommit
+            gold_pred_full[rows] = gpred
     return ({'build': build_full, 'move': move_full, 'train': train_full,
-             'force_build': force_full}, commit_full)
+             'force_build': force_full}, commit_full, gold_pred_full)
 
 
 def train(cfg: Config, device=None, seed=0, log_every=1):
@@ -1314,6 +1233,11 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     prev_reach_ag = torch.zeros(cfg.B, env.mb.T, 5, device=device)
     prev_reach_op = torch.zeros(cfg.B, env.mb.T, 5, device=device)
 
+    # each side's own actor-aux opp-gold prediction from the previous step, fed back
+    # as a global feature; 0 on the first turn / after an episode resets.
+    prev_gold_pred_ag = torch.zeros(cfg.B, device=device)
+    prev_gold_pred_op = torch.zeros(cfg.B, device=device)
+
     # per-game state for the scripted opponents (rusher=index 0, japper=index 1).
     # Fresh, not checkpointed: episodes never resume across runs (env is reset on
     # resume), so a fresh state always aligns with a fresh env.
@@ -1347,17 +1271,19 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         buf = []
         ep_rewards, ep_count = 0.0, 0
         for s in range(steps):
-            o_ag = extract(env, 0, prev_reach_ag)
+            o_ag = extract(env, 0, prev_reach_ag, prev_gold_pred_ag)
             with torch.no_grad():
-                act_ag, store, _, ncommit_ag = sample_policy(actor_t1, actor_t2, o_ag, N)
+                act_ag, store, _, ncommit_ag, gpred_ag = sample_policy(actor_t1, actor_t2, o_ag, N)
                 val = critic.value(o_ag['t1'], o_ag['glob'], o_ag['tmask'])
-                o_op = extract(env, 1, prev_reach_op)
-                act_op, ncommit_op = opponent_actions(pool_t1, pool_t2, o_op, opp_assign,
-                                                      env, 1, cfg.B, N, device,
-                                                      rstate, jstate)
-            # this turn's reach becomes next turn's baseline for the delta feature
+                o_op = extract(env, 1, prev_reach_op, prev_gold_pred_op)
+                act_op, ncommit_op, gpred_op = opponent_actions(
+                    pool_t1, pool_t2, o_op, opp_assign, env, 1, cfg.B, N, device,
+                    rstate, jstate)
+            # this turn's reach + own aux gold prediction become next turn's features
             prev_reach_ag = o_ag['reach_raw'].clone()
             prev_reach_op = o_op['reach_raw'].clone()
+            prev_gold_pred_ag = gpred_ag
+            prev_gold_pred_op = gpred_op
             env.step({'left': act_ag, 'right': act_op})
             # carry the HQ-upgrade commitment to next turn (regen resets it for
             # finished games below).
@@ -1395,17 +1321,19 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 opp_assign[drows] = sample_opponents(
                     drows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
                 env.regen(done)
-                # new map -> no prior turn; baseline the reach deltas at 0
+                # new map -> no prior turn; baseline the reach deltas + gold pred at 0
                 prev_reach_ag[drows] = 0
                 prev_reach_op[drows] = 0
+                prev_gold_pred_ag[drows] = 0
+                prev_gold_pred_op[drows] = 0
                 # restart the scripted opponents' state machines for the new games
                 rstate.reset_rows(drows)
                 jstate.reset_rows(drows)
 
         with torch.no_grad():
-            # bootstrap value on the post-rollout state; same prev_reach the next
-            # iter's first step will use (no env step happened in between).
-            o_ag = extract(env, 0, prev_reach_ag)
+            # bootstrap value on the post-rollout state; same prev_reach / gold pred the
+            # next iter's first step will use (no env step happened in between).
+            o_ag = extract(env, 0, prev_reach_ag, prev_gold_pred_ag)
             last_val = critic.value(o_ag['t1'], o_ag['glob'], o_ag['tmask']).to(sdev)
 
         # ---- GAE ----

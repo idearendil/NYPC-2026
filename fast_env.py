@@ -170,8 +170,30 @@ def compute_map_tensors(maps: list, N: int, T: int, device: torch.device) -> dic
             cur = upd
         tt_turns[:, :, ti] = cur
 
+    # bit-packed target-inference table for the hidden-info opp-gold reconstruction
+    # (mirrors submit_bot's `tvia`): tvia_bits[b, a, nb] = bitmask over targets t of
+    # (nxt[a][t] == nb) -- the set of targets whose next hop from region a is nb. So a
+    # warrior stepping a->nb is consistent with exactly the targets in that mask.
+    # Packed 62 real bits per int64 word (avoids the sign bit); W64 = ceil(N/62).
+    BITS = 62
+    W64 = (N + BITS - 1) // BITS
+    reg = torch.arange(N, device=device)
+    reg_word = reg // BITS                                    # [N] word index per region
+    reg_bit = (torch.ones(N, dtype=torch.int64, device=device) << (reg % BITS))  # [N]
+    tvia_bits = torch.zeros((B, N, N, W64), dtype=torch.int64, device=device)
+    valid_hop = nxt >= 0                                      # [B,N,N] (a, t)
+    dest_nb = nxt.clamp(min=0).long()                        # [B,N,N] -> next hop nb
+    for w in range(W64):
+        in_word = (reg_word == w)                            # [N] over targets t
+        srcbit = torch.where(in_word[None, None, :] & valid_hop,
+                             reg_bit[None, None, :].expand(B, N, N),
+                             torch.zeros((), dtype=torch.int64, device=device))
+        # scatter targets onto their next-hop nb (dim=2): tvia_bits[b,a,nb,w] |= bit(t)
+        tvia_bits[:, :, :, w].scatter_add_(2, dest_nb, srcbit)
+
     return dict(cx=cx, cy=cy, is_stronghold=is_stronghold, next_step=nxt,
                 token_ids=token_ids, token_valid=token_valid, travel_turns=tt_turns,
+                tvia_bits=tvia_bits,
                 n_regions=n_regions.to(device), hq_right=(n_regions - 1).to(device))
 
 
@@ -251,6 +273,14 @@ class FastEnv:
         self.B, self.N = B, N
         dev = self.device
 
+        # bit-packing helpers for the opp-gold move-cost target inference (see
+        # _update_est_gold): 62 real region-bits per int64 word, W64 = ceil(N/62).
+        self.BITS = 62
+        self.W64 = (N + self.BITS - 1) // self.BITS
+        reg = torch.arange(N, device=dev)
+        self._reg_word = reg // self.BITS                       # [N]
+        self._reg_bit = (torch.ones(N, dtype=torch.int64, device=dev) << (reg % self.BITS))
+
         # constant lookup tables on device
         self.HQ_HP = torch.tensor(HQ_HP, device=dev)
         self.HQ_TURRET = torch.tensor(HQ_TURRET, device=dev)
@@ -306,6 +336,19 @@ class FastEnv:
         # per-side "saving to upgrade the HQ" commitment flag (set by the policy's
         # HQ-upgrade macro; while True, costly actions are masked off in sampling).
         self.hq_commit = torch.zeros((B, 2), dtype=torch.bool, device=dev)
+        # ---- hidden-info opponent-gold ESTIMATE (mirrors submit_bot) ----------
+        # est_gold[b, s] = side s's gold as RECONSTRUCTED by its opponent from the
+        # visible economy: builds/trains/income/upkeep are exact, only move cost is
+        # inferred (target hidden). Fed to the net as the opp-gold feature so training
+        # matches inference (submit_bot never sees exact opp gold). Per-warrior move-
+        # inference state: tgt_set (bitmask of still-consistent targets), move_chg
+        # (an outstanding refundable 10-charge), moved_last (moved on the prev turn).
+        self.est_gold = torch.full((B, 2), START_GOLD, dtype=torch.int64, device=dev)
+        self.build_spend = z(B, 2)                      # per-side build spend this turn
+        self.prev_region = z(B, W)                      # warrior regions before _phase_move
+        self.w_tgt_set = torch.zeros((B, W, self.W64), dtype=torch.int64, device=dev)
+        self.w_move_chg = torch.zeros((B, W), dtype=torch.bool, device=dev)
+        self.w_moved_last = torch.zeros((B, W), dtype=torch.bool, device=dev)
 
     def reset(self, mask=None):
         """Reset all games (mask=None) or only the games where mask[b] is True
@@ -327,6 +370,13 @@ class FastEnv:
         self.w_move[m] = False
         self.last_region_take[m] = 0
         self.hq_commit[m] = False
+        # reset the opp-gold estimate + move-inference state for the (re)started games
+        self.est_gold = torch.where(mc, torch.full_like(self.est_gold, START_GOLD), self.est_gold)
+        self.build_spend[m] = 0
+        self.prev_region[m] = 0
+        self.w_tgt_set[m] = 0
+        self.w_move_chg[m] = False
+        self.w_moved_last[m] = False
         rows = m.nonzero(as_tuple=True)[0]
         if rows.numel() > 0:
             rhq = self.mb.hq_right[rows]
@@ -436,13 +486,96 @@ class FastEnv:
         self._phase_build(actions, apply_agent_rules)
         self._phase_register_moves(actions)
         self._phase_train_charge(actions)
+        # snapshot for the opp-gold move inference: regions BEFORE movement, and who
+        # was alive to move this turn (spawns happen after, so they can't have moved).
+        self.prev_region = self.w_region.clone()
+        self._alive_before = self.w_hp > 0
         self._phase_move()
         self._phase_spawn()
         self._phase_combat()
         self._phase_work()
         self._phase_upkeep()
+        self._update_est_gold()
         self.day += 1
         return self
+
+    def _update_est_gold(self):
+        """Update est_gold[b, s] = each side's gold as its OPPONENT would reconstruct
+        it from visible info. Builds/trains/income are charged exactly; move cost is
+        inferred by submit_bot's nxt-path TARGET INFERENCE (a new move costs 10, and it
+        is refunded once the inferred target is known to be one of that side's OWN
+        buildings -- a free garrison move). Vectorized over all warriors, both sides at
+        once; each warrior contributes to its OWN side's estimate."""
+        B, N, W = self.B, self.N, self.W
+        dev = self.device
+        prev = self.prev_region                          # [B,W] region before move
+        cur = self.w_region                              # [B,W] region after move
+        moved = self._alive_before & (cur != prev)       # [B,W] made a step this turn
+        alive_now = self.w_hp > 0                         # [B,W] survivors (post-combat)
+        sd = self.slot_side[None, :].expand(B, W)         # [B,W] 0/1 side per slot
+
+        # per-side owned-building bitmask [B,W64] (targets that are free to move onto)
+        def pack(mask):                                   # [B,N] bool -> [B,W64] int64
+            contrib = mask.long() * self._reg_bit[None, :]           # [B,N]
+            return torch.stack([(contrib * (self._reg_word == w)[None, :]).sum(1)
+                                for w in range(self.W64)], dim=1)     # [B,W64]
+        owned0 = self.b_owner == OWN_LEFT                 # [B,N]
+        owned1 = self.b_owner == OWN_RIGHT
+        obits0, obits1 = pack(owned0), pack(owned1)       # [B,W64] each
+        owned_w = torch.where(sd[:, :, None] == 0,
+                              obits0[:, None, :], obits1[:, None, :])  # [B,W,W64] per warrior
+        prev_owned = torch.where(sd == 0, owned0.gather(1, prev), owned1.gather(1, prev))  # [B,W]
+        cur_owned = torch.where(sd == 0, owned0.gather(1, cur), owned1.gather(1, cur))     # [B,W]
+
+        # cons[b,w] = targets consistent with the step prev->cur = tvia_bits[b,prev,cur]
+        tvia = self.mb.tvia_bits.view(B, N * N, self.W64)  # [B,N*N,W64]
+        cons = torch.gather(tvia, 1, (prev * N + cur)[:, :, None].expand(B, W, self.W64))
+
+        tgt = self.w_tgt_set                             # [B,W,W64] carried from last turn
+        mchg = self.w_move_chg                           # [B,W]
+        mlast = self.w_moved_last                        # [B,W]
+        tgt_nonempty = (tgt != 0).any(dim=2)             # [B,W]
+        fits_prev = ((tgt & cons) != 0).any(dim=2)       # step fits the running target set
+        is_new = moved & ((~mlast) | (~fits_prev))       # fresh dispatch or re-dispatch
+        is_cont = moved & (~is_new)                      # continuation of the same move
+
+        new_tgt = torch.where(is_new[:, :, None], cons,
+                  torch.where(is_cont[:, :, None], tgt & cons, tgt))     # [B,W,W64]
+        new_mchg = torch.where(is_new, torch.ones_like(mchg), mchg)      # cont keeps old chg
+        # free detection: all remaining possible targets are owned -> refund the charge
+        subset_owned = ((new_tgt & ~owned_w) == 0).all(dim=2)
+        free_moved = moved & new_mchg & (new_tgt != 0).any(dim=2) & subset_owned
+        new_mchg = new_mchg & (~free_moved)
+        # a mid-move warrior that did NOT step this turn -> its move concluded (stopped)
+        concluded = alive_now & (~moved) & tgt_nonempty
+        refund_concl = concluded & mchg & cur_owned
+
+        # per-warrior net move charge (units of MOVE_COST): +new, -(re-dispatch/free/stop refunds)
+        delta_w = (is_new.long()
+                   - (is_new & mchg & prev_owned).long()   # re-dispatch off an owned building
+                   - free_moved.long()
+                   - refund_concl.long()) * MOVE_COST       # [B,W]
+        move_cost = torch.stack([delta_w[:, :self.Wside].sum(1),
+                                 delta_w[:, self.Wside:].sum(1)], dim=1)  # [B,2]
+
+        # commit per-warrior inference state (moved -> updated; concluded -> cleared;
+        # else carried; dead slots cleared so they can never trigger a stray refund)
+        self.w_tgt_set = torch.where(moved[:, :, None], new_tgt,
+                         torch.where(concluded[:, :, None], torch.zeros_like(tgt), tgt))
+        self.w_move_chg = torch.where(moved, new_mchg,
+                          torch.where(concluded, torch.zeros_like(mchg), mchg))
+        dead = ~alive_now
+        self.w_tgt_set = torch.where(dead[:, :, None], torch.zeros_like(self.w_tgt_set), self.w_tgt_set)
+        self.w_move_chg = self.w_move_chg & (~dead)
+        self.w_moved_last = moved & (~dead)
+
+        # economy: exact income/build/train, estimated moves, estimate-based upkeep
+        train_spend = self.pending_train * TRAIN_COST                  # [B,2] exact
+        est = self.est_gold - self.build_spend - move_cost - train_spend + self.prev_income
+        alive_cnt = torch.stack([(alive_now & (sd == 0)).sum(1),
+                                 (alive_now & (sd == 1)).sum(1)], dim=1)  # [B,2]
+        fed = torch.minimum(alive_cnt, est.clamp(min=0) // UPKEEP_PER_WARRIOR)
+        self.est_gold = est - UPKEEP_PER_WARRIOR * fed
 
     # build -> register moves -> train (morning, in that order)
     def _phase_build(self, actions, apply_agent_rules: bool = True):
@@ -518,7 +651,9 @@ class FastEnv:
             cost = torch.where(build_new, torch.full_like(cost, BASE_COST[1]), cost)
             cost = torch.where(can_up, upcost, cost)
             cost = torch.where(can_heal, healcost, cost)
-            self.gold[:, side] -= cost.sum(dim=1)
+            spend = cost.sum(dim=1)
+            self.gold[:, side] -= spend
+            self.build_spend[:, side] = spend        # exact, visible -> opp-gold estimate
 
             # apply: build new
             self.b_owner = torch.where(build_new, torch.full_like(self.b_owner, me), self.b_owner)
