@@ -275,6 +275,38 @@ def extract(env, side, prev_reach=None, prev_gold_pred=None):
     t1 = torch.cat([raw24, normx[:, :, None], normy[:, :, None], reach_delta],
                    dim=2)  # [B,T,31]
 
+    # ---- CRITIC-ONLY view -------------------------------------------------- #
+    # The submission never runs the critic, so during training it may condition
+    # on privileged (hidden) information the actor cannot see. Two swaps vs the
+    # actor's t1/glob (the actor tensors above are left untouched):
+    #   (a) glob opp-gold uses the EXACT hidden value g[:,6] (observe reports the
+    #       true self.gold[:,opp]) instead of the reconstructed env.est_gold;
+    #   (b) the per-거점 "enemy reachable within k turns" block (raw24[:,:,19:24])
+    #       is replaced by the enemy's PLANNED arrivals within k turns, computed
+    #       from the (hidden) opponent move orders EXACTLY like observe()'s own-
+    #       arrival block -- so the value net sees who is actually coming, not who
+    #       merely could. reach_delta (t1's last 5 dims) is left as the actor's.
+    sd_all = env.slot_side[None, :].expand(B, env.W)
+    op_moving = (env.w_hp > 0) & (sd_all == opp_idx) & env.w_move
+    tt_full = env.mb.travel_turns                      # [B,N,T]
+    tok_sorted = env.mb.token_ids                      # [B,T] ascending
+    ti_of = torch.searchsorted(tok_sorted, env.w_tgt.clamp(min=0)).clamp(max=T - 1)
+    is_tok = tok_sorted.gather(1, ti_of) == env.w_tgt
+    valid_mv = op_moving & is_tok                      # opp movers heading to a token
+    mcount = torch.zeros((B, N, T), dtype=torch.int64, device=t1.device)
+    if bool(valid_mv.any()):
+        flat = ((env.b_ar[:, None] * N + env.w_region) * T + ti_of)[valid_mv]
+        mcount.view(-1).scatter_add_(0, flat, torch.ones_like(flat))
+    op_arrive = torch.zeros((B, T, 5), dtype=torch.float32, device=t1.device)
+    for k in range(1, 6):                              # arrivals in EXACTLY k turns
+        op_arrive[:, :, k - 1] = (mcount * (tt_full == k)).sum(1).float()
+    raw24_crit = raw24.clone()
+    raw24_crit[:, :, 19:24] = slog1p(op_arrive) * tmask[:, :, None].float()
+    t1_crit = torch.cat([raw24_crit, normx[:, :, None], normy[:, :, None],
+                         reach_delta], dim=2)          # [B,T,31]
+    glob_crit = glob_t.clone()
+    glob_crit[:, 6] = plog1p(g[:, 6] / 100.0)          # exact opp gold
+
     cnt, sumhp = env._side_counts()
     turret, workcap = env._turret(), env._workcap()
 
@@ -337,7 +369,8 @@ def extract(env, side, prev_reach=None, prev_gold_pred=None):
     tok_dist = tokens[:, :, 24:24 + T].float()       # observe packs dist after the 24 feats
 
     return dict(
-        t1=t1, glob=glob_t, tmask=tmask, tok_ids=tok_ids,
+        t1=t1, glob=glob_t, t1_crit=t1_crit, glob_crit=glob_crit,
+        tmask=tmask, tok_ids=tok_ids,
         gold=gold, hq_level=hq_level,
         build_cand=build_cand, build_cost=cost,
         wc_cur=my_wc, wc_after=wc_after, stat_cnt=stat_cnt,
@@ -525,7 +558,8 @@ def sample_policy(t1net, t2net, o, N):
               'force_build': force_build_env}
 
     store = dict(
-        t1=o['t1'], glob=o['glob'], tmask=o['tmask'],
+        t1=o['t1'], glob=o['glob'],
+        t1_crit=o['t1_crit'], glob_crit=o['glob_crit'], tmask=o['tmask'],
         extra4=o['extra4'], tok_dist=o['tok_dist'],
         normx=o['normx'], normy=o['normy'],
         build_mask=build_mask, build_outcome=outcome,
@@ -1274,7 +1308,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             o_ag = extract(env, 0, prev_reach_ag, prev_gold_pred_ag)
             with torch.no_grad():
                 act_ag, store, _, ncommit_ag, gpred_ag = sample_policy(actor_t1, actor_t2, o_ag, N)
-                val = critic.value(o_ag['t1'], o_ag['glob'], o_ag['tmask'])
+                val = critic.value(o_ag['t1_crit'], o_ag['glob_crit'], o_ag['tmask'])
                 o_op = extract(env, 1, prev_reach_op, prev_gold_pred_op)
                 act_op, ncommit_op, gpred_op = opponent_actions(
                     pool_t1, pool_t2, o_op, opp_assign, env, 1, cfg.B, N, device,
@@ -1334,7 +1368,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             # bootstrap value on the post-rollout state; same prev_reach / gold pred the
             # next iter's first step will use (no env step happened in between).
             o_ag = extract(env, 0, prev_reach_ag, prev_gold_pred_ag)
-            last_val = critic.value(o_ag['t1'], o_ag['glob'], o_ag['tmask']).to(sdev)
+            last_val = critic.value(o_ag['t1_crit'], o_ag['glob_crit'], o_ag['tmask']).to(sdev)
 
         # ---- GAE ----
         adv = [None] * steps
@@ -1350,7 +1384,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             buf[t]['ret'] = adv[t] + buf[t]['value']
 
         # ---- flatten ----
-        keys = ['t1', 'glob', 'tmask', 'extra4', 'tok_dist', 'normx', 'normy',
+        keys = ['t1', 'glob', 't1_crit', 'glob_crit', 'tmask', 'extra4', 'tok_dist', 'normx', 'normy',
                 'build_mask', 'build_outcome', 'train_mask', 'train_cat',
                 'valid_src', 'tgt', 'surplus_pb', 'tgt_allowed', 'old_logp',
                 'adv', 'ret', 'value', 'gold_aux', 'gold_glob']
@@ -1391,7 +1425,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 opt_actor.step()
 
                 # ---- critic update (value regression + gold-production aux) ----
-                value, aux_c = critic.value_aux(mb['t1'], mb['glob'], mb['tmask'])
+                value, aux_c = critic.value_aux(mb['t1_crit'], mb['glob_crit'], mb['tmask'])
                 vloss = F.mse_loss(value, mb['ret'])
                 aux_loss_c = aux_losses(aux_c, mb['gold_aux'], mb['gold_glob'], mb['tmask'])
                 critic_loss = vloss + cfg.aux_coef * aux_loss_c
