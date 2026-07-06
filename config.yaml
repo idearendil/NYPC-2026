@@ -4,18 +4,18 @@
 
 # ---- rollout / batch ----
 B: 256                  # parallel games stepped together
-steps_per_iter: 250000  # env-steps collected per iteration (horizon = steps_per_iter / B)
-iters: 500              # number of training iterations
+steps_per_iter: 300000  # env-steps collected per iteration (horizon = steps_per_iter / B)
+iters: 750              # number of training iterations
 
 # ---- PPO ----
 gamma: 0.997            # discount
 lam: 0.95               # GAE lambda
 clip: 0.2               # PPO clip range
-lr: 0.0003              # Adam lr (shared by actor & critic optimizers)
-epochs: 4               # PPO epochs per iteration
+lr: 0.0001              # Adam lr (shared by actor & critic optimizers)
+epochs: 3               # PPO epochs per iteration
 minibatch: 4096         # minibatch size
 target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
-ent_coef: 0.005         # entropy bonus (actor loss)
+ent_coef: 0.001         # entropy bonus (actor loss)
 aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
