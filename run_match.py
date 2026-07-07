@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a submit_bot.py vs submit_bot.py match and write a replay log.
+"""Run a vanilla_bot.py vs vanilla_bot.py match and write a replay log.
 
 Thin wrapper around testing-tool.py (the judge) so you don't have to type the
 nested exec commands by hand. Uses the *current* Python interpreter for both the
@@ -24,14 +24,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def bot_cmd(py, weights, mode):
-    cmd = f'"{py}" "{os.path.join(HERE, "submit_bot.py")}" --weights "{weights}"'
-    if mode == "stochastic":
-        cmd += " --stochastic"
+    cmd = f'"{py}" "{os.path.join(HERE, "vanilla_bot.py")}" --weights "{weights}"'
+    # vanilla_bot CLI: --greedy = argmax, --stochastic = sample (default stochastic)
+    cmd += " --greedy" if mode == "argmax" else " --stochastic"
     return cmd
 
 
 def main():
-    ap = argparse.ArgumentParser(description="submit_bot vs submit_bot -> replay log")
+    ap = argparse.ArgumentParser(description="vanilla_bot vs vanilla_bot -> replay log")
     ap.add_argument("--left", choices=["argmax", "stochastic"], default="argmax",
                     help="LEFT player policy (default: argmax)")
     ap.add_argument("--right", choices=["argmax", "stochastic"], default="stochastic",

@@ -83,7 +83,7 @@ OWN_LEFT, OWN_RIGHT = 1, 2
 KIND_HQ, KIND_BASE = 1, 2
 
 TOK_FEAT = 31           # 14 + 5 arrive + 5 reach + 2 coords + 5 reach-delta vs prev turn
-GLOB_FEAT = 12          # 11 + HQ-upgrade "turns to afford" (log1p)
+GLOB_FEAT = 16          # 11 + HQ-turns + 거점-count + x/y map-span + own prev aux opp-gold pred
 T2_EXTRA = 8
 COST_INF = 1_000_000_000
 BIG = 1 << 20            # unreachable travel marker (matches fast_env)
@@ -189,6 +189,16 @@ class Net:
         head = linear(gelu(linear(h, W["t1.head.0.weight"], W["t1.head.0.bias"])),
                       W["t1.head.2.weight"], W["t1.head.2.bias"])   # [K,T,5]
         return h, head
+
+    def aux_gold_pred(self, h1):                 # h1:[T,d] -> scalar
+        """The actor's auxiliary prediction of the opponent's next-turn gold, in the
+        aux target space ln(1+gold/100): run the aux head (Linear-GELU-Linear -> [T,7]),
+        take channel 6, mean over tokens (all valid here). Mirrors ppo_selfplay's
+        sample_policy gold_pred; fed back as glob feature #15 the FOLLOWING turn."""
+        W = self.W
+        a = linear(gelu(linear(h1, W["t1.aux.0.weight"], W["t1.aux.0.bias"])),
+                   W["t1.aux.2.weight"], W["t1.aux.2.bias"])   # [T,7]
+        return float(a[:, 6].mean())
 
     def has_critic(self):
         return "critic.enc.embed.weight" in self.W
@@ -385,6 +395,7 @@ class Bot:
         self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
         self.hq_commit = False           # saving-for-HQ-upgrade macro (see _select_action)
         self.prev_reach = None           # last turn's raw enemy-reachability [T,5] for the delta feature
+        self.prev_gold_pred = 0.0        # last turn's actor-aux opp-gold prediction, fed as glob feature #15
 
         self.my_side = 'A'
         self.me_code = OWN_LEFT
@@ -562,6 +573,14 @@ class Bot:
             plog1p(self.income[me] / 10), plog1p(self.income[opp] / 10),
             plog1p(lvl_sum_me / 5), plog1p(lvl_sum_op / 5),
             self._hq_turns_feature(my_hq_level, my_total),
+            # static map-geometry globals (mirror ppo_selfplay.extract): 거점 count and
+            # physical map size (x/y span over ALL regions; /10000 keeps span O(1)).
+            plog1p(len(g) / 7.0),
+            plog1p((max(self.x) - min(self.x)) / 10000.0),
+            plog1p((max(self.y) - min(self.y)) / 10000.0),
+            # this side's OWN previous-turn actor-aux prediction of the opponent's
+            # next-turn gold (ln(1+gold/100) space), fed back as a feature. 0 on turn 1.
+            getattr(self, 'prev_gold_pred', 0.0),
         ])
 
         # action masking quantities
@@ -707,6 +726,10 @@ class Bot:
             h1, head5 = self.net.t1(o['t1'], o['glob'])
         else:
             h1, head5 = t1_cache
+        # this turn's actor-aux prediction of the opponent's next-turn gold becomes
+        # NEXT turn's glob feature #15 (mirrors ppo_selfplay.sample_policy's gold_pred
+        # threading). encode() already consumed the PREVIOUS value before this call.
+        self.prev_gold_pred = self.net.aux_gold_pred(h1)
 
         # Non-moving friendly warriors board-wide (caps builds), and of those the
         # "free" ones not currently labouring -- surplus beyond each region's
