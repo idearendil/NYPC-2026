@@ -475,16 +475,21 @@ class FastEnv:
         return cnt, sumhp
 
     # --------------------------------------------------------------- step
-    def step(self, actions: dict, apply_agent_rules: bool = True):
+    def step(self, actions: dict, apply_agent_rules: bool = True, relax_right=None):
         """Advance every game one day. ``actions`` = {'left':{...}, 'right':{...}}
         each with build [B,N] bool, move [B,N] long (-1 none), train [B] long.
 
         ``apply_agent_rules`` (default True) enables the agent-side build policy
         baked into the env: gate builds on having a non-moving worker, cap builds
         to the worker count, and auto-staff understaffed new/upgraded bases. Set
-        it False for a pure-rules step (used by the testing-tool parity tests)."""
+        it False for a pure-rules step (used by the testing-tool parity tests).
+
+        ``relax_right`` [B,N] bool (optional): per-region "lift the work-cap move
+        restriction" flag for the RIGHT player (side 1). Where set, every commanded
+        warrior in that region moves (no work_cap kept home). Used for the opponent
+        in full-mobilisation training games; None = normal rules for both sides."""
         self._phase_build(actions, apply_agent_rules)
-        self._phase_register_moves(actions)
+        self._phase_register_moves(actions, relax_right)
         self._phase_train_charge(actions)
         # snapshot for the opp-gold move inference: regions BEFORE movement, and who
         # was alive to move this turn (spawns happen after, so they can't have moved).
@@ -731,7 +736,7 @@ class FastEnv:
         self.w_move = torch.where(assigned, torch.ones_like(self.w_move), self.w_move)
         self.w_tgt = torch.where(assigned, force_tgt, self.w_tgt)
 
-    def _phase_register_moves(self, actions):
+    def _phase_register_moves(self, actions, relax_right=None):
         B, N = self.B, self.N
         cnt, _ = self._side_counts()
         workcap = self._workcap()
@@ -752,6 +757,10 @@ class FastEnv:
 
             keepcap = torch.where(self.b_owner == me, workcap,
                                   torch.zeros_like(workcap))  # [B,N]
+            # full-mobilisation: for flagged RIGHT-player regions, keep nobody home so
+            # every commanded warrior (incl. labourers) moves.
+            if side == 1 and relax_right is not None:
+                keepcap = torch.where(relax_right, torch.zeros_like(keepcap), keepcap)
             keep_w = keepcap.gather(1, w_region)              # [B,Wside]
 
             group = self.b_ar[:, None] * N + w_region

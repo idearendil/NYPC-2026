@@ -427,7 +427,11 @@ def train_logits_from_head(head5, tmask):
 # --------------------------------------------------------------------------- #
 # action sampling (collection)
 # --------------------------------------------------------------------------- #
-def sample_policy(t1net, t2net, o, N):
+def sample_policy(t1net, t2net, o, N, relax_reg=None):
+    # relax_reg [B,N] bool (optional): per-region "lift the work-cap MOVE restriction"
+    # flag. Where set, this region's labourers may also be ordered to move (surplus =
+    # ALL stationary warriors, not just those beyond work_cap). Used only for the
+    # opponent in full-mobilisation games; the training agent always passes None.
     B, T = o['tmask'].shape
     dev = o['t1'].device
     h1, head5 = t1net(o['t1'], o['glob'], o['tmask'])
@@ -496,6 +500,12 @@ def sample_policy(t1net, t2net, o, N):
 
     # post-build quantities
     wc_pb = torch.where(exec_all, o['wc_after'], o['wc_cur'])
+    # full-mobilisation: drop the move-source work-cap (-> surplus = all stationary)
+    # for flagged regions, so labourers there become movable. Affects moves only; the
+    # build free-worker gate above (o['free_total']) is unchanged.
+    if relax_reg is not None:
+        relax_tok = relax_reg.gather(1, o['tok_ids'].clamp(max=N - 1)) & o['tmask']
+        wc_pb = torch.where(relax_tok, torch.zeros_like(wc_pb), wc_pb)
     surplus_pb = (o['stat_cnt'] - wc_pb).clamp(min=0)
     owner_me_pb = o['owner_me'] | (exec_all & o['build_new'])
     hq_after = (o['hq_level'] + do_hq_now.long()).clamp(max=HQ_MAXLEVEL)
@@ -711,6 +721,13 @@ class Config:
     pool_snapshot_every: int = 80    # every N iters, snapshot the current actor as a
                                      # PERMANENT (never-evicted) opponent and bump the cap
     opp_sample_floor: float = 0.05   # min sampling weight per opponent
+    # "full-mobilisation" opponent games: a fraction of games where the opponent may
+    # ignore the work-cap move restriction (labourers CAN be ordered to move) so the
+    # agent learns to predict opponents that mobilise every warrior. Per such game,
+    # each opponent base/HQ independently drops the restriction with opp_relax_prob
+    # per turn. These games' win/loss do NOT feed the EMA win rate.
+    opp_relax_frac: float = 0.20     # fraction of games flagged full-mobilisation
+    opp_relax_prob: float = 0.10     # per-base/HQ per-turn relax prob in those games
     use_wandb: bool = True
     # checkpointing
     ckpt_path: str = "checkpoint.pt"  # saved at the start of every iter
@@ -1119,7 +1136,7 @@ def japper_action(env, side, jstate):
 
 
 def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
-                     rstate, jstate):
+                     rstate, jstate, relax_reg=None):
     """Sample opponent actions, grouping batch slots by their assigned opponent so
     each opponent runs once over its subset of games. The first N_SCRIPTED unified
     indices are fixed scripted bots (0 = rusher, 1 = japper); index p >= N_SCRIPTED
@@ -1144,8 +1161,10 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
             force_full[rows] = act['force_build'][rows]
         else:
             sub = slice_obs(o_op, rows)
+            sub_relax = relax_reg[rows] if relax_reg is not None else None
             act, _, _, ncommit, gpred = sample_policy(pool_t1[p - N_SCRIPTED],
-                                                      pool_t2[p - N_SCRIPTED], sub, N)
+                                                      pool_t2[p - N_SCRIPTED], sub, N,
+                                                      relax_reg=sub_relax)
             build_full[rows] = act['build']
             move_full[rows] = act['move']
             train_full[rows] = act['train']
@@ -1190,6 +1209,11 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     opp_gen = torch.Generator().manual_seed(seed + 777)
     opp_assign = sample_opponents(cfg.B, pool_wr, opp_gen,
                                   cfg.opp_sample_floor).to(device)
+    # full-mobilisation flag per game (see opp_relax_frac): these games let the opponent
+    # ignore the work-cap move restriction, and their results are excluded from the EMA
+    # win rate. Constant within an episode; resampled when a game regenerates. Ephemeral
+    # (not checkpointed) -- the env resets on resume, so a fresh draw is consistent.
+    relaxed_game = torch.rand(cfg.B, device=device) < cfg.opp_relax_frac
 
     actor_params = list(actor_t1.parameters()) + list(actor_t2.parameters())
     critic_params = list(critic.parameters())
@@ -1310,15 +1334,19 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 act_ag, store, _, ncommit_ag, gpred_ag = sample_policy(actor_t1, actor_t2, o_ag, N)
                 val = critic.value(o_ag['t1_crit'], o_ag['glob_crit'], o_ag['tmask'])
                 o_op = extract(env, 1, prev_reach_op, prev_gold_pred_op)
+                # per-region full-mobilisation mask for the opponent this turn: only in
+                # flagged games, each opponent region independently with opp_relax_prob.
+                relax_reg = (relaxed_game[:, None]
+                             & (torch.rand(cfg.B, N, device=device) < cfg.opp_relax_prob))
                 act_op, ncommit_op, gpred_op = opponent_actions(
                     pool_t1, pool_t2, o_op, opp_assign, env, 1, cfg.B, N, device,
-                    rstate, jstate)
+                    rstate, jstate, relax_reg=relax_reg)
             # this turn's reach + own aux gold prediction become next turn's features
             prev_reach_ag = o_ag['reach_raw'].clone()
             prev_reach_op = o_op['reach_raw'].clone()
             prev_gold_pred_ag = gpred_ag
             prev_gold_pred_op = gpred_op
-            env.step({'left': act_ag, 'right': act_op})
+            env.step({'left': act_ag, 'right': act_op}, relax_right=relax_reg)
             # carry the HQ-upgrade commitment to next turn (regen resets it for
             # finished games below).
             env.hq_commit[:, 0] = ncommit_ag
@@ -1348,12 +1376,20 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                                               torch.full_like(rr, 0.5)))
                 assigned = opp_assign[drows].cpu()
                 res_c = res.cpu()
+                # full-mobilisation games are excluded from the EMA win rate (their
+                # relaxed opponent isn't representative of real play).
+                relaxed_c = relaxed_game[drows].cpu()
                 for j in range(drows.numel()):
+                    if bool(relaxed_c[j]):
+                        continue
                     p = int(assigned[j])
                     pool_wr[p] = (1 - alpha) * pool_wr[p] + alpha * float(res_c[j])
                 # fresh opponent for each finished game, then fresh map + reset
                 opp_assign[drows] = sample_opponents(
                     drows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
+                # re-roll the full-mobilisation flag for each regenerated game
+                relaxed_game[drows] = (torch.rand(drows.numel(), device=device)
+                                       < cfg.opp_relax_frac)
                 env.regen(done)
                 # new map -> no prior turn; baseline the reach deltas + gold pred at 0
                 prev_reach_ag[drows] = 0

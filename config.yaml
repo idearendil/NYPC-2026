@@ -16,7 +16,7 @@ epochs: 3               # PPO epochs per iteration
 minibatch: 4096         # minibatch size
 target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
 ent_coef: 0.0005         # entropy bonus (actor loss)
-aux_coef: 0.1          # gold-production aux-prediction loss weight (actor & critic); 0 disables
+aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
 # ---- model ----
