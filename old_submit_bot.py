@@ -83,7 +83,7 @@ OWN_LEFT, OWN_RIGHT = 1, 2
 KIND_HQ, KIND_BASE = 1, 2
 
 TOK_FEAT = 31           # 14 + 5 arrive + 5 reach + 2 coords + 5 reach-delta vs prev turn
-GLOB_FEAT = 16          # 11 + HQ-turns + 거점-count + x/y map-span + own prev aux opp-gold pred
+GLOB_FEAT = 12          # 11 + HQ-upgrade "turns to afford" (log1p)
 T2_EXTRA = 8
 COST_INF = 1_000_000_000
 BIG = 1 << 20            # unreachable travel marker (matches fast_env)
@@ -189,16 +189,6 @@ class Net:
         head = linear(gelu(linear(h, W["t1.head.0.weight"], W["t1.head.0.bias"])),
                       W["t1.head.2.weight"], W["t1.head.2.bias"])   # [K,T,5]
         return h, head
-
-    def aux_gold_pred(self, h1):                 # h1:[T,d] -> scalar
-        """The actor's auxiliary prediction of the opponent's next-turn gold, in the
-        aux target space ln(1+gold/100): run the aux head (Linear-GELU-Linear -> [T,7]),
-        take channel 6, mean over tokens (all valid here). Mirrors ppo_selfplay's
-        sample_policy gold_pred; fed back as glob feature #15 the FOLLOWING turn."""
-        W = self.W
-        a = linear(gelu(linear(h1, W["t1.aux.0.weight"], W["t1.aux.0.bias"])),
-                   W["t1.aux.2.weight"], W["t1.aux.2.bias"])   # [T,7]
-        return float(a[:, 6].mean())
 
     def has_critic(self):
         return "critic.enc.embed.weight" in self.W
@@ -395,7 +385,6 @@ class Bot:
         self.rng = None                  # numpy.random pulled in lazily too (handshake hygiene)
         self.hq_commit = False           # saving-for-HQ-upgrade macro (see _select_action)
         self.prev_reach = None           # last turn's raw enemy-reachability [T,5] for the delta feature
-        self.prev_gold_pred = 0.0        # last turn's actor-aux opp-gold prediction, fed as glob feature #15
 
         self.my_side = 'A'
         self.me_code = OWN_LEFT
@@ -573,14 +562,6 @@ class Bot:
             plog1p(self.income[me] / 10), plog1p(self.income[opp] / 10),
             plog1p(lvl_sum_me / 5), plog1p(lvl_sum_op / 5),
             self._hq_turns_feature(my_hq_level, my_total),
-            # static map-geometry globals (mirror ppo_selfplay.extract): 거점 count and
-            # physical map size (x/y span over ALL regions; /10000 keeps span O(1)).
-            plog1p(len(g) / 7.0),
-            plog1p((max(self.x) - min(self.x)) / 10000.0),
-            plog1p((max(self.y) - min(self.y)) / 10000.0),
-            # this side's OWN previous-turn actor-aux prediction of the opponent's
-            # next-turn gold (ln(1+gold/100) space), fed back as a feature. 0 on turn 1.
-            getattr(self, 'prev_gold_pred', 0.0),
         ])
 
         # action masking quantities
@@ -708,11 +689,8 @@ class Bot:
         to a DIFFERENT stronghold. Falls back to the normal single action whenever the
         HQ isn't sending >= 2 warriors."""
         pr0 = self.prev_reach                       # reach baseline before any turn-1 encode
-        pgp0 = self.prev_gold_pred                  # aux opp-gold-pred baseline (glob feat #15)
         o1 = self.encode(turn)
         plan1 = self._select_action(o1)
-        reach1 = self.prev_reach                    # this turn's true reach (for turn-2 delta)
-        pred1 = self.prev_gold_pred                 # this turn's true aux pred (for turn-2 feat)
         hq_reg = 0 if self.my_side == 'A' else self.N - 1
         hq_tok = self.tok2idx.get(hq_reg)
         exec_move1, tgt1, wc_pb1 = plan1[1], plan1[2], plan1[3]
@@ -739,24 +717,17 @@ class Bot:
         cost = 0 if (a_bld is not None and a_bld.side == self.my_side) else MOVE_COST
         self.gold[self.my_side] = saved_gold - cost
         w_a.moving, w_a.target = True, a_reg
-        # reset the recurrent features to their turn-0 baseline so o2's reach-delta and
-        # opp-gold-pred feature match o1's (still "turn 1", not "since the 1st inference").
-        self.prev_reach = pr0
-        self.prev_gold_pred = pgp0
+        self.prev_reach = pr0                       # so o2's reach-delta matches o1's (turn 0 baseline)
         o2 = self.encode(turn)
         plan2 = self._select_action(o2, forbid_tgt=a_tok)
         # _to_commands reads live state: w_a is now moving (excluded), so this dispatches
         # the REMAINING HQ warrior(s) to target B, and picks up the (re-decided) training.
         upgrades, moves2, train_cat = self._to_commands(plan2, o2)
 
-        # restore the mutated state; read_turn_result will apply the authoritative moves.
-        # prev_reach / prev_gold_pred are restored to o1's values (the true turn-1
-        # observation) so turn 2's recurrent features thread from there.
+        # restore the mutated state; read_turn_result will apply the authoritative moves
         self.gold[self.my_side] = saved_gold
         w_a.moving, w_a.target = saved_moving, saved_target
         self.hq_commit = saved_commit
-        self.prev_reach = reach1
-        self.prev_gold_pred = pred1
 
         moves = [(w_a.side, w_a.num, a_reg)] + moves2
         return upgrades, moves, train_cat
@@ -794,10 +765,6 @@ class Bot:
             h1, head5 = self.net.t1(o['t1'], o['glob'])
         else:
             h1, head5 = t1_cache
-        # this turn's actor-aux prediction of the opponent's next-turn gold becomes
-        # NEXT turn's glob feature #15 (mirrors ppo_selfplay.sample_policy's gold_pred
-        # threading). encode() already consumed the PREVIOUS value before this call.
-        self.prev_gold_pred = self.net.aux_gold_pred(h1)
 
         # Non-moving friendly warriors board-wide (caps builds), and of those the
         # "free" ones not currently labouring -- surplus beyond each region's
@@ -1239,7 +1206,7 @@ def main():
     # Manual argv parse (no argparse) -- supports `--weights X`, `--weights=X`,
     # `--stochastic` (default) / `--greedy`. No search knobs: this bot always emits a
     # single one-shot policy action. Defaults: data.bin, stochastic sampling.
-    weights, stochastic = "data.bin", True
+    weights, stochastic = "data.bin", False
     args = sys.argv[1:]
     i = 0
     while i < len(args):

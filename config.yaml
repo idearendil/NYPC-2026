@@ -5,7 +5,7 @@
 # ---- rollout / batch ----
 B: 256                  # parallel games stepped together
 steps_per_iter: 300000  # env-steps collected per iteration (horizon = steps_per_iter / B)
-iters: 1000              # number of training iterations
+iters: 1250              # number of training iterations
 
 # ---- PPO ----
 gamma: 0.997            # discount

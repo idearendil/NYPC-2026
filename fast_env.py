@@ -778,6 +778,38 @@ class FastEnv:
             self.w_move[:, sl] = torch.where(move_flag, torch.ones_like(w_move), w_move)
             self.w_tgt[:, sl] = torch.where(move_flag, tgt_w, self.w_tgt[:, sl])
 
+    def opening_premove(self, side, hq_region, target, mask):
+        """Turn-1 opening split helper: for each game in ``mask`` [B] bool, dispatch
+        EXACTLY ONE warrior -- the first surplus one (lowest hp, then suffix, beyond the
+        HQ work_cap) -- from ``hq_region[b]`` to ``target[b]`` for ``side``. Sets
+        w_move/w_tgt and charges the move cost (0 onto our own building). Because the
+        subsequent normal move registration skips already-moving warriors (~w_move), the
+        remaining surplus warrior can then be sent to a DIFFERENT target the same turn."""
+        B, N = self.B, self.N
+        me = OWN_LEFT if side == 0 else OWN_RIGHT
+        base = self.left_base if side == 0 else self.right_base
+        sl = slice(base, base + self.Wside)
+        w_hp = self.w_hp[:, sl]
+        w_region = self.w_region[:, sl]
+        slot = self.slot_idx[None, base:base + self.Wside].expand(B, self.Wside)
+        workcap = self._workcap()
+
+        at_hq = (w_region == hq_region[:, None]) & mask[:, None] & (target[:, None] >= 0)
+        candidate = (w_hp > 0) & (~self.w_move[:, sl]) & at_hq
+        group = self.b_ar[:, None] * N + w_region
+        rank, _ = _seg_stats(group, w_hp, slot, candidate)
+        keep = workcap.gather(1, hq_region.clamp(min=0)[:, None]).squeeze(1)   # [B]
+        move_flag = candidate & (rank == keep[:, None])            # exactly the 1st surplus
+
+        tgt_clamped = target.clamp(min=0)
+        tgt_mine = (self.b_owner.gather(1, tgt_clamped[:, None]).squeeze(1) == me)
+        cost = torch.where(tgt_mine, torch.zeros_like(target), torch.full_like(target, MOVE_COST))
+        self.gold[:, side] -= move_flag.any(1).long() * cost
+        tgt_b = target[:, None].expand(B, self.Wside)
+        self.w_move[:, sl] = torch.where(move_flag, torch.ones_like(self.w_move[:, sl]),
+                                         self.w_move[:, sl])
+        self.w_tgt[:, sl] = torch.where(move_flag, tgt_b, self.w_tgt[:, sl])
+
     def _phase_train_charge(self, actions):
         self.pending_train = torch.zeros((self.B, 2), dtype=torch.int64, device=self.device)
         for side in (0, 1):

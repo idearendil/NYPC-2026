@@ -427,11 +427,14 @@ def train_logits_from_head(head5, tmask):
 # --------------------------------------------------------------------------- #
 # action sampling (collection)
 # --------------------------------------------------------------------------- #
-def sample_policy(t1net, t2net, o, N, relax_reg=None):
+def sample_policy(t1net, t2net, o, N, relax_reg=None, forbid_tgt=None):
     # relax_reg [B,N] bool (optional): per-region "lift the work-cap MOVE restriction"
     # flag. Where set, this region's labourers may also be ordered to move (surplus =
     # ALL stationary warriors, not just those beyond work_cap). Used only for the
     # opponent in full-mobilisation games; the training agent always passes None.
+    # forbid_tgt [B] long (optional): per-game token index to mask out of EVERY move
+    # source's target distribution (-1 = none). Used by the turn-1 opening split so the
+    # second inference can't re-pick the first inference's target.
     B, T = o['tmask'].shape
     dev = o['t1'].device
     h1, head5 = t1net(o['t1'], o['glob'], o['tmask'])
@@ -519,6 +522,12 @@ def sample_policy(t1net, t2net, o, N, relax_reg=None):
     logits = t2_logits_sources(t2net, h1, o['extra4'], surplus_pb, o['tok_dist'],
                                o['normx'], o['normy'], o['tmask'], valid_src)
     logits = logits.masked_fill(~tgt_allowed[:, None, :], -1e9)
+    if forbid_tgt is not None:
+        fmask = torch.zeros(B, T, dtype=torch.bool, device=dev)
+        frows = (forbid_tgt >= 0).nonzero(as_tuple=True)[0]
+        if frows.numel() > 0:
+            fmask[frows, forbid_tgt[frows].clamp(max=T - 1)] = True
+            logits = logits.masked_fill(fmask[:, None, :], -1e9)
     logp_tok = F.log_softmax(logits, dim=2)                       # [B,src,tok]
     src_idx = torch.arange(T, device=dev)[None, :].expand(B, T)
     tgt = src_idx.clone()                                         # default: self (no move)
@@ -728,6 +737,10 @@ class Config:
     # per turn. These games' win/loss do NOT feed the EMA win rate.
     opp_relax_frac: float = 0.20     # fraction of games flagged full-mobilisation
     opp_relax_prob: float = 0.10     # per-base/HQ per-turn relax prob in those games
+    # turn-1 opening split: on each game's first turn, infer the actor twice so the HQ's
+    # two spare warriors head to DIFFERENT strongholds (faster 2-base opening; matches
+    # the submission bots). Applies to the agent and to NET opponents (not rusher/japper).
+    opening_split: bool = True
     use_wandb: bool = True
     # checkpointing
     ckpt_path: str = "checkpoint.pt"  # saved at the start of every iter
@@ -1135,8 +1148,17 @@ def japper_action(env, side, jstate):
     return {'build': build, 'move': move, 'train': train, 'force_build': force}
 
 
+def region_to_token(token_ids, region):
+    """Map a region id [B] to its token index [B] via searchsorted on the ascending
+    per-game token_ids [B,T]. The region is assumed to BE a token (move targets always
+    are); non-token/-1 inputs give a harmless clamped index the caller masks off."""
+    q = region.clamp(min=0)[:, None]
+    T = token_ids.shape[1]
+    return torch.searchsorted(token_ids, q).clamp(max=T - 1).squeeze(1)
+
+
 def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
-                     rstate, jstate, relax_reg=None):
+                     rstate, jstate, relax_reg=None, forbid_tgt=None):
     """Sample opponent actions, grouping batch slots by their assigned opponent so
     each opponent runs once over its subset of games. The first N_SCRIPTED unified
     indices are fixed scripted bots (0 = rusher, 1 = japper); index p >= N_SCRIPTED
@@ -1162,9 +1184,11 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
         else:
             sub = slice_obs(o_op, rows)
             sub_relax = relax_reg[rows] if relax_reg is not None else None
+            sub_forbid = forbid_tgt[rows] if forbid_tgt is not None else None
             act, _, _, ncommit, gpred = sample_policy(pool_t1[p - N_SCRIPTED],
                                                       pool_t2[p - N_SCRIPTED], sub, N,
-                                                      relax_reg=sub_relax)
+                                                      relax_reg=sub_relax,
+                                                      forbid_tgt=sub_forbid)
             build_full[rows] = act['build']
             move_full[rows] = act['move']
             train_full[rows] = act['train']
@@ -1341,12 +1365,55 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 act_op, ncommit_op, gpred_op = opponent_actions(
                     pool_t1, pool_t2, o_op, opp_assign, env, 1, cfg.B, N, device,
                     rstate, jstate, relax_reg=relax_reg)
+            # ---------------- turn-1 opening split ----------------
+            # On a game's first turn (env.day==0) our region-move action space would send
+            # the HQ's two spare warriors to ONE stronghold. Re-infer with warrior #1
+            # already en route (gold / HQ movable-count / target arrivals updated in the
+            # features) and its target MASKED, so warrior #2 goes to a DIFFERENT stronghold
+            # -- both moves execute this turn (the normal registration below skips the
+            # already-moving #1 via ~w_move). The STORED transition stays the FIRST
+            # inference (trained as usual, o_ag/store/val untouched); the second move is
+            # folded into the executed action, matching how the submission bots auto-split.
+            act_ag_exec = act_ag
+            if cfg.opening_split:
+                turn1 = env.day == 0
+                with torch.no_grad():
+                    hq0 = env.hq_region[:, 0]
+                    a_reg0 = act_ag['move'].gather(1, hq0[:, None]).squeeze(1)
+                    split0 = turn1 & (a_reg0 >= 0)
+                    if bool(split0.any()):
+                        env.opening_premove(0, hq0, a_reg0, split0)          # warrior #1 -> A
+                        o2 = extract(env, 0, prev_reach_ag, prev_gold_pred_ag)
+                        forbid0 = torch.where(split0, region_to_token(env.mb.token_ids, a_reg0),
+                                              torch.full_like(a_reg0, -1))
+                        act2, _, _, _, _ = sample_policy(actor_t1, actor_t2, o2, N,
+                                                         forbid_tgt=forbid0)
+                        b_reg0 = act2['move'].gather(1, hq0[:, None]).squeeze(1)
+                        mv = act_ag['move'].clone()
+                        r0 = split0.nonzero(as_tuple=True)[0]
+                        mv[r0, hq0[r0]] = b_reg0[r0]                          # execute HQ -> B
+                        act_ag_exec = {**act_ag, 'move': mv}
+                    # net opponents only (scripted rusher/japper keep their region moves)
+                    hq1 = env.hq_region[:, 1]
+                    a_reg1 = act_op['move'].gather(1, hq1[:, None]).squeeze(1)
+                    split1 = turn1 & (opp_assign >= N_SCRIPTED) & (a_reg1 >= 0)
+                    if bool(split1.any()):
+                        env.opening_premove(1, hq1, a_reg1, split1)
+                        o2op = extract(env, 1, prev_reach_op, prev_gold_pred_op)
+                        forbid1 = torch.where(split1, region_to_token(env.mb.token_ids, a_reg1),
+                                              torch.full_like(a_reg1, -1))
+                        act_op2, _, _ = opponent_actions(
+                            pool_t1, pool_t2, o2op, opp_assign, env, 1, cfg.B, N, device,
+                            rstate, jstate, relax_reg=relax_reg, forbid_tgt=forbid1)
+                        b_reg1 = act_op2['move'].gather(1, hq1[:, None]).squeeze(1)
+                        r1 = split1.nonzero(as_tuple=True)[0]
+                        act_op['move'][r1, hq1[r1]] = b_reg1[r1]             # execute HQ -> B
             # this turn's reach + own aux gold prediction become next turn's features
             prev_reach_ag = o_ag['reach_raw'].clone()
             prev_reach_op = o_op['reach_raw'].clone()
             prev_gold_pred_ag = gpred_ag
             prev_gold_pred_op = gpred_op
-            env.step({'left': act_ag, 'right': act_op}, relax_right=relax_reg)
+            env.step({'left': act_ag_exec, 'right': act_op}, relax_right=relax_reg)
             # carry the HQ-upgrade commitment to next turn (regen resets it for
             # finished games below).
             env.hq_commit[:, 0] = ncommit_ag
