@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""Head-to-head win-rate test between two selectable bot engines, over random map
+"""Head-to-head win-rate test between two vanilla_bot weight files, over random map
 seeds.
 
 Each seed is played TWICE with sides swapped (new plays LEFT then RIGHT) so any
 LEFT/RIGHT asymmetry cancels out. Wins/losses/draws are tallied from the judge's
-`RESULT <outcome> <reason>` line. Both bots read the SAME data.bin -- the search
-bots additionally use the critic in it; make sure data.bin was exported with a
-critic (export_weights.py), otherwise a search bot silently falls back to the
-single-action path.
-
-Each side's engine is selectable via --new-engine / --old-engine:
-  * baseline -> old_submit_bot.py  (single-action python baseline)
-  * py       -> submit_bot.py      (1-step expected-value search; uses --cand/--depth)
-  * py2      -> submit_bot2.py      (k-candidate depth-d rollout; uses --cand2/--depth2)
+`RESULT <outcome> <reason>` line. Both sides run the SAME bot (`vanilla_bot.py`);
+what differs is the weights each one loads -- so this measures "is the new
+checkpoint stronger than the old one?".
 
 Usage:
-    python power_test.py --games 20                          # py-search vs baseline
-    python power_test.py --games 20 --new-engine py2 --old-engine py   # rollout vs 1-step
-    python power_test.py --games 40 --weights data.bin --jobs 4 --cand2 3 --depth2 3
+    python power_test.py --games 20                              # data.bin vs data.bin (sanity: ~50%)
+    python power_test.py --games 40 --old-weights old.bin        # new checkpoint vs an archived one
+    python power_test.py --games 40 --jobs 4 --greedy
 """
 import argparse
 import concurrent.futures as cf
@@ -28,23 +22,14 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PY = r"D:\other_programs\anaconda3\envs\orbit\python.exe"  # has numpy
+DEFAULT_PY = r"D:\other_programs\anaconda3\envs\nypc\python.exe"  # has numpy
 RESULT_RE = re.compile(r"RESULT\s+(LEFT_WIN|RIGHT_WIN|DRAW)\s+(\S+)")
 
 
-def build_cmd(engine, py, weights, depth, cand, depth2, cand2, budget, stochastic):
-    """Command line for one contender. engine:
-      * "baseline" -> old_submit_bot.py (single-action python baseline)
-      * "py"       -> submit_bot.py     (1-step expected-value search; --cand/--depth)
-      * "py2"      -> submit_bot2.py     (k-candidate depth-d rollout; --cand2/--depth2)"""
-    s = " --stochastic" if stochastic else ""
-    if engine == "baseline":
-        return f'"{py}" old_submit_bot.py --weights "{weights}"{s}'
-    if engine == "py2":
-        dep = f" --depth {depth2}" if depth2 and depth2 > 0 else ""   # else submit_bot2 default (=3)
-        return f'"{py}" submit_bot2.py --weights "{weights}"{dep} --cand {cand2} --budget {budget}{s}'
-    dep = f" --depth {depth}" if depth and depth > 0 else ""   # else submit_bot's default (unlimited)
-    return f'"{py}" submit_bot.py --weights "{weights}"{dep} --cand {cand} --budget {budget}{s}'
+def build_cmd(py, weights, stochastic):
+    """Command line for one contender: vanilla_bot with the given weight file."""
+    s = " --stochastic" if stochastic else " --greedy"
+    return f'"{py}" vanilla_bot.py --weights "{weights}"{s}'
 
 
 def run_one(py, seed, left_cmd, right_cmd, logdir, timeout):
@@ -64,11 +49,10 @@ def run_one(py, seed, left_cmd, right_cmd, logdir, timeout):
     return m.group(1), m.group(2)
 
 
-def play_seed(py, seed, weights, depth, cand, depth2, cand2, budget, stochastic,
-              logdir, timeout, new_engine="py", old_engine="baseline"):
+def play_seed(py, seed, new_weights, old_weights, stochastic, logdir, timeout):
     """Two games for one seed: new=LEFT then new=RIGHT. Returns a list of dicts."""
-    ncmd = build_cmd(new_engine, py, weights, depth, cand, depth2, cand2, budget, stochastic)
-    ocmd = build_cmd(old_engine, py, weights, depth, cand, depth2, cand2, budget, stochastic)
+    ncmd = build_cmd(py, new_weights, stochastic)
+    ocmd = build_cmd(py, old_weights, stochastic)
     out = []
     # game 1: new is LEFT (exec1), old is RIGHT (exec2)
     oc, rs = run_one(py, seed, ncmd, ocmd, logdir + "_A", timeout)
@@ -94,64 +78,43 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--games", type=int, default=20, help="number of seeds (2 games each)")
     ap.add_argument("--base-seed", type=int, default=1000)
-    ap.add_argument("--weights", default="data.bin")
+    ap.add_argument("--weights", default="data.bin",
+                    help="weights for the 'new' side (default: data.bin)")
+    ap.add_argument("--old-weights", default=None,
+                    help="weights for the 'old' side (default: same as --weights)")
     ap.add_argument("--python", default=DEFAULT_PY, help="interpreter for the bots + judge")
-    ap.add_argument("--depth", type=int, default=0,
-                    help="lookahead ceiling; 0 = omit (submit_bot uses its default: unlimited/time-only)")
-    ap.add_argument("--cand", type=int, default=5,
-                    help="submit_bot.py (py): stochastic opponent replies per turn")
-    ap.add_argument("--depth2", type=int, default=0,
-                    help="submit_bot2.py (py2): optional hard rollout-depth ceiling; 0 = unlimited (time-only)")
-    ap.add_argument("--cand2", type=int, default=3,
-                    help="submit_bot2.py (py2): number k of agent action candidates per turn")
-    ap.add_argument("--budget", type=int, default=70,
-                    help="new bot's per-turn INTERNAL search budget in ms (kept <100ms judge cap "
-                         "incl. IPC overhead; 90 spikes to ~110ms judge-side -> token drain -> WA)")
     ap.add_argument("--stochastic", action="store_true", default=True)
     ap.add_argument("--greedy", dest="stochastic", action="store_false",
                     help="run both bots in argmax mode")
-    ap.add_argument("--jobs", type=int, default=1,
-                    help="parallel games (use 1 for accurate timing: the new bot's "
-                         "adaptive depth measures wall-clock, so CPU contention shrinks it)")
+    ap.add_argument("--jobs", type=int, default=1, help="parallel games")
     ap.add_argument("--timeout", type=int, default=600, help="per-game seconds")
     ap.add_argument("--logdir", default=None)
-    ap.add_argument("--new-engine", choices=("py", "py2", "baseline"), default="py2",
-                    help="engine for the 'new' side: py=submit_bot.py, py2=submit_bot2.py, "
-                         "baseline=old_submit_bot.py")
-    ap.add_argument("--old-engine", choices=("py", "py2", "baseline"), default="py",
-                    help="engine for the 'old' side (default: baseline=old_submit_bot.py)")
     args = ap.parse_args()
 
-    weights = args.weights if os.path.isabs(args.weights) else os.path.join(HERE, args.weights)
-    if not os.path.exists(weights):
-        print(f"weights not found: {weights}", file=sys.stderr); sys.exit(1)
-    _warn_if_no_critic(weights)
+    def _resolve(w):
+        return w if os.path.isabs(w) else os.path.join(HERE, w)
+    new_w = _resolve(args.weights)
+    old_w = _resolve(args.old_weights or args.weights)
+    for w in (new_w, old_w):
+        if not os.path.exists(w):
+            print(f"weights not found: {w}", file=sys.stderr); sys.exit(1)
 
     logdir = args.logdir or tempfile.mkdtemp(prefix="power_")
     os.makedirs(logdir, exist_ok=True)
-    def _desc(engine):
-        return {"py": "py (submit_bot.py)",
-                "py2": "py2 (submit_bot2.py)",
-                "baseline": "baseline (old_submit_bot.py)"}[engine]
     print(f"python : {args.python}")
-    print(f"weights: {weights}")
-    print(f"new bot: {_desc(args.new_engine)}   vs   old bot: {_desc(args.old_engine)}")
-    depth_desc = "unlimited(time-only)" if args.depth <= 0 else f"<={args.depth}"
-    depth2_desc = "unlimited(time-only)" if args.depth2 <= 0 else f"<={args.depth2}"
-    print(f"games  : {args.games} seeds x2 (sides swapped)  budget={args.budget}ms "
-          f"stochastic={args.stochastic}")
-    print(f"         py: depth={depth_desc} cand={args.cand}   "
-          f"py2: depth={depth2_desc} cand(k)={args.cand2}")
+    print(f"new bot: vanilla_bot.py + {new_w}")
+    print(f"old bot: vanilla_bot.py + {old_w}")
+    if new_w == old_w:
+        print("         (identical weights -> this is a ~50% sanity run)")
+    print(f"games  : {args.games} seeds x2 (sides swapped)  stochastic={args.stochastic}")
     print(f"logs   : {logdir}\n")
 
     seeds = [args.base_seed + i for i in range(args.games)]
     results = []
 
     def work(sd):
-        return play_seed(args.python, sd, weights, args.depth, args.cand,
-                         args.depth2, args.cand2, args.budget, args.stochastic,
-                         os.path.join(logdir, f"s{sd}"), args.timeout,
-                         args.new_engine, args.old_engine)
+        return play_seed(args.python, sd, new_w, old_w, args.stochastic,
+                         os.path.join(logdir, f"s{sd}"), args.timeout)
 
     if args.jobs > 1:
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
@@ -162,17 +125,6 @@ def main():
             games = work(sd); results.extend(games); _report_partial(games)
 
     _summary(results)
-
-
-def _warn_if_no_critic(weights):
-    try:
-        import numpy as np
-        with np.load(weights) as z:
-            if not any(k.startswith("critic.") for k in z.files):
-                print("WARNING: data.bin has NO critic net -> new bot falls back to "
-                      "single-action; expect ~50% (identical play).\n", file=sys.stderr)
-    except Exception as e:
-        print(f"(could not inspect weights: {e})", file=sys.stderr)
 
 
 def _report_partial(games):

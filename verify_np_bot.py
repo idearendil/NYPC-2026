@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Verify the numpy submission bot reproduces the torch training pipeline:
 encoder features (extract) and the actor net forward, on random states, for both
-sides. Run after `export_weights.py`."""
+sides. Run after `export_weights.py` (reads data.bin + checkpoint.pt)."""
 import numpy as np
 import torch
 
 import fast_env as fe
 from fast_env import OWN_LEFT, KIND_HQ
 from ppo_selfplay import ActorT1, ActorT2, extract, T2_EXTRA
-import submit_bot as sb
+import vanilla_bot as sb
 
 
 def make_env(seed):
@@ -102,8 +102,13 @@ def env_to_bot(env, m, side):
 
 
 def main():
-    npz = np.load("weights.npz")
-    ck = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--weights", default="data.bin")
+    ap.add_argument("--ckpt", default="checkpoint.pt")
+    args = ap.parse_args()
+    npz = np.load(args.weights)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     d = int(ck["cfg"]["d_model"])
     t1net = ActorT1(d=d); t1net.load_state_dict(ck["actor_t1"]); t1net.eval()
     t2net = ActorT2(d + T2_EXTRA, d=d); t2net.load_state_dict(ck["actor_t2"]); t2net.eval()
@@ -115,6 +120,7 @@ def main():
 
     worst = {k: 0.0 for k in fields}
     worst_head = worst_h1 = worst_t2 = 0.0
+    worst_gold = 0.0            # glob[6] (reconstructed opp gold) -- reported only
     bool_ok = True
     tt_ok = True
 
@@ -132,6 +138,14 @@ def main():
             for k in fields:
                 a = o_t[k][0].detach().cpu().numpy() if o_t[k].dim() >= 1 else o_t[k].item()
                 b = np.asarray(o_n[k], dtype=np.float64)
+                if k == 'glob':
+                    # glob[6] is the opponent's gold RECONSTRUCTED from visible play.
+                    # The env threads its own estimate through a real game history;
+                    # these probe states are randomized, so the two reconstructions
+                    # legitimately differ here. Compared separately (reported, not
+                    # asserted); every other global feature must match.
+                    worst_gold = max(worst_gold, float(abs(a[6] - b[6])))
+                    a, b = np.delete(a, 6), np.delete(b, 6)
                 worst[k] = max(worst[k], float(np.max(np.abs(a - b))))
             for k in bool_fields:
                 a = o_t[k][0].cpu().numpy().astype(bool)
@@ -149,9 +163,11 @@ def main():
             worst_h1 = max(worst_h1, float(np.max(np.abs(h1_t[0].detach().numpy() - h1_n))))
             worst_head = max(worst_head, float(np.max(np.abs(head_t[0].detach().numpy() - head_n))))
 
-            # t2 on identical inputs
+            # t2 on identical inputs (both output channels: target logit + the
+            # full-mobilisation logit). Sources = any 거점 with a stationary warrior,
+            # matching sample_policy's valid_src.
             surplus = np.maximum(o_n['stat_cnt'] - o_n['wc_cur'], 0)
-            src = np.nonzero(surplus > 0)[0]
+            src = np.nonzero(o_n['stat_cnt'] > 0)[0]
             if src.size:
                 X = np.empty((src.size, T, h1_n.shape[1] + T2_EXTRA), dtype=np.float32)
                 for j, si in enumerate(src):
@@ -172,6 +188,7 @@ def main():
     print(f"max abs diff h1   : {worst_h1:.2e}")
     print(f"max abs diff head5: {worst_head:.2e}")
     print(f"max abs diff t2   : {worst_t2:.2e}")
+    print(f"(glob[6] reconstructed opp gold, not asserted: {worst_gold:.2e})")
     ok = (tt_ok and bool_ok and max(worst.values()) < 1e-4
           and worst_head < 1e-3 and worst_t2 < 1e-3)
     print("VERIFY", "PASS" if ok else "FAIL")

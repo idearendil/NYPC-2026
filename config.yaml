@@ -3,25 +3,72 @@
 # (--B / --steps / --iters / --no-wandb / --no-resume) override these.
 
 # ---- rollout / batch ----
-B: 256                  # parallel games stepped together
-steps_per_iter: 300000  # env-steps collected per iteration (horizon = steps_per_iter / B)
+# B is the TOTAL number of parallel games; with --gpus N each rank simulates B/N
+# of them, so an N-GPU run collects exactly the same data per iteration as a
+# 1-GPU run with this config. The rollout is launch-bound (thousands of small
+# kernels per step), so throughput scales almost linearly with B: 256 -> 2048 is
+# ~5x the env-steps/s on one GPU. The cost is a shorter GAE horizon
+# (steps_per_iter / B); with lam=0.95 the advantage estimate only reaches back
+# ~1/(1-gamma*lam) ~ 20 steps anyway -- the terminal +-10 is propagated by the
+# critic, not by the rollout length -- so a horizon of ~100 is plenty.
+B: 2048
+steps_per_iter: 300000  # env-steps per iteration (horizon = steps_per_iter / B).
+                        # OVERRIDDEN by the phase schedule below unless phases: null
 iters: 1250              # number of training iterations
+
+# ---- training phases ----
+# Iterations are grouped into blocks of phase_iters; entering a block swaps in its
+# lr / epochs / ent_coef / steps_per_iter. The LAST entry is held for every later
+# phase, so with phase_iters 250: 1-250 = phase 1, 251-500 = 2, 501-750 = 3,
+# 751+ = 4 (steady state). Resolved from the iteration number, so a resumed run
+# lands in the right phase. Set `phases: null` (or pass --no-phases / --steps) to
+# ignore the schedule and use the flat lr/epochs/ent_coef/steps_per_iter above.
+phase_iters: 250
+phases:
+  - {lr: 0.0005,  epochs: 5, ent_coef: 0.005, steps_per_iter: 200000}
+  - {lr: 0.0002,  epochs: 4, ent_coef: 0.002, steps_per_iter: 250000}
+  - {lr: 0.0001,  epochs: 3, ent_coef: 0.001, steps_per_iter: 300000}
+  - {lr: 0.00005, epochs: 3, ent_coef: 0.0005, steps_per_iter: 300000}
 
 # ---- PPO ----
 gamma: 0.997            # discount
 lam: 0.95               # GAE lambda
 clip: 0.2               # PPO clip range
-lr: 0.00005              # Adam lr (shared by actor & critic optimizers)
-epochs: 3               # PPO epochs per iteration
-minibatch: 4096         # minibatch size
+lr: 0.00005              # Adam lr (shared by actor & critic optimizers; phased above)
+epochs: 3               # PPO epochs per iteration (phased above)
+minibatch: 4096         # TOTAL minibatch size; with --gpus N each rank takes
+                        # minibatch/N, so the number of optimizer steps and the
+                        # effective batch match a 1-GPU run. Once B is large the
+                        # PPO update, not the rollout, is the bottleneck, and
+                        # raising this is the main lever left -- but it changes
+                        # the optimization (fewer, larger steps), so it is not
+                        # touched by default.
 target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
-ent_coef: 0.0005         # entropy bonus (actor loss)
+ent_coef: 0.0005         # entropy bonus (actor loss; phased above)
 aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
 # ---- model ----
 d_model: 64             # transformer width
-store_device: cpu       # device for the rollout buffer (cpu keeps GPU mem free)
+
+# ---- throughput ----
+# Rollout buffer location: cpu (host RAM) / cuda / auto (VRAM if it fits in
+# store_vram_frac of free memory). MEASURED: at B=2048 this makes no difference
+# -- 100k steps/iter took 33.8/33.2s with the buffer in VRAM and 32.9/34.3s in
+# host RAM, because the per-minibatch gather+H2D overlaps with GPU compute. So
+# the default stays on the host and the ~2.7 GiB of VRAM is left free for a
+# larger B or minibatch, which DO matter. Set cuda if you want it resident.
+store_device: cpu
+store_vram_frac: 0.45   # share of FREE VRAM the buffer may claim under auto
+                        # (the flatten step briefly needs ~2x, hence < 0.5)
+# Background processes pre-generating maps for episode regeneration. One map is
+# ~25 ms of single-core Python and every finished episode needs one, so at
+# B=2048 this is otherwise a serial stall in the middle of the rollout. Counted
+# PER RANK (a 2-GPU run with 6 spawns 12 processes; sized for a 36-thread box).
+# 0 = generate inline, deterministic but slow.
+map_workers: 6
+map_queue: 512          # ready maps buffered per worker pool
+torch_threads: null     # CPU threads for torch (null -> min(8, cpu_count // 2))
 
 # ---- opponent pool ----
 opp_ema_alpha: 0.02     # EMA rate for per-opponent win rate

@@ -171,7 +171,7 @@ def compute_map_tensors(maps: list, N: int, T: int, device: torch.device) -> dic
         tt_turns[:, :, ti] = cur
 
     # bit-packed target-inference table for the hidden-info opp-gold reconstruction
-    # (mirrors submit_bot's `tvia`): tvia_bits[b, a, nb] = bitmask over targets t of
+    # (mirrors the submission bot's `tvia`): tvia_bits[b, a, nb] = bitmask over targets t of
     # (nxt[a][t] == nb) -- the set of targets whose next hop from region a is nb. So a
     # warrior stepping a->nb is consistent with exactly the targets in that mask.
     # Packed 62 real bits per int64 word (avoids the sign bit); W64 = ceil(N/62).
@@ -269,6 +269,12 @@ class FastEnv:
             else ("cuda" if torch.cuda.is_available() else "cpu"))
         self.mb = MapBatch(maps, self.device, n_cap=n_cap, t_cap=t_cap)
         self._map_rng = None
+        # Optional map_gen.MapFactory: a background process pool that keeps fresh
+        # maps queued up. Generating one costs ~25 ms of single-core Python, and
+        # regen() needs one per finished episode, so at large B this is the
+        # difference between the rollout waiting on a core and not. None -> maps
+        # are generated inline from _map_rng (deterministic).
+        self.map_factory = None
         B, N = self.mb.B, self.mb.N
         self.B, self.N = B, N
         dev = self.device
@@ -336,11 +342,11 @@ class FastEnv:
         # per-side "saving to upgrade the HQ" commitment flag (set by the policy's
         # HQ-upgrade macro; while True, costly actions are masked off in sampling).
         self.hq_commit = torch.zeros((B, 2), dtype=torch.bool, device=dev)
-        # ---- hidden-info opponent-gold ESTIMATE (mirrors submit_bot) ----------
+        # ---- hidden-info opponent-gold ESTIMATE (mirrors vanilla_bot) ---------
         # est_gold[b, s] = side s's gold as RECONSTRUCTED by its opponent from the
         # visible economy: builds/trains/income/upkeep are exact, only move cost is
         # inferred (target hidden). Fed to the net as the opp-gold feature so training
-        # matches inference (submit_bot never sees exact opp gold). Per-warrior move-
+        # matches inference (the bot never sees exact opp gold). Per-warrior move-
         # inference state: tgt_set (bitmask of still-consistent targets), move_chg
         # (an outstanding refundable 10-charge), moved_last (moved on the prev turn).
         self.est_gold = torch.full((B, 2), START_GOLD, dtype=torch.int64, device=dev)
@@ -393,6 +399,8 @@ class FastEnv:
 
     def _random_map(self):
         import random
+        if self.map_factory is not None:
+            return self.map_factory.get()
         if self._map_rng is None:
             self._map_rng = random.Random()
         r = self._map_rng
@@ -477,7 +485,9 @@ class FastEnv:
     # --------------------------------------------------------------- step
     def step(self, actions: dict, apply_agent_rules: bool = True, relax_right=None):
         """Advance every game one day. ``actions`` = {'left':{...}, 'right':{...}}
-        each with build [B,N] bool, move [B,N] long (-1 none), train [B] long.
+        each with build [B,N] bool, move [B,N] long (-1 none), train [B] long, and
+        optionally mobilize [B,N] bool -- regions whose commanded move takes EVERY
+        stationary warrior (labourers included) instead of keeping work_cap home.
 
         ``apply_agent_rules`` (default True) enables the agent-side build policy
         baked into the env: gate builds on having a non-moving worker, cap builds
@@ -507,7 +517,7 @@ class FastEnv:
     def _update_est_gold(self):
         """Update est_gold[b, s] = each side's gold as its OPPONENT would reconstruct
         it from visible info. Builds/trains/income are charged exactly; move cost is
-        inferred by submit_bot's nxt-path TARGET INFERENCE (a new move costs 10, and it
+        inferred by the bot's nxt-path TARGET INFERENCE (a new move costs 10, and it
         is refunded once the inferred target is known to be one of that side's OWN
         buildings -- a free garrison move). Vectorized over all warriors, both sides at
         once; each warrior contributes to its OWN side's estimate."""
@@ -757,10 +767,18 @@ class FastEnv:
 
             keepcap = torch.where(self.b_owner == me, workcap,
                                   torch.zeros_like(workcap))  # [B,N]
-            # full-mobilisation: for flagged RIGHT-player regions, keep nobody home so
-            # every commanded warrior (incl. labourers) moves.
+            # full mobilisation, from two independent sources (either one lifts the
+            # work-cap for that region, so nobody is kept home and every commanded
+            # warrior -- labourers included -- moves):
+            #   * actions[side]['mobilize'] [B,N] bool -- the POLICY's own choice
+            #     (T2's second head output for the source it ordered to move);
+            #   * relax_right [B,N] -- the exogenous full-mobilisation noise applied
+            #     to the RIGHT player in a fraction of training games.
+            mobil = actions['left' if side == 0 else 'right'].get('mobilize')
             if side == 1 and relax_right is not None:
-                keepcap = torch.where(relax_right, torch.zeros_like(keepcap), keepcap)
+                mobil = relax_right if mobil is None else (mobil | relax_right)
+            if mobil is not None:
+                keepcap = torch.where(mobil, torch.zeros_like(keepcap), keepcap)
             keep_w = keepcap.gather(1, w_region)              # [B,Wside]
 
             group = self.b_ar[:, None] * N + w_region

@@ -1,40 +1,15 @@
 #!/usr/bin/env python3
-"""Vanilla bot (numpy-only) — same engine/features/I/O and opponent-gold
-reconstruction as `submit_bot2.py`, but NO lookahead/rollout search.
+"""Submission bot (numpy-only): the trained actor played straight, no search.
 
 Action selection: ONE actor-net inference per turn, then emit a single action
 SAMPLED (stochastically) from the resulting policy probabilities -- the raw policy,
-played as-is. (`--greedy` switches to argmax.) There is no simulator, no critic
-rollout, no candidate scoring: `decide` -> `_decide_single` -> encode -> sample ->
-emit. This is the natural baseline for measuring what the search bots add on top.
+played as-is. (`--greedy` switches to argmax, and to the p > 0.5 threshold on T2's
+full-mobilisation output.) `decide` -> `_decide_single` -> encode -> sample -> emit.
 
-IMPORTANT: the hidden-opponent-gold estimate is IDENTICAL to submit_bot2.py -- the
-`read_turn_result` reconstruction and the `_ensure_ready` next-hop / `tvia` precompute
-(which the move-cost target inference needs) are unchanged. Only the per-turn action
-DECISION differs (single policy sample instead of a rollout).
-
-Why numpy: the handshake budget is 1000ms, but importing torch alone is ~2.3s.
-numpy imports in ~0.15s, so we run inference with numpy and load the actor
-weights from a torch-free `data.bin` (an .npz produced offline by `export_weights.py`).
-
-Correctness: the encoder features and the transformer forward are a faithful port
-of `ppo_selfplay.extract` / `fast_env.observe` and the network modules; the port
-is checked numerically against the torch path by `verify_np_bot.py`.
-
-Key behaviours (identical to training):
-  * The agent remembers destinations of its moving warriors (the protocol never
-    reveals a mover's target), used for the "my arrivals in 1..5 turns" features.
-  * A (source, target) move keeps the `work_cap` (post-build) lowest-HP stationary
-    friendly warriors at the source (ties -> smaller suffix) and moves the rest.
-  * Region->거점 travel time (in turns) is precomputed once at map load (<1s).
-  * Default samples ~ policy probs (`--stochastic`); `--greedy` = argmax.
-
-The opponent's gold and income are never sent by the protocol; we reconstruct them
-from the visible economy (their builds/upgrades/heals, trains, moves, work income,
-upkeep). Move cost is the only inexact part (the target is hidden): we infer each opp
-warrior's move target from its trajectory using the exact next-hop model -- a new move
-costs 10, and it is refunded once the inferred target is known to be an opp-owned
-building (a free garrison move). See read_turn_result.
+The hidden opponent gold is reconstructed from visible play: `read_turn_result`
+charges builds/trains/income exactly and infers per-warrior move costs via the
+`_ensure_ready` next-hop / `tvia` precompute. `fast_env` mirrors that same estimate
+during training (env.est_gold), so the feature the net sees matches at submission.
 """
 from __future__ import annotations
 
@@ -173,12 +148,14 @@ class Net:
                       W["t1.head.2.weight"], W["t1.head.2.bias"])
         return h[0], head[0]                      # [T,d], [T,5]
 
-    def t2(self, x):                             # x:[S,T,d_in] -> logits [S,T]
+    def t2(self, x):                             # x:[S,T,d_in] -> [S,T,2]
+        """Per-source target head: [...,0] = move-target logit (softmax over tokens),
+        [...,1] = full-mobilisation logit (sigmoid; send the source's labourers too)."""
         W = self.W
         h = self._encoder("t2.enc", x)
         head = linear(gelu(linear(h, W["t2.head.0.weight"], W["t2.head.0.bias"])),
                       W["t2.head.2.weight"], W["t2.head.2.bias"])
-        return head[..., 0]
+        return head
 
     def t1_batch(self, t1s, globs):              # t1s:[K,T,31], globs:[K,GLOB] -> ([K,T,d],[K,T,5])
         """Batched T1 over K states (fixed T). Same math as t1(), one encoder pass."""
@@ -680,7 +657,7 @@ class Bot:
     def decide(self, turn):
         """Vanilla policy: ONE actor-net inference, then emit a single action sampled
         (stochastically) from its probabilities -- no lookahead/rollout. The opponent-
-        gold reconstruction in read_turn_result is unchanged from submit_bot2.py."""
+        gold reconstruction in read_turn_result is the shared visible-play estimate."""
         import time as _t
         t0 = _t.perf_counter()
         self._ensure_ready()
@@ -897,8 +874,11 @@ class Bot:
         hq_after = min(o['hq_level'] + (1 if do_hq_now else 0), HQ_MAXLEVEL)
 
         # ---------------- MOVE (T2 input assembly) ----------------
-        # while committed: only free moves -> restrict targets to our own buildings
-        valid_src = (surplus_pb > 0) & (MOVE_COST * surplus_pb <= gold1)
+        # while committed: only free moves -> restrict targets to our own buildings.
+        # A source only needs a stationary warrior: 거점 whose warriors are ALL
+        # labouring (surplus 0) are legal sources that can move only by full
+        # mobilisation (T2 head [1]); mirrors ppo_selfplay.sample_policy.
+        valid_src = (o['stat_cnt'] > 0) & (MOVE_COST * surplus_pb <= gold1)
         tgt_allowed = owner_me_pb if committed else np.ones(T, dtype=bool)
         src_list = np.nonzero(valid_src)[0]
         X = None
@@ -932,31 +912,43 @@ class Bot:
         exec_build = ctx['exec_build']; wc_pb = ctx['wc_pb']; hq_after = ctx['hq_after']
         force_moves = ctx['force_moves']; force_ids = ctx['force_ids']; head5 = ctx['head5']
 
+        stat_cnt = ctx['o']['stat_cnt']
         tgt = np.arange(T)
+        mob = np.zeros(T, dtype=bool)                    # full-mobilisation per source
         lp_move = 0.0                                    # log-prob of the move-target picks
         if src_list.size > 0:
+            tgt_lg, mob_lg = logits[:, :, 0], logits[:, :, 1]
             if committed:
-                logits = np.where(tgt_allowed[None, :], logits, -1e9)
+                tgt_lg = np.where(tgt_allowed[None, :], tgt_lg, -1e9)
             if forbid_tgt is not None:
-                logits = logits.copy()
-                logits[:, forbid_tgt] = -1e9
+                tgt_lg = tgt_lg.copy()
+                tgt_lg[:, forbid_tgt] = -1e9
             for j, si in enumerate(src_list):
-                p = softmax(logits[j])
+                p = softmax(tgt_lg[j])
                 if sto:
                     tgt[si] = self.rng.choice(T, p=p)
                 else:
-                    tgt[si] = int(np.argmax(logits[j]))
+                    tgt[si] = int(np.argmax(tgt_lg[j]))
                 lp_move += float(np.log(max(p[tgt[si]], 1e-12)))
-            chosen = logits[np.arange(src_list.size), tgt[src_list]]
+                # the chosen target's second output decides whether the source's
+                # labourers march out too (0.5 threshold; sampled when stochastic)
+                if tgt[si] != si and surplus_pb[si] < stat_cnt[si]:
+                    pm = 1.0 / (1.0 + np.exp(-mob_lg[j, tgt[si]]))
+                    mob[si] = (self.rng.random() < pm) if sto else (pm > 0.5)
+                    lp_move += float(np.log(max(pm if mob[si] else 1.0 - pm, 1e-12)))
+            chosen = tgt_lg[np.arange(src_list.size), tgt[src_list]]
         tgt_is_self = tgt == np.arange(T)
         tgt_mine = owner_me_pb[tgt]
-        move_cost = np.where(tgt_mine, 0, MOVE_COST * surplus_pb)
-        move_item = valid_src & (~tgt_is_self)
+        mov_cnt = np.where(mob, stat_cnt, surplus_pb)    # warriors actually leaving
+        move_cost = np.where(tgt_mine, 0, MOVE_COST * mov_cnt)
+        move_item = valid_src & (~tgt_is_self) & (mov_cnt > 0)
         prio2 = np.full(T, -1e30)
         if src_list.size > 0:
             prio2[src_list] = np.where(move_item[src_list], chosen, -1e30)
         order2 = np.argsort(-prio2, kind='stable')
         exec_move, gold2 = self._greedy(move_item, move_cost, gold1, order2)
+        # a mobilised source keeps nobody home (the env's keep-cap goes to 0)
+        wc_pb = np.where(mob, 0, wc_pb)
 
         # ---------------- TRAIN ----------------
         tl = head5[:, 1:5].mean(axis=0)                  # [4]
