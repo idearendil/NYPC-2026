@@ -11,7 +11,7 @@
 # (steps_per_iter / B); with lam=0.95 the advantage estimate only reaches back
 # ~1/(1-gamma*lam) ~ 20 steps anyway -- the terminal +-10 is propagated by the
 # critic, not by the rollout length -- so a horizon of ~100 is plenty.
-B: 2048
+B: 4096
 steps_per_iter: 300000  # env-steps per iteration (horizon = steps_per_iter / B).
                         # OVERRIDDEN by the phase schedule below unless phases: null
 iters: 1250              # number of training iterations
