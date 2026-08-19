@@ -19,12 +19,13 @@ iters: 3000              # number of training iterations
 # ---- training phases ----
 # Iterations are grouped into blocks of phase_iters; entering a block swaps in its
 # lr / epochs / ent_coef / steps_per_iter. The LAST entry is held for every later
-# phase, so with phase_iters 400: 0-399 = phase 1, 400-799 = 2, 800-1199 = 3,
-# 1200+ = 4 (steady state). Resolved from the iteration number, so a resumed run
+# phase, so with phase_iters 500: 0-499 = phase 1, 500-999 = 2, 1000-1499 = 3,
+# 1500+ = 4 (steady state). Resolved from the iteration number, so a resumed run
 # lands in the right phase. Set `phases: null` (or pass --no-phases / --steps) to
 # ignore the schedule and use the flat lr/epochs/ent_coef/steps_per_iter above.
-# This matches exploiter_every, so a phase boundary and an exploiter run coincide.
-phase_iters: 400
+# This matches exploiter_every / perm_snapshot_every, so a phase boundary, an
+# exploiter run and a permanent self-snapshot all coincide.
+phase_iters: 500
 phases:
   - {lr: 0.0005,  epochs: 5, ent_coef: 0.005, steps_per_iter: 200000}
   - {lr: 0.0002,  epochs: 4, ent_coef: 0.002, steps_per_iter: 250000}
@@ -74,11 +75,20 @@ torch_threads: null     # CPU threads for torch (null -> min(8, cpu_count // 2))
 # ---- opponent pool ----
 opp_ema_alpha: 0.02     # EMA rate for per-opponent win rate
 pool_add_threshold: 0.6 # snapshot the agent into the pool when min win rate exceeds this
-pool_max_size: 7        # TOTAL pool cap (incl. rusher+japper), fixed for the whole run.
-                        # Only the 2 scripted bots are permanent; when the pool is full
-                        # the OLDEST net snapshot is evicted, so it holds the 5 most
-                        # recent snapshots.
+pool_max_size: 6        # BASE pool cap (incl. rusher+japper). The cap GROWS by 1 for
+                        # every permanent opponent added later (each exploiter and each
+                        # perm_snapshot_every self-snapshot), so the EVICTABLE room stays
+                        # at pool_max_size - 2 = 4 ordinary snapshots; when those are full
+                        # the OLDEST is evicted. Those 4 slots are what wandb logs as
+                        # opp_winrate/opponent1..4 (the curve set stays bounded: on an
+                        # eviction every snapshot shifts down one slot).
 opp_sample_floor: 0.05  # minimum sampling weight per opponent
+
+# Every perm_snapshot_every iterations the CURRENT main actor is frozen into the
+# pool as a PERMANENT opponent (never evicted; the cap grows by 1), giving the run
+# a permanent ladder of its own past selves so it cannot cycle back into a style it
+# already beat. 0 disables. Costs ~4.5 MB of checkpoint per snapshot.
+perm_snapshot_every: 500
 
 # ---- exploiters ----
 # Every exploiter_every main iterations, training pauses and a SEPARATE agent is
@@ -92,9 +102,9 @@ opp_sample_floor: 0.05  # minimum sampling weight per opponent
 # evicted) and the pool cap grows by 1, so every hole an exploiter found stays in
 # the training distribution for the rest of the run. Set exploiter_every: 0 to
 # disable. NOTE the cost: one run is up to exploiter_iters x exploiter_steps_per_iter
-# env-steps (400 x 200k = 80M) on top of the main loop's.
-exploiter_every: 400
-exploiter_iters: 400
+# env-steps (500 x 200k = 100M) on top of the main loop's.
+exploiter_every: 500
+exploiter_iters: 500
 exploiter_win_stop: 0.7
 exploiter_min_games: 200  # min finished games in an iteration before the early stop
                           # may fire (at B=4096 an iteration finishes ~2000)

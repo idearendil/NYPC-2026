@@ -923,10 +923,17 @@ class Config:
     # opponent pool
     opp_ema_alpha: float = 0.02      # EMA rate for per-opponent win rate
     pool_add_threshold: float = 0.6  # add agent to pool when min win rate exceeds this
-    pool_max_size: int = 7           # BASE total pool cap (incl. fixed rusher+japper).
-                                     # +1 per exploiter added, so the evictable room
-                                     # stays at pool_max_size - N_SCRIPTED.
+    pool_max_size: int = 6           # BASE total pool cap (incl. fixed rusher+japper).
+                                     # +1 per PERMANENT opponent added later, so the
+                                     # evictable room stays at pool_max_size - N_SCRIPTED.
     opp_sample_floor: float = 0.05   # min sampling weight per opponent
+    # ---- PERMANENT SELF-SNAPSHOTS ----
+    # Every perm_snapshot_every iterations, the CURRENT main actor is frozen into the
+    # pool as a PERMANENT opponent (never evicted; the cap grows by 1). Unlike the
+    # ordinary win-rate-triggered snapshots -- which are evicted oldest-first and so
+    # only ever cover the recent past -- these accumulate into a permanent ladder of
+    # past selves, so the agent cannot drift back into a style it already beat.
+    perm_snapshot_every: int = 500   # 0 = disabled
     # ---- EXPLOITERS ----
     # Every `exploiter_every` main iterations, training pauses and a separate
     # exploiter agent is trained AGAINST A FROZEN SNAPSHOT OF THE MAIN ACTOR ONLY
@@ -935,8 +942,8 @@ class Config:
     # or wins >= exploiter_win_stop of that iteration's games. The result is added to
     # the pool as a PERMANENT opponent (never evicted; the cap grows by 1), so the
     # main agent keeps having to answer every hole an exploiter has found.
-    exploiter_every: int = 400       # main iters between exploiter runs (0 = disabled)
-    exploiter_iters: int = 400       # max iterations of one exploiter run
+    exploiter_every: int = 500       # main iters between exploiter runs (0 = disabled)
+    exploiter_iters: int = 500       # max iterations of one exploiter run
     exploiter_win_stop: float = 0.7  # stop early at this per-iteration win rate
     exploiter_min_games: int = 200   # ...but only once this many games have finished
                                      # in that iteration (a win rate over a handful of
@@ -962,9 +969,9 @@ class Config:
     # Training is split into phases of `phase_iters` iterations; entering phase k
     # swaps in that phase's entries (any of lr / epochs / ent_coef / steps_per_iter;
     # anything omitted keeps the flat value above). The LAST entry is held for every
-    # later phase, so the schedule below means: 0-399 / 400-799 / 800-1199 / 1200+.
+    # later phase, so the schedule below means: 0-499 / 500-999 / 1000-1499 / 1500+.
     # Set `phases: null` in config.yaml (or pass --steps) to disable the schedule.
-    phase_iters: int = 400
+    phase_iters: int = 500
     phases: Optional[list] = field(default_factory=lambda: [
         dict(lr=5e-4, epochs=5, ent_coef=5e-3, steps_per_iter=200_000),
         dict(lr=2e-4, epochs=4, ent_coef=2e-3, steps_per_iter=250_000),
@@ -1544,23 +1551,30 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     # opponent pool. Unified index 0 is a FIXED scripted rusher (never evicted,
     # tracked with its own EMA win rate); index i>=1 is net snapshot pool_t1[i-1].
     # It starts with the rusher + a frozen copy of the initial policy. The total pool
-    # cap is cfg.pool_max_size plus one slot per EXPLOITER added, so the evictable room
-    # stays constant: ordinary self-snapshots are all evictable (oldest first) and the
-    # permanent entries are the scripted bots plus the exploiters. pool_perm[j] marks net
-    # snapshot j as permanent. pool_ids gives each opponent a stable id (survives eviction
-    # index shifts) so wandb curves track the same opponent over time ('rusher'/'japper'
-    # for the fixed ones, 'exp<k>' for exploiters).
+    # cap is cfg.pool_max_size plus one slot per PERMANENT opponent added, so the evictable
+    # room stays constant: ordinary win-rate-triggered self-snapshots are all evictable
+    # (oldest first), while the scripted bots, the exploiters and the periodic
+    # perm_snapshot_every self-snapshots are permanent. pool_perm[j] marks net
+    # snapshot j as permanent. pool_ids names each opponent: 'rusher'/'japper' for the
+    # fixed ones, 'exp@<it>' for exploiters, 'main@<it>' for the periodic permanent
+    # self-snapshots, and an int for the ordinary evictable ones (those are logged to
+    # wandb by SLOT -- opponent1..N -- so the number of curves stays bounded).
     pool_t1 = [frozen_copy(actor_t1)]
     pool_t2 = [frozen_copy(actor_t2)]
     # EMA win rate, indexed by unified opponent index: [rusher, japper, net0]
     pool_wr = torch.full((N_SCRIPTED + 1,), 0.5)
     pool_ids = ['rusher', 'japper', 0]
-    pool_perm = [False]                 # per net snapshot: never-evict? (exploiters only)
+    pool_perm = [False]                 # per net snapshot: never-evict?
     next_opp_id = 1
     n_exploiters = 0
+    n_perm_snaps = 0                    # periodic permanent self-snapshots taken so far
     exp_state = None                    # in-progress exploiter run (see run_exploiter)
     exp_step = 0                        # x-axis for the exploiter wandb panels: counts
                                         # exploiter iterations across ALL runs
+    # last iteration whose exploiter run / permanent self-snapshot already completed.
+    # Checkpointed, so a resume that lands back on a boundary iteration (the checkpoint
+    # is written at the START of each iteration) does not redo them.
+    last_exp_it = last_perm_it = -1
     opp_gen = torch.Generator().manual_seed(seed + 777 + 7919 * dd.rank)
     opp_assign = sample_opponents(B_loc, pool_wr, opp_gen,
                                   cfg.opp_sample_floor).to(device)
@@ -1670,6 +1684,9 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         if len(pool_perm) != len(pool_t1):        # legacy/mismatched -> rebuild
             pool_perm = [False] * len(pool_t1)
         n_exploiters = int(ck.get('n_exploiters', sum(pool_perm)))
+        n_perm_snaps = int(ck.get('n_perm_snaps', 0))
+        last_exp_it = int(ck.get('last_exp_it', -1))
+        last_perm_it = int(ck.get('last_perm_it', -1))
         exp_state = ck.get('exp_state')           # mid-exploiter run, resumed below
         exp_step = int(ck.get('exp_step', 0))
         next_opp_id = ck['next_opp_id']
@@ -2079,6 +2096,9 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             'pool_ids': pool_ids,
             'pool_perm': pool_perm,
             'n_exploiters': n_exploiters,
+            'n_perm_snaps': n_perm_snaps,
+            'last_exp_it': last_exp_it,
+            'last_perm_it': last_perm_it,
             'exp_state': exp,
             'exp_step': exp_step,
             'next_opp_id': next_opp_id,
@@ -2209,18 +2229,20 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         # snapshots keep their room). exp_state != None means a previous run died
         # inside an exploiter and this resume must finish it first.
         if exp_state is not None or (cfg.exploiter_every and it > 0
-                                     and it % cfg.exploiter_every == 0):
+                                     and it % cfg.exploiter_every == 0
+                                     and it != last_exp_it):
             e1, e2, e_iters, e_win = run_exploiter(it, exp_state)
             exp_state = None
+            last_exp_it = it
             pool_t1.append(e1)
             pool_t2.append(e2)
             pool_wr = torch.cat([pool_wr, torch.full((1,), 0.5)])
-            pool_ids.append(f'exp{n_exploiters}')
+            pool_ids.append(f'exp@{it}')
             pool_perm.append(True)
             n_exploiters += 1
             if dd.is_main:
                 print(f"== exploiter done after {e_iters} iters (win {e_win:.3f}); "
-                      f"added as PERMANENT opponent 'exp{n_exploiters - 1}' -> "
+                      f"added as PERMANENT opponent 'exp@{it}' -> "
                       f"pool {len(pool_t1) + N_SCRIPTED}/"
                       f"{cfg.pool_max_size + sum(pool_perm)}")
             wlog({'iter': it, 'exploiter_iters': e_iters, 'exploiter_win': e_win,
@@ -2237,6 +2259,29 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                                                    # to the next main iteration
             snapshot(it, None)         # persist the pool addition
 
+        # ---- every cfg.perm_snapshot_every iters: freeze the CURRENT main actor
+        # into the pool as a PERMANENT opponent (never evicted, cap grows by 1).
+        # Runs AFTER the exploiter block so a crash inside an exploiter resumes into
+        # the exploiter and only then takes this snapshot -- never twice.
+        if (cfg.perm_snapshot_every and it > 0
+                and it % cfg.perm_snapshot_every == 0
+                and it != last_perm_it):
+            last_perm_it = it
+            pool_t1.append(frozen_copy(actor_t1))
+            pool_t2.append(frozen_copy(actor_t2))
+            pool_wr = torch.cat([pool_wr, torch.full((1,), 0.5)])
+            pool_ids.append(f'main@{it}')
+            pool_perm.append(True)
+            n_perm_snaps += 1
+            if dd.is_main:
+                print(f"== iter {it}: main actor frozen into the pool as PERMANENT "
+                      f"opponent 'main@{it}' -> pool {len(pool_t1) + N_SCRIPTED}/"
+                      f"{cfg.pool_max_size + sum(pool_perm)}")
+            wlog({'iter': it, 'n_perm_snaps': n_perm_snaps})
+            # no opp_assign redraw: games in flight keep their opponent and pick the
+            # new one up when they finish (same as an ordinary pool add).
+            snapshot(it, exp_state)    # persist the pool addition
+
         t0 = time.time()
         res = run_iteration(main_L, rs, pool_t1, pool_t2, pool_wr, opp_assign,
                             relaxed_game,
@@ -2252,9 +2297,10 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         added = False
 
         # ---- grow the pool when the agent beats even the hardest opponent ----
-        # Cap = cfg.pool_max_size + one slot per exploiter, so the evictable room is
-        # constant. When full, evict the oldest EVICTABLE net; the scripted bots
-        # (unified indices < N_SCRIPTED) and the exploiters are never touched. The
+        # Cap = cfg.pool_max_size + one slot per PERMANENT opponent, so the evictable
+        # room is constant. When full, evict the oldest EVICTABLE net; the scripted bots
+        # (unified indices < N_SCRIPTED), the exploiters and the periodic permanent
+        # self-snapshots are never touched. The
         # `while` also trims a checkpoint loaded with more snapshots than fit.
         pool_cap = cfg.pool_max_size + sum(pool_perm)
         if float(pool_wr.min()) > cfg.pool_add_threshold:
@@ -2333,8 +2379,18 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'world_size': dd.world,
                 'map_queue_misses': misses,
             }
-            # per-opponent EMA win rate, keyed by stable id (survives eviction)
+            # Per-opponent EMA win rate. The EVICTABLE snapshots are keyed by their
+            # SLOT ('opponent1' = oldest surviving one), not by identity, so the set of
+            # curves is bounded by cfg.pool_max_size - N_SCRIPTED however long the run
+            # goes: on an eviction each remaining snapshot shifts down one slot and
+            # opponentN simply continues with the next one. Only the permanent entries
+            # (rusher/japper, exp@<it>, main@<it>) get a curve of their own, and those
+            # are added on a fixed schedule.
+            slot = 0
             for k, oid in enumerate(pool_ids):
+                if k >= N_SCRIPTED and not pool_perm[k - N_SCRIPTED]:
+                    slot += 1
+                    oid = f'opponent{slot}'
                 log[f'opp_winrate/{oid}'] = float(pool_wr[k])
             wlog(log)
 
