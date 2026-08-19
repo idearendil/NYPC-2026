@@ -923,11 +923,30 @@ class Config:
     # opponent pool
     opp_ema_alpha: float = 0.02      # EMA rate for per-opponent win rate
     pool_add_threshold: float = 0.6  # add agent to pool when min win rate exceeds this
-    pool_max_size: int = 7           # INITIAL total pool cap (incl. fixed rusher+japper);
-                                     # grows +1 each time a permanent snapshot is added
-    pool_snapshot_every: int = 80    # every N iters, snapshot the current actor as a
-                                     # PERMANENT (never-evicted) opponent and bump the cap
+    pool_max_size: int = 7           # BASE total pool cap (incl. fixed rusher+japper).
+                                     # +1 per exploiter added, so the evictable room
+                                     # stays at pool_max_size - N_SCRIPTED.
     opp_sample_floor: float = 0.05   # min sampling weight per opponent
+    # ---- EXPLOITERS ----
+    # Every `exploiter_every` main iterations, training pauses and a separate
+    # exploiter agent is trained AGAINST A FROZEN SNAPSHOT OF THE MAIN ACTOR ONLY
+    # (no pool, no scripted bots, no full-mobilisation games). It starts from FRESHLY
+    # INITIALIZED weights and runs until it either reaches exploiter_iters iterations
+    # or wins >= exploiter_win_stop of that iteration's games. The result is added to
+    # the pool as a PERMANENT opponent (never evicted; the cap grows by 1), so the
+    # main agent keeps having to answer every hole an exploiter has found.
+    exploiter_every: int = 400       # main iters between exploiter runs (0 = disabled)
+    exploiter_iters: int = 400       # max iterations of one exploiter run
+    exploiter_win_stop: float = 0.7  # stop early at this per-iteration win rate
+    exploiter_min_games: int = 200   # ...but only once this many games have finished
+                                     # in that iteration (a win rate over a handful of
+                                     # games is noise; 200 gives ~3% standard error)
+    exploiter_lr: float = 2e-4
+    exploiter_epochs: int = 5
+    exploiter_ent_coef: float = 5e-4
+    exploiter_steps_per_iter: int = 200_000
+    exploiter_clip: float = 0.4      # 2x the usual clip: an exploiter is meant to move
+                                     # fast and does not have to stay a good generalist
     # "full-mobilisation" opponent games: a fraction of games where the opponent may
     # ignore the work-cap move restriction (labourers CAN be ordered to move) so the
     # agent learns to predict opponents that mobilise every warrior. Per such game,
@@ -943,9 +962,9 @@ class Config:
     # Training is split into phases of `phase_iters` iterations; entering phase k
     # swaps in that phase's entries (any of lr / epochs / ent_coef / steps_per_iter;
     # anything omitted keeps the flat value above). The LAST entry is held for every
-    # later phase, so the schedule below means: 1-250 / 251-500 / 501-750 / 751+.
+    # later phase, so the schedule below means: 0-399 / 400-799 / 800-1199 / 1200+.
     # Set `phases: null` in config.yaml (or pass --steps) to disable the schedule.
-    phase_iters: int = 250
+    phase_iters: int = 400
     phases: Optional[list] = field(default_factory=lambda: [
         dict(lr=5e-4, epochs=5, ent_coef=5e-3, steps_per_iter=200_000),
         dict(lr=2e-4, epochs=4, ent_coef=2e-3, steps_per_iter=250_000),
@@ -1028,6 +1047,57 @@ def frozen_from_state(make_net, state, device):
     for p in net.parameters():
         p.requires_grad_(False)
     return net
+
+
+class Learner:
+    """An actor (t1+t2) + critic with their optimizers and flat parameter lists.
+
+    The main agent and each exploiter are both Learners, so one iteration routine
+    can train either. `pa`/`pc` are cached because the gradient all-reduce and the
+    clip walk them once per minibatch."""
+
+    def __init__(self, t1, t2, cr, lr, on_cuda):
+        self.t1, self.t2, self.cr = t1, t2, cr
+        self.pa = list(t1.parameters()) + list(t2.parameters())
+        self.pc = list(cr.parameters())
+        adam_kw = dict(fused=True) if on_cuda else {}
+        self.opt_a = torch.optim.Adam(self.pa, lr=lr, **adam_kw)
+        self.opt_c = torch.optim.Adam(self.pc, lr=lr, **adam_kw)
+
+    def set_lr(self, lr):
+        for opt in (self.opt_a, self.opt_c):
+            for g in opt.param_groups:
+                g['lr'] = lr
+
+    def train_mode(self):
+        self.t1.train(); self.t2.train(); self.cr.train()
+
+
+class RolloutState:
+    """Per-game state that carries ACROSS steps within a rollout: each side's
+    previous-turn enemy reachability and its own aux gold prediction (both are
+    input features), plus the scripted bots' state machines. Reset per game at
+    episode boundaries -- a fresh map means there is no previous turn."""
+
+    def __init__(self, B, T, device):
+        self.reach_ag = torch.zeros(B, T, 5, device=device)
+        self.reach_op = torch.zeros(B, T, 5, device=device)
+        self.gold_ag = torch.zeros(B, device=device)
+        self.gold_op = torch.zeros(B, device=device)
+        self.rstate = RusherState(B, device)
+        self.jstate = JapperState(B, device)
+        self._all = torch.arange(B, device=device)
+
+    def reset_rows(self, rows):
+        self.reach_ag[rows] = 0
+        self.reach_op[rows] = 0
+        self.gold_ag[rows] = 0
+        self.gold_op[rows] = 0
+        self.rstate.reset_rows(rows)
+        self.jstate.reset_rows(rows)
+
+    def reset_all(self):
+        self.reset_rows(self._all)
 
 
 def slice_obs(o, rows):
@@ -1248,7 +1318,7 @@ def japper_action(env, side, jstate):
       6) if an enemy reaches the HQ or an adjacent region, recall gatherers home to defend
          and hold the waves (attackers already out keep attacking).
     Returns a full-batch action dict; bases go on the force_build channel (bypasses the
-    free-worker gate; the env auto-staffs the new base)."""
+    free-worker gate)."""
     B, N, dev = env.B, env.N, env.device
     W = env.W
     opp = 1 - side
@@ -1474,18 +1544,23 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     # opponent pool. Unified index 0 is a FIXED scripted rusher (never evicted,
     # tracked with its own EMA win rate); index i>=1 is net snapshot pool_t1[i-1].
     # It starts with the rusher + a frozen copy of the initial policy. The total pool
-    # cap starts at cfg.pool_max_size (=6) and grows by 1 whenever a PERMANENT snapshot
-    # is added (every cfg.pool_snapshot_every iters), so the evictable capacity stays
-    # constant. pool_perm[j] marks net snapshot j as permanent (never evicted, like the
-    # rusher). pool_ids gives each opponent a stable id (survives eviction index shifts)
-    # so wandb curves track the same opponent over time ('rusher' for the fixed one).
+    # cap is cfg.pool_max_size plus one slot per EXPLOITER added, so the evictable room
+    # stays constant: ordinary self-snapshots are all evictable (oldest first) and the
+    # permanent entries are the scripted bots plus the exploiters. pool_perm[j] marks net
+    # snapshot j as permanent. pool_ids gives each opponent a stable id (survives eviction
+    # index shifts) so wandb curves track the same opponent over time ('rusher'/'japper'
+    # for the fixed ones, 'exp<k>' for exploiters).
     pool_t1 = [frozen_copy(actor_t1)]
     pool_t2 = [frozen_copy(actor_t2)]
     # EMA win rate, indexed by unified opponent index: [rusher, japper, net0]
     pool_wr = torch.full((N_SCRIPTED + 1,), 0.5)
     pool_ids = ['rusher', 'japper', 0]
-    pool_perm = [False]                                 # per net snapshot: never-evict?
+    pool_perm = [False]                 # per net snapshot: never-evict? (exploiters only)
     next_opp_id = 1
+    n_exploiters = 0
+    exp_state = None                    # in-progress exploiter run (see run_exploiter)
+    exp_step = 0                        # x-axis for the exploiter wandb panels: counts
+                                        # exploiter iterations across ALL runs
     opp_gen = torch.Generator().manual_seed(seed + 777 + 7919 * dd.rank)
     opp_assign = sample_opponents(B_loc, pool_wr, opp_gen,
                                   cfg.opp_sample_floor).to(device)
@@ -1495,11 +1570,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     # (not checkpointed) -- the env resets on resume, so a fresh draw is consistent.
     relaxed_game = torch.rand(B_loc, device=device) < cfg.opp_relax_frac
 
-    actor_params = list(actor_t1.parameters()) + list(actor_t2.parameters())
-    critic_params = list(critic.parameters())
-    adam_kw = dict(fused=True) if on_cuda else {}
-    opt_actor = torch.optim.Adam(actor_params, lr=cfg.lr, **adam_kw)
-    opt_critic = torch.optim.Adam(critic_params, lr=cfg.lr, **adam_kw)
+    main_L = Learner(actor_t1, actor_t2, critic, cfg.lr, on_cuda)
+    opt_actor, opt_critic = main_L.opt_a, main_L.opt_c
 
     alpha = cfg.opp_ema_alpha
 
@@ -1592,8 +1664,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         pool_t2 = [frozen_from_state(mk_t2, sd, device) for sd in ck['pool_t2']]
         pool_wr = ck['pool_wr'].cpu()   # kept on CPU (used with the CPU opp_gen)
         pool_ids = ck['pool_ids']
-        # pre-permanent-snapshot checkpoints have no pool_perm -> all nets evictable
+        # checkpoints written before exploiters existed have no pool_perm -> every net
+        # snapshot in them is an ordinary (evictable) one.
         pool_perm = list(ck.get('pool_perm', [False] * len(pool_t1)))
+        if len(pool_perm) != len(pool_t1):        # legacy/mismatched -> rebuild
+            pool_perm = [False] * len(pool_t1)
+        n_exploiters = int(ck.get('n_exploiters', sum(pool_perm)))
+        exp_state = ck.get('exp_state')           # mid-exploiter run, resumed below
+        exp_step = int(ck.get('exp_step', 0))
         next_opp_id = ck['next_opp_id']
         # The checkpoint stores rank 0's assignment for B_loc games. A resume with a
         # different B (or on another rank) just redraws it -- the env is rebuilt from
@@ -1633,75 +1711,65 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                   f"(pool size {len(pool_t1) + N_SCRIPTED})")
 
     run = None
+    # wandb's own step must never go backwards, and an exploiter run logs hundreds of
+    # points BETWEEN two main iterations -- so every log call gets its own slot from a
+    # monotone counter and the panels are plotted against the metrics that actually
+    # mean something: `iter` for the main agent, `exp/step` for the exploiters.
+    wstep = start_iter
     if cfg.use_wandb and dd.is_main:
         import wandb
         os.environ["WANDB_API_KEY"] = (
             "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")
         run = wandb.init(project="nypc2026-selfplay", config=vars(cfg))
+        wandb.define_metric("iter")
+        wandb.define_metric("*", step_metric="iter")
+        wandb.define_metric("exp/step")
+        wandb.define_metric("exp/*", step_metric="exp/step")   # more specific -> wins
 
-    # previous turn's raw enemy-reachability (per side) for the reach-delta token
-    # feature; reset to 0 per game at episode boundaries (fresh map = no prior turn).
-    prev_reach_ag = torch.zeros(B_loc, env.mb.T, 5, device=device)
-    prev_reach_op = torch.zeros(B_loc, env.mb.T, 5, device=device)
+    def wlog(d):
+        """Log one point on the shared monotone wandb step (rank 0 / wandb only)."""
+        nonlocal wstep
+        if run is None:
+            return
+        import wandb
+        wandb.log(d, step=wstep)
+        wstep += 1
 
-    # each side's own actor-aux opp-gold prediction from the previous step, fed back
-    # as a global feature; 0 on the first turn / after an episode resets.
-    prev_gold_pred_ag = torch.zeros(B_loc, device=device)
-    prev_gold_pred_op = torch.zeros(B_loc, device=device)
-
-    # per-game state for the scripted opponents (rusher=index 0, japper=index 1).
-    # Fresh, not checkpointed: episodes never resume across runs (env is reset on
+    # Per-game rollout state: each side's previous-turn reachability + own aux gold
+    # prediction (both are input features) and the scripted bots' state machines.
+    # Fresh, not checkpointed: episodes never resume across runs (the env is reset on
     # resume), so a fresh state always aligns with a fresh env.
-    rstate = RusherState(B_loc, device)
-    jstate = JapperState(B_loc, device)
+    rs = RolloutState(B_loc, env.mb.T, device)
 
     # map-factory starvation counter: a "miss" is an episode that had to generate
     # its map inline (~25 ms on the rollout's critical path) because the queue was
     # empty. A steady stream of them means map_workers is too low.
     prev_misses, warned_maps = 0, False
 
-    for it in range(start_iter, cfg.iters):
-        # ---- apply this iteration's phase hyperparameters ----
-        phase_no, ph = phase_at(it)
-        steps = max(1, ph['steps_per_iter'] // cfg.B)
-        epochs_i, ent_i = ph['epochs'], ph['ent_coef']
-        if phase_no != cur_phase:
-            cur_phase = phase_no
-            for g in opt_actor.param_groups:
-                g['lr'] = ph['lr']
-            for g in opt_critic.param_groups:
-                g['lr'] = ph['lr']
-            if phase_no and dd.is_main:
-                print(f"== phase {phase_no} (iter {it}): lr {ph['lr']:g} "
-                      f"epochs {epochs_i} ent_coef {ent_i:g} "
-                      f"steps/iter {ph['steps_per_iter']:,} (horizon {steps})")
+    # ------------------------------------------------------------------ #
+    # ONE PPO ITERATION (rollout + update). Shared by the main self-play loop
+    # and by the exploiter runs; everything that differs between the two is a
+    # parameter: which nets learn (L), which nets play the other side (p_t1/p_t2
+    # + opp_assign), and the hyperparameters (hp).
+    #
+    # pool_wr / opp_assign / relaxed_game are passed in AND returned, because the
+    # EMA update and the per-episode redraws replace them.
+    # ------------------------------------------------------------------ #
+    def run_iteration(L, rs, p_t1, p_t2, pool_wr, opp_assign, relaxed_game, hp,
+                      resample_opp=True):
+        steps = hp['steps']
+        epochs_i, ent_i, clip = hp['epochs'], hp['ent_coef'], hp['clip']
+        relax_frac = hp['relax_frac']
+        # local aliases so the body below reads exactly as it did when the main
+        # agent was the only learner
+        actor_t1, actor_t2, critic = L.t1, L.t2, L.cr
+        opt_actor, opt_critic = L.opt_a, L.opt_c
+        actor_params, critic_params = L.pa, L.pc
+        pool_t1, pool_t2 = p_t1, p_t2
+        prev_reach_ag, prev_reach_op = rs.reach_ag, rs.reach_op
+        prev_gold_pred_ag, prev_gold_pred_op = rs.gold_ag, rs.gold_op
+        rstate, jstate = rs.rstate, rs.jstate
 
-        # ---- checkpoint before starting this iter (for crash-safe resume) ----
-        # Rank 0 only: every rank holds identical weights/pool, and the rollout
-        # state that does differ is regenerated on resume anyway.
-        if dd.is_main:
-            save_ckpt(cfg.ckpt_path, {
-                'iter': it,
-                'actor_t1': actor_t1.state_dict(),
-                'actor_t2': actor_t2.state_dict(),
-                'critic': critic.state_dict(),
-                'opt_actor': opt_actor.state_dict(),
-                'opt_critic': opt_critic.state_dict(),
-                'pool_t1': [n.state_dict() for n in pool_t1],
-                'pool_t2': [n.state_dict() for n in pool_t2],
-                'pool_wr': pool_wr,
-                'pool_ids': pool_ids,
-                'pool_perm': pool_perm,
-                'next_opp_id': next_opp_id,
-                'opp_assign': opp_assign.cpu(),
-                'opp_gen': opp_gen.get_state(),
-                'torch_rng': torch.get_rng_state(),
-                'cuda_rng': ([torch.cuda.get_rng_state(device)]
-                             if on_cuda else None),
-                'cfg': vars(cfg),
-            })
-
-        t0 = time.time()
         buf = []
         # Episode bookkeeping is accumulated on the DEVICE and read once per
         # iteration: the old per-finished-game Python loop forced a GPU->CPU sync
@@ -1815,12 +1883,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 # pool_wr is the value from the START of this iteration (it is only
                 # advanced once per iteration now, so ranks stay in lockstep); with
                 # alpha=0.02 and hundreds of games per iter this is indistinguishable
-                # from the old update-as-you-go sampling.
-                opp_assign[drows] = sample_opponents(
-                    drows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
+                # from the old update-as-you-go sampling. An exploiter run always
+                # faces the same single opponent, so it skips the redraw.
+                if resample_opp:
+                    opp_assign[drows] = sample_opponents(
+                        drows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
                 # re-roll the full-mobilisation flag for each regenerated game
                 relaxed_game[drows] = (torch.rand(drows.numel(), device=device)
-                                       < cfg.opp_relax_frac)
+                                       < relax_frac)
                 env.regen(done)
                 # new map -> no prior turn; baseline the reach deltas + gold pred at 0
                 prev_reach_ag[drows] = 0
@@ -1920,7 +1990,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                     approx_kl = ((ratio - 1) - logratio).mean()
                 adv_b = mb['adv']
                 s1 = ratio * adv_b
-                s2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv_b
+                s2 = torch.clamp(ratio, 1 - clip, 1 + clip) * adv_b
                 ploss = -torch.min(s1, s2).mean()
                 eloss = -ent.mean()
                 aux_loss_a = aux_losses(aux_a, mb['gold_aux'], mb['gold_glob'], mb['tmask'])
@@ -1977,30 +2047,220 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         pl, vl, el, kl, ax_a, ax_c = acc_m
         del flat
 
+        # the rollout rebinds these locals every step; hand them back so the next
+        # iteration continues from this one's last turn
+        rs.reach_ag, rs.reach_op = prev_reach_ag, prev_reach_op
+        rs.gold_ag, rs.gold_op = prev_gold_pred_ag, prev_gold_pred_op
+
+        return dict(pool_wr=pool_wr, opp_assign=opp_assign, relaxed_game=relaxed_game,
+                    ep_rewards=ep_rewards, ep_count=ep_count,
+                    wr_sum=ws, wr_cnt=wc, pl=pl, vl=vl, el=el, kl=kl,
+                    ax_a=ax_a, ax_c=ax_c, ev=ev, mob_rate=mob_rate,
+                    mob_dec=mob_dec, epochs_run=epochs_run, steps=steps)
+
+    def snapshot(it, exp=None):
+        """Crash-safe checkpoint written before each iteration, rank 0 only: every
+        rank holds identical weights/pool, and the rollout state that does differ is
+        regenerated on resume anyway. `exp` is the in-progress exploiter state (None
+        outside an exploiter run) so a crash mid-exploiter resumes the exploiter
+        instead of silently dropping it."""
+        if not dd.is_main:
+            return
+        save_ckpt(cfg.ckpt_path, {
+            'iter': it,
+            'actor_t1': actor_t1.state_dict(),
+            'actor_t2': actor_t2.state_dict(),
+            'critic': critic.state_dict(),
+            'opt_actor': opt_actor.state_dict(),
+            'opt_critic': opt_critic.state_dict(),
+            'pool_t1': [n.state_dict() for n in pool_t1],
+            'pool_t2': [n.state_dict() for n in pool_t2],
+            'pool_wr': pool_wr,
+            'pool_ids': pool_ids,
+            'pool_perm': pool_perm,
+            'n_exploiters': n_exploiters,
+            'exp_state': exp,
+            'exp_step': exp_step,
+            'next_opp_id': next_opp_id,
+            'opp_assign': opp_assign.cpu(),
+            'opp_gen': opp_gen.get_state(),
+            'torch_rng': torch.get_rng_state(),
+            'cuda_rng': ([torch.cuda.get_rng_state(device)]
+                         if on_cuda else None),
+            'cfg': vars(cfg),
+        })
+
+    def run_exploiter(it, st):
+        """Train an EXPLOITER against a frozen snapshot of the current main actor.
+
+        The exploiter starts from FRESHLY INITIALIZED weights -- it is not seeded from
+        the main agent, so it is free to find a counter-strategy the main agent's own
+        habits would never lead it to -- and plays only that one frozen opponent: no
+        pool, no scripted bots, no full-mobilisation games. Its hyperparameters are its
+        own (a 2x PPO clip, higher lr, more epochs) so it can specialize hard and fast.
+        It stops at cfg.exploiter_iters iterations or as soon as one iteration's win
+        rate reaches cfg.exploiter_win_stop over at least cfg.exploiter_min_games games.
+
+        `st` carries the run across a crash/resume (None = start a fresh run).
+        Returns (frozen t1, frozen t2, iterations run, last win rate)."""
+        nonlocal exp_step
+        if st is None:
+            st = dict(inner=0,
+                      main_t1={k: v.detach().clone() for k, v in actor_t1.state_dict().items()},
+                      main_t2={k: v.detach().clone() for k, v in actor_t2.state_dict().items()},
+                      t1=None, t2=None, critic=None, opt_a=None, opt_c=None)
+        # the (fixed) opponent: a frozen copy of the main actor as of this iteration
+        tgt_t1 = frozen_from_state(mk_t1, st['main_t1'], device)
+        tgt_t2 = frozen_from_state(mk_t2, st['main_t2'], device)
+        # fresh random init (st['t1'] is only set when resuming a partial run)
+        e_t1 = ActorT1(d=cfg.d_model).to(device)
+        e_t2 = ActorT2(cfg.d_model + T2_EXTRA, d=cfg.d_model).to(device)
+        e_cr = Critic(d=cfg.d_model).to(device)
+        if st['t1'] is not None:
+            e_t1.load_state_dict(st['t1']); e_t2.load_state_dict(st['t2'])
+            e_cr.load_state_dict(st['critic'])
+        # the ranks draw different random weights -- broadcast rank 0's so they train
+        # one shared exploiter (exactly what is done for the main agent at startup)
+        dd.broadcast_params([e_t1, e_t2, e_cr])
+        L = Learner(e_t1, e_t2, e_cr, cfg.exploiter_lr, on_cuda)
+        if st.get('opt_a') is not None:
+            try:
+                L.opt_a.load_state_dict(st['opt_a']); L.opt_c.load_state_dict(st['opt_c'])
+            except (ValueError, KeyError):
+                pass
+
+        # a single-entry "pool": unified index N_SCRIPTED is the frozen main actor and
+        # every game is assigned to it. The scripted slots exist only so the win-rate
+        # tallies keep their usual layout; nothing is ever assigned to them.
+        e_wr = torch.full((N_SCRIPTED + 1,), 0.5)
+        e_assign = torch.full((B_loc,), N_SCRIPTED, dtype=torch.long, device=device)
+        e_relaxed = torch.zeros(B_loc, dtype=torch.bool, device=device)
+        hp = dict(steps=max(1, cfg.exploiter_steps_per_iter // cfg.B),
+                  epochs=cfg.exploiter_epochs, ent_coef=cfg.exploiter_ent_coef,
+                  clip=cfg.exploiter_clip, relax_frac=0.0)
+        # start from fresh games: the ones in flight are mid-episode against a
+        # different opponent
+        all_rows = torch.ones(B_loc, dtype=torch.bool, device=device)
+        env.regen(all_rows); rs.reset_all()
+        if dd.is_main:
+            print(f"== exploiter (main iter {it}): vs frozen main actor, "
+                  f"max {cfg.exploiter_iters} iters, stop at win rate "
+                  f"{cfg.exploiter_win_stop:.0%} over >= {cfg.exploiter_min_games} "
+                  f"games | lr {cfg.exploiter_lr:g} "
+                  f"epochs {cfg.exploiter_epochs} ent {cfg.exploiter_ent_coef:g} "
+                  f"clip {cfg.exploiter_clip} horizon {hp['steps']}"
+                  + (f" (resumed at {st['inner']})" if st['inner'] else ""))
+
+        i, win = st['inner'], 0.0
+        while i < cfg.exploiter_iters:
+            t0e = time.time()
+            res = run_iteration(L, rs, [tgt_t1], [tgt_t2], e_wr, e_assign,
+                                e_relaxed, hp, resample_opp=False)
+            e_wr = res['pool_wr']
+            games = float(res['wr_cnt'][N_SCRIPTED])
+            win = float(res['wr_sum'][N_SCRIPTED]) / max(games, 1.0)
+            i += 1
+            exp_step += 1
+            # every exploiter iteration gets its own wandb point; exp/win_rate is the
+            # headline -- this iteration's win rate against the frozen main actor
+            wlog({'exp/step': exp_step, 'exp/run': n_exploiters, 'exp/inner_iter': i,
+                  'exp/win_rate': win, 'exp/games': games,
+                  'exp/avg_ep_R': res['ep_rewards'] / max(res['ep_count'], 1),
+                  'exp/episodes': res['ep_count'], 'exp/ploss': res['pl'],
+                  'exp/vloss': res['vl'], 'exp/entropy': res['el'],
+                  'exp/approx_kl': res['kl'], 'exp/value_ev': res['ev'],
+                  'exp/aux_loss_actor': res['ax_a'], 'exp/aux_loss_critic': res['ax_c'],
+                  'exp/main_iter': it})
+            if dd.is_main and (i - 1) % log_every == 0:
+                dte = time.time() - t0e
+                print(f"   exp {i:3d}/{cfg.exploiter_iters} | games {int(games):5d} | "
+                      f"win {win:.3f} | avg_ep_R {res['ep_rewards']/max(res['ep_count'],1):+6.2f} | "
+                      f"ploss {res['pl']:+.4f} vloss {res['vl']:.3f} ent {res['el']:.3f} "
+                      f"kl {res['kl']:.4f} | ev {res['ev']:+.3f} | "
+                      f"{hp['steps']*cfg.B/dte:,.0f} steps/s ({dte:.1f}s)")
+            # persist after every inner iteration -- an exploiter run is hours long
+            st = dict(inner=i, main_t1=st['main_t1'], main_t2=st['main_t2'],
+                      t1=e_t1.state_dict(), t2=e_t2.state_dict(),
+                      critic=e_cr.state_dict(), opt_a=L.opt_a.state_dict(),
+                      opt_c=L.opt_c.state_dict())
+            snapshot(it, st)
+            if games >= cfg.exploiter_min_games and win >= cfg.exploiter_win_stop:
+                break
+        return frozen_copy(e_t1), frozen_copy(e_t2), i, win
+
+    for it in range(start_iter, cfg.iters):
+        # ---- apply this iteration's phase hyperparameters ----
+        phase_no, ph = phase_at(it)
+        steps = max(1, ph['steps_per_iter'] // cfg.B)
+        epochs_i, ent_i = ph['epochs'], ph['ent_coef']
+        if phase_no != cur_phase:
+            cur_phase = phase_no
+            main_L.set_lr(ph['lr'])
+            if phase_no and dd.is_main:
+                print(f"== phase {phase_no} (iter {it}): lr {ph['lr']:g} "
+                      f"epochs {epochs_i} ent_coef {ent_i:g} "
+                      f"steps/iter {ph['steps_per_iter']:,} (horizon {steps})")
+
+        # ---- checkpoint before starting this iter (for crash-safe resume) ----
+        snapshot(it, exp_state)
+
+        # ---- every cfg.exploiter_every iters: train an exploiter, then add it to
+        # the pool as a PERMANENT opponent (the cap grows with it, so the ordinary
+        # snapshots keep their room). exp_state != None means a previous run died
+        # inside an exploiter and this resume must finish it first.
+        if exp_state is not None or (cfg.exploiter_every and it > 0
+                                     and it % cfg.exploiter_every == 0):
+            e1, e2, e_iters, e_win = run_exploiter(it, exp_state)
+            exp_state = None
+            pool_t1.append(e1)
+            pool_t2.append(e2)
+            pool_wr = torch.cat([pool_wr, torch.full((1,), 0.5)])
+            pool_ids.append(f'exp{n_exploiters}')
+            pool_perm.append(True)
+            n_exploiters += 1
+            if dd.is_main:
+                print(f"== exploiter done after {e_iters} iters (win {e_win:.3f}); "
+                      f"added as PERMANENT opponent 'exp{n_exploiters - 1}' -> "
+                      f"pool {len(pool_t1) + N_SCRIPTED}/"
+                      f"{cfg.pool_max_size + sum(pool_perm)}")
+            wlog({'iter': it, 'exploiter_iters': e_iters, 'exploiter_win': e_win,
+                  'n_exploiters': n_exploiters})
+            # back to the pool: fresh opponents, fresh full-mobilisation flags and
+            # fresh games (the ones in flight were played against the exploiter's target)
+            opp_assign = sample_opponents(B_loc, pool_wr, opp_gen,
+                                          cfg.opp_sample_floor).to(device)
+            relaxed_game = torch.rand(B_loc, device=device) < cfg.opp_relax_frac
+            env.regen(torch.ones(B_loc, dtype=torch.bool, device=device))
+            rs.reset_all()
+            if map_factory is not None:
+                prev_misses = map_factory.misses   # don't bill the exploiter's maps
+                                                   # to the next main iteration
+            snapshot(it, None)         # persist the pool addition
+
+        t0 = time.time()
+        res = run_iteration(main_L, rs, pool_t1, pool_t2, pool_wr, opp_assign,
+                            relaxed_game,
+                            dict(steps=steps, epochs=epochs_i, ent_coef=ent_i,
+                                 clip=cfg.clip, relax_frac=cfg.opp_relax_frac))
+        pool_wr, opp_assign = res['pool_wr'], res['opp_assign']
+        relaxed_game = res['relaxed_game']
+        ep_rewards, ep_count = res['ep_rewards'], res['ep_count']
+        pl, vl, el, kl = res['pl'], res['vl'], res['el'], res['kl']
+        ax_a, ax_c, ev = res['ax_a'], res['ax_c'], res['ev']
+        mob_rate, mob_dec, epochs_run = res['mob_rate'], res['mob_dec'], res['epochs_run']
+
         added = False
 
-        # ---- every N iters: snapshot the current actor as a PERMANENT opponent ----
-        # Like the rusher it is never evicted; the total cap grows by 1 (implicitly,
-        # via sum(pool_perm) below) so the evictable capacity is unchanged.
-        if cfg.pool_snapshot_every and it > 0 and it % cfg.pool_snapshot_every == 0:
-            pool_t1.append(frozen_copy(actor_t1))
-            pool_t2.append(frozen_copy(actor_t2))
-            pool_wr = torch.cat([pool_wr, torch.full((1,), 0.5)])
-            pool_ids.append(next_opp_id)
-            pool_perm.append(True)
-            next_opp_id += 1
-            added = True
-
         # ---- grow the pool when the agent beats even the hardest opponent ----
-        # Total cap = base + one slot per permanent snapshot (so evictable room is
-        # constant at pool_max_size - N_SCRIPTED). When full, evict the oldest
-        # EVICTABLE net; the scripted bots (indices < N_SCRIPTED) and permanent
-        # snapshots are never touched.
+        # Cap = cfg.pool_max_size + one slot per exploiter, so the evictable room is
+        # constant. When full, evict the oldest EVICTABLE net; the scripted bots
+        # (unified indices < N_SCRIPTED) and the exploiters are never touched. The
+        # `while` also trims a checkpoint loaded with more snapshots than fit.
         pool_cap = cfg.pool_max_size + sum(pool_perm)
         if float(pool_wr.min()) > cfg.pool_add_threshold:
-            if len(pool_t1) + N_SCRIPTED >= pool_cap:
-                # oldest non-permanent net (list pos -> unified index pos+N_SCRIPTED)
-                evict_pos = next(i for i, perm in enumerate(pool_perm) if not perm)
+            while (len(pool_t1) + N_SCRIPTED >= pool_cap
+                   and not all(pool_perm) and pool_t1):
+                evict_pos = next(i for i, p in enumerate(pool_perm) if not p)
                 ev_idx = evict_pos + N_SCRIPTED
                 pool_t1.pop(evict_pos); pool_t2.pop(evict_pos)
                 pool_wr = torch.cat([pool_wr[:ev_idx], pool_wr[ev_idx + 1:]])
@@ -2044,7 +2304,6 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                   f"{steps*cfg.B/dt:,.0f} steps/s ({dt:.1f}s)")
 
         if run is not None:
-            import wandb
             log = {
                 'iter': it,
                 'avg_ep_R': wr,
@@ -2065,7 +2324,6 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'mobilize_decisions': mob_dec,
                 'pool_size': len(pool_t1) + N_SCRIPTED,
                 'pool_cap': pool_cap,
-                'pool_perm_count': N_SCRIPTED + sum(pool_perm),
                 'opp_winrate_min': float(pool_wr.min()),
                 'opp_winrate_mean': float(pool_wr.mean()),
                 'opp_winrate_rusher': float(pool_wr[RUSHER_IDX]),
@@ -2078,7 +2336,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             # per-opponent EMA win rate, keyed by stable id (survives eviction)
             for k, oid in enumerate(pool_ids):
                 log[f'opp_winrate/{oid}'] = float(pool_wr[k])
-            wandb.log(log, step=it)
+            wlog(log)
 
     if run is not None:
         run.finish()

@@ -861,12 +861,9 @@ class Bot:
             exec_build = (exec_build & ~o['nu']) | capped
         gold1 = gold_after_hq - int(np.where(exec_build, o['build_cost'], 0.0).sum())
 
-        # add the committed/forced HQ upgrade (bypasses our gating) for emission + staffing
+        # add the committed/forced HQ upgrade (bypasses our gating) for emission
         if do_hq_now and hq_tok is not None:
             exec_build[hq_tok] = True
-
-        # plan force-staffing: one nearest surplus warrior per understaffed base
-        force_moves, force_ids = self._plan_force_staff(o, exec_build)
 
         wc_pb = np.where(exec_build, o['wc_after'], o['wc_cur'])
         surplus_pb = np.maximum(o['stat_cnt'] - wc_pb, 0)
@@ -895,7 +892,6 @@ class Bot:
             'o': o, 'T': T, 'sto': sto, 'head5': head5, 'committed': committed,
             'exec_build': exec_build, 'wc_pb': wc_pb, 'surplus_pb': surplus_pb,
             'owner_me_pb': owner_me_pb, 'gold1': gold1, 'hq_after': hq_after,
-            'force_moves': force_moves, 'force_ids': force_ids,
             'valid_src': valid_src, 'tgt_allowed': tgt_allowed, 'src_list': src_list,
             'X': X, 'lp_build': lp_build,
         }
@@ -910,7 +906,7 @@ class Bot:
         surplus_pb = ctx['surplus_pb']; owner_me_pb = ctx['owner_me_pb']
         valid_src = ctx['valid_src']; gold1 = ctx['gold1']
         exec_build = ctx['exec_build']; wc_pb = ctx['wc_pb']; hq_after = ctx['hq_after']
-        force_moves = ctx['force_moves']; force_ids = ctx['force_ids']; head5 = ctx['head5']
+        head5 = ctx['head5']
 
         stat_cnt = ctx['o']['stat_cnt']
         tgt = np.arange(T)
@@ -965,55 +961,12 @@ class Bot:
             train_cat = int(np.argmax(tl_m))
         lp_train = float(np.log(max(sm[train_cat], 1e-12)))
 
-        plan = (exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids)
+        plan = (exec_build, exec_move, tgt, wc_pb, train_cat)
         logp = ctx['lp_build'] + lp_move + lp_train     # joint policy log-prob of this action
         return plan, logp
 
-    def _plan_force_staff(self, o, exec_build):
-        """For each new/upgraded base whose non-moving friendly count is below its
-        post-build work_cap, pick the nearest *surplus* friendly warrior to send
-        there. Returns (list of (warrior, target_region), set of force-moved ids).
-        Surplus = stationary friendly warriors beyond a region's post-build keep-cap
-        (work_cap where we own a building, else 0) -- the same pool the policy moves,
-        so force_ids are excluded from policy moves in _to_commands."""
-        tok = o['tok_ids']
-        nu, stat_cnt = o['nu'], o['stat_cnt']
-        wc_after, wc_cur = o['wc_after'], o['wc_cur']
-        is_hq_me = o['is_hq_me']
-        # exclude the HQ: it is always staffed at home, so HQ upgrades never trigger
-        # a force-staffing move.
-        needing = [ti for ti in range(len(tok))
-                   if exec_build[ti] and nu[ti] and stat_cnt[ti] < wc_after[ti]
-                   and not is_hq_me[ti]]
-        if not needing:
-            return [], set()
-        # post-build keep-cap per 거점 region (non-거점 regions keep 0)
-        keepcap = {int(tok[ti]): (int(wc_after[ti]) if exec_build[ti] else int(wc_cur[ti]))
-                   for ti in range(len(tok))}
-        by_region = {}
-        for w in self.warriors.values():
-            if w.side == self.my_side and w.hp > 0 and not w.moving:
-                by_region.setdefault(w.region, []).append(w)
-        surplus = []
-        for r, ws in by_region.items():
-            ws.sort(key=lambda w: (w.hp, w.num))
-            surplus.extend(ws[keepcap.get(r, 0):])
-        force_moves, assigned = [], set()
-        for ti in needing:
-            best, bestkey = None, None
-            for w in surplus:
-                if id(w) in assigned:
-                    continue
-                key = (int(self.tt[w.region, ti]), w.region, w.hp, w.num)
-                if bestkey is None or key < bestkey:
-                    bestkey, best = key, w
-            if best is not None:
-                assigned.add(id(best))
-                force_moves.append((best, int(tok[ti])))
-        return force_moves, assigned
-
     def _to_commands(self, plan, o):
-        exec_build, exec_move, tgt, wc_pb, train_cat, force_moves, force_ids = plan
+        exec_build, exec_move, tgt, wc_pb, train_cat = plan
         tok = o['tok_ids']
         # moves are keyed (side, num, target_region) -- side-agnostic to the warrior
         # objects, so the same command list drives emission, my-action bookkeeping,
@@ -1021,13 +974,11 @@ class Bot:
         upgrades, moves = [], []
         for t in np.nonzero(exec_build)[0]:
             upgrades.append(int(tok[t]))
-        for w, treg in force_moves:          # force-staffing (nearest surplus warrior)
-            moves.append((w.side, w.num, treg))
         for s in np.nonzero(exec_move)[0]:
             sreg = int(tok[s]); treg = int(tok[int(tgt[s])]); keep = int(wc_pb[s])
             here = [w for w in self.warriors.values()
                     if w.side == self.my_side and w.hp > 0
-                    and not w.moving and w.region == sreg and id(w) not in force_ids]
+                    and not w.moving and w.region == sreg]
             here.sort(key=lambda w: (w.hp, w.num))
             for w in here[keep:]:
                 moves.append((w.side, w.num, treg))

@@ -1,0 +1,47 @@
+# Toy-game hyperparameters -- also a worked example of the config format.
+# Every key maps to a field of examples.toy_duel.Config (which subclasses
+# rlkit.BaseConfig); an unknown key is a hard error rather than a silent no-op.
+
+# ---- rollout ----
+B: 512                   # TOTAL parallel games (split across ranks by --gpus)
+steps_per_iter: 20000    # env-steps per iteration; GAE horizon = this / B
+iters: 200
+
+# ---- PPO ----
+gamma: 0.99
+lam: 0.95
+clip: 0.2
+epochs: 3
+minibatch: 2048          # TOTAL, split across ranks
+target_kl: null          # null disables the early stop (and its per-epoch sync)
+max_grad_norm: 1.0
+
+# ---- phases: lr / entropy / rollout size by iteration block ----
+# Blocks of phase_iters iterations; the LAST entry is held for every later block.
+# Explore first (high entropy, high lr), then refine on longer rollouts.
+phase_iters: 60
+phases:
+  - {lr: 0.001,   epochs: 4, ent_coef: 0.02,  steps_per_iter: 20000}
+  - {lr: 0.0005,  epochs: 3, ent_coef: 0.005, steps_per_iter: 30000}
+  - {lr: 0.0002,  epochs: 3, ent_coef: 0.001, steps_per_iter: 40000}
+
+# ---- model ----
+d_model: 64
+
+# ---- opponent pool ----
+opp_ema_alpha: 0.02
+pool_add_threshold: 0.6  # snapshot once the MIN win rate crosses this
+pool_max_size: 6         # initial cap INCLUDING the scripted bots
+pool_snapshot_every: 40  # permanent (never-evicted) snapshot every N iters
+opp_sample_floor: 0.05
+
+# ---- throughput ----
+store_device: cpu
+instance_workers: 0      # >0 spawns that many map/instance generator processes
+instance_queue: 256
+
+# ---- logging ----
+use_wandb: false
+ckpt_path: checkpoint_toy.pt
+resume: true
+log_every: 5

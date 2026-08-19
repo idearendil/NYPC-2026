@@ -1,0 +1,17 @@
+# rlkit dependencies.
+#
+# Install torch FIRST, separately, with the CUDA build that matches the machine:
+#   cu126:  pip install torch --index-url https://download.pytorch.org/whl/cu126
+#   cu130:  pip install torch --index-url https://download.pytorch.org/whl/cu130
+# THEN:
+#   pip install -r requirements.txt
+#
+# (Listing torch here would let pip pull the default PyPI wheel and clobber the
+#  CUDA build. Lower bounds avoid downgrading an already-good environment.)
+#
+# rlkit itself needs only torch + PyYAML; wandb is optional (use_wandb: false).
+# A SUBMISSION bot needs only numpy.
+
+numpy>=2.0
+PyYAML>=6.0
+wandb>=0.27

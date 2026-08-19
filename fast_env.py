@@ -490,9 +490,9 @@ class FastEnv:
         stationary warrior (labourers included) instead of keeping work_cap home.
 
         ``apply_agent_rules`` (default True) enables the agent-side build policy
-        baked into the env: gate builds on having a non-moving worker, cap builds
-        to the worker count, and auto-staff understaffed new/upgraded bases. Set
-        it False for a pure-rules step (used by the testing-tool parity tests).
+        baked into the env: gate builds on having a non-moving worker and cap builds
+        to the worker count. Set it False for a pure-rules step (used by the
+        testing-tool parity tests).
 
         ``relax_right`` [B,N] bool (optional): per-region "lift the work-cap move
         restriction" flag for the RIGHT player (side 1). Where set, every commanded
@@ -647,7 +647,7 @@ class FastEnv:
 
             # forced builds (the committed HQ-upgrade macro): bypass the n_free
             # gating and the cap, respecting only the game rules (own warrior present,
-            # no enemy in the region). Still subject to force-staffing below.
+            # no enemy in the region).
             fb = actions['left' if side == 0 else 'right'].get('force_build') \
                 if apply_agent_rules else None
             if fb is not None:
@@ -681,70 +681,9 @@ class FastEnv:
             changed = build_new | can_up | can_heal
             self.b_hp = torch.where(changed, newhp, self.b_hp)
 
-            # auto-staff understaffed new/upgraded BASES (heal and the HQ excluded:
-            # the HQ is always staffed at home, so it neither needs force-staffing
-            # nor the free-worker gate).
-            if apply_agent_rules:
-                self._force_staff(side, me, (build_new | can_up) & (~self.is_hq_mask))
-
-    def _force_staff(self, side, me, nu_mask):
-        """For each region in ``nu_mask`` (this side's new builds / upgrades this
-        turn) whose non-moving friendly count is below its post-build work_cap,
-        force one nearest *surplus* friendly warrior to move there. The move is
-        free (we own the building) and is registered here -- before
-        _phase_register_moves -- so the policy's own move commands never touch the
-        staffed warrior. Surplus = friendly stationary warriors beyond a region's
-        keep-cap (work_cap where we own a building, else 0): exactly the pool the
-        policy may move, so staffing simply claims from it first."""
-        if not bool(nu_mask.any()):
-            return
-        B, N, W = self.B, self.N, self.W
-        dev = self.device
-        workcap = self._workcap()                                   # post-build [B,N]
-        sd = self.slot_side[None, :].expand(B, W)
-        cand = (self.w_hp > 0) & (sd == side) & (~self.w_move)       # stationary friendly
-        stat_cnt = self._scatter_region(cand)                       # [B,N]
-        needing = nu_mask & (stat_cnt < workcap)
-        if not bool(needing.any()):
-            return
-
-        keepcap = torch.where(self.b_owner == me, workcap, torch.zeros_like(workcap))
-        keep_w = keepcap.gather(1, self.w_region)                   # [B,W]
-        group = self.b_ar[:, None] * N + self.w_region
-        slot = self.slot_idx[None, :].expand(B, W)
-        rank, _ = _seg_stats(group, self.w_hp, slot, cand)
-        is_surplus = cand & (rank >= keep_w)                        # movable pool
-        surplus_rem = (stat_cnt - keepcap).clamp(min=0)            # per-region surplus count
-
-        tt = self.mb.travel_turns                                   # [B,N,T]
-        tok = self.mb.token_ids
-        tvalid = self.mb.token_valid
-        assigned = torch.zeros((B, W), dtype=torch.bool, device=dev)
-        force_tgt = torch.zeros((B, W), dtype=torch.int64, device=dev)
-        BIGD = 1 << 30
-        for ti in range(self.mb.T):
-            tokreg = tok[:, ti].clamp(max=N - 1)                    # [B]
-            need_t = tvalid[:, ti] & needing.gather(1, tokreg[:, None]).squeeze(1)
-            if not bool(need_t.any()):
-                continue
-            md = torch.where(surplus_rem > 0, tt[:, :, ti],
-                             torch.full_like(tt[:, :, ti], BIGD))   # [B,N]
-            r_star = md.argmin(dim=1)                               # [B] nearest src region
-            src_ok = need_t & ((surplus_rem.gather(1, r_star[:, None]).squeeze(1)) > 0)
-            at = ((self.w_region == r_star[:, None]) & is_surplus
-                  & (~assigned) & src_ok[:, None])
-            wkey = torch.where(at, rank, torch.full_like(rank, BIGD))
-            wsel = wkey.argmin(dim=1)                               # [B] chosen warrior slot
-            chose = at.gather(1, wsel[:, None]).squeeze(1)
-            rows = chose.nonzero(as_tuple=True)[0]
-            if rows.numel() > 0:
-                sl = wsel[rows]
-                assigned[rows, sl] = True
-                force_tgt[rows, sl] = tokreg[rows]
-                surplus_rem[rows, r_star[rows]] -= 1
-
-        self.w_move = torch.where(assigned, torch.ones_like(self.w_move), self.w_move)
-        self.w_tgt = torch.where(assigned, force_tgt, self.w_tgt)
+            # NOTE: new/upgraded bases are NOT auto-staffed. A base that comes out of
+            # a build/upgrade understaffed simply stays that way until the policy
+            # itself sends warriors there.
 
     def _phase_register_moves(self, actions, relax_right=None):
         B, N = self.B, self.N

@@ -14,16 +14,17 @@
 B: 4096
 steps_per_iter: 300000  # env-steps per iteration (horizon = steps_per_iter / B).
                         # OVERRIDDEN by the phase schedule below unless phases: null
-iters: 1250              # number of training iterations
+iters: 3000              # number of training iterations
 
 # ---- training phases ----
 # Iterations are grouped into blocks of phase_iters; entering a block swaps in its
 # lr / epochs / ent_coef / steps_per_iter. The LAST entry is held for every later
-# phase, so with phase_iters 250: 1-250 = phase 1, 251-500 = 2, 501-750 = 3,
-# 751+ = 4 (steady state). Resolved from the iteration number, so a resumed run
+# phase, so with phase_iters 400: 0-399 = phase 1, 400-799 = 2, 800-1199 = 3,
+# 1200+ = 4 (steady state). Resolved from the iteration number, so a resumed run
 # lands in the right phase. Set `phases: null` (or pass --no-phases / --steps) to
 # ignore the schedule and use the flat lr/epochs/ent_coef/steps_per_iter above.
-phase_iters: 250
+# This matches exploiter_every, so a phase boundary and an exploiter run coincide.
+phase_iters: 400
 phases:
   - {lr: 0.0005,  epochs: 5, ent_coef: 0.005, steps_per_iter: 200000}
   - {lr: 0.0002,  epochs: 4, ent_coef: 0.002, steps_per_iter: 250000}
@@ -73,9 +74,35 @@ torch_threads: null     # CPU threads for torch (null -> min(8, cpu_count // 2))
 # ---- opponent pool ----
 opp_ema_alpha: 0.02     # EMA rate for per-opponent win rate
 pool_add_threshold: 0.6 # snapshot the agent into the pool when min win rate exceeds this
-pool_max_size: 7        # INITIAL total pool cap (incl. rusher+japper); +1 per permanent snapshot
-pool_snapshot_every: 80  # every N iters add a PERMANENT (never-evicted) actor snapshot & bump cap
+pool_max_size: 7        # TOTAL pool cap (incl. rusher+japper), fixed for the whole run.
+                        # Only the 2 scripted bots are permanent; when the pool is full
+                        # the OLDEST net snapshot is evicted, so it holds the 5 most
+                        # recent snapshots.
 opp_sample_floor: 0.05  # minimum sampling weight per opponent
+
+# ---- exploiters ----
+# Every exploiter_every main iterations, training pauses and a SEPARATE agent is
+# trained against a frozen snapshot of the main actor ONLY -- no pool, no scripted
+# bots, no full-mobilisation games. It starts from FRESHLY INITIALIZED weights (not
+# seeded from the main agent, so it is free to find a counter-strategy the main
+# agent's own habits would never lead it to) and runs until it either hits
+# exploiter_iters iterations or wins exploiter_win_stop of one iteration's games
+# (its per-iteration win rate is logged to wandb as exp/win_rate every iteration).
+# The result joins the pool as a PERMANENT opponent (never
+# evicted) and the pool cap grows by 1, so every hole an exploiter found stays in
+# the training distribution for the rest of the run. Set exploiter_every: 0 to
+# disable. NOTE the cost: one run is up to exploiter_iters x exploiter_steps_per_iter
+# env-steps (400 x 200k = 80M) on top of the main loop's.
+exploiter_every: 400
+exploiter_iters: 400
+exploiter_win_stop: 0.7
+exploiter_min_games: 200  # min finished games in an iteration before the early stop
+                          # may fire (at B=4096 an iteration finishes ~2000)
+exploiter_lr: 0.0002
+exploiter_epochs: 5
+exploiter_ent_coef: 0.0005
+exploiter_steps_per_iter: 200000
+exploiter_clip: 0.4     # 2x the usual clip; an exploiter may move fast and overfit
 
 # ---- logging / checkpointing ----
 use_wandb: true
