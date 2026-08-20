@@ -937,9 +937,13 @@ class Config:
     # ---- EXPLOITERS ----
     # Every `exploiter_every` main iterations, training pauses and a separate
     # exploiter agent is trained AGAINST A FROZEN SNAPSHOT OF THE MAIN ACTOR ONLY
-    # (no pool, no scripted bots, no full-mobilisation games). It starts from FRESHLY
-    # INITIALIZED weights and runs until it either reaches exploiter_iters iterations
-    # or wins >= exploiter_win_stop of that iteration's games. The result is added to
+    # (no pool, no scripted bots, no full-mobilisation games). It is SEEDED WITH THE
+    # MAIN ACTOR+CRITIC FROM exploiter_every ITERATIONS EARLIER -- the run at iter 500
+    # starts from main@0, the one at 1000 from main@500 -- because from a random init
+    # it just loses every game against a far more trained opponent and never gets a
+    # usable learning signal. Those seeds are snapshotted at every boundary and all of
+    # them are kept in the checkpoint. It runs until it either reaches exploiter_iters
+    # iterations or its win-rate EMA reaches exploiter_win_stop. The result is added to
     # the pool as a PERMANENT opponent (never evicted; the cap grows by 1), so the
     # main agent keeps having to answer every hole an exploiter has found.
     exploiter_every: int = 500       # main iters between exploiter runs (0 = disabled)
@@ -956,11 +960,17 @@ class Config:
     # at least one game finished feeds the EMA (there is no minimum-games threshold;
     # the EMA is what handles the noise).
     exploiter_win_ema_alpha: float = 0.1
-    exploiter_lr: float = 2e-4
-    exploiter_epochs: int = 5
-    exploiter_ent_coef: float = 1e-3
-    exploiter_steps_per_iter: int = 200_000
-    exploiter_clip: float = 0.2      # same trust region as the main agent
+    # The optimisation settings are deliberately IDENTICAL to the main agent's
+    # PHASE 1 (phases[0] plus the shared clip) rather than a hotter setting of their
+    # own: phase 1 is the schedule's exploratory end, which is what an exploiter needs
+    # to move away from the seeded policy and find something different, and it is the
+    # regime the seed itself was last trained under early in the run. Keep these in
+    # sync with phases[0] in config.yaml if that schedule is retuned.
+    exploiter_lr: float = 5e-4       # = phases[0].lr
+    exploiter_epochs: int = 5        # = phases[0].epochs
+    exploiter_ent_coef: float = 5e-3  # = phases[0].ent_coef
+    exploiter_steps_per_iter: int = 200_000  # = phases[0].steps_per_iter
+    exploiter_clip: float = 0.2      # = clip (not phased)
     # "full-mobilisation" opponent games: a fraction of games where the opponent may
     # ignore the work-cap move restriction (labourers CAN be ordered to move) so the
     # agent learns to predict opponents that mobilise every warrior. Per such game,
@@ -1578,6 +1588,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     exp_state = None                    # in-progress exploiter run (see run_exploiter)
     exp_step = 0                        # x-axis for the exploiter wandb panels: counts
                                         # exploiter iterations across ALL runs
+    # ---- exploiter seed weights ----
+    # The main actor+critic frozen at EVERY exploiter boundary, keyed by iteration:
+    # {0: {'t1':…, 't2':…, 'critic':…}, 500: {...}, 1000: {...}, ...}. An exploiter
+    # starting at iteration `it` is seeded from entry `it - cfg.exploiter_every`, so
+    # the run at 500 starts from main@0, the one at 1000 from main@500, and so on.
+    # The whole history is kept (not just the newest): 1.2 MB per entry at d_model 64,
+    # i.e. 7 entries / 8.4 MB of checkpoint over a 3000-iteration run.
+    exp_seeds = {}
     # last iteration whose exploiter run / permanent self-snapshot already completed.
     # Checkpointed, so a resume that lands back on a boundary iteration (the checkpoint
     # is written at the START of each iteration) does not redo them.
@@ -1696,6 +1714,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         last_perm_it = int(ck.get('last_perm_it', -1))
         exp_state = ck.get('exp_state')           # mid-exploiter run, resumed below
         exp_step = int(ck.get('exp_step', 0))
+        # per-boundary exploiter seeds (see exp_seeds); keys come back as ints
+        exp_seeds = {int(k): v for k, v in (ck.get('exp_seeds') or {}).items()}
         next_opp_id = ck['next_opp_id']
         # The checkpoint stores rank 0's assignment for B_loc games. A resume with a
         # different B (or on another rank) just redraws it -- the env is rebuilt from
@@ -1756,7 +1776,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         # An EXACT define always beats a glob, which makes this immune to the order.
         for _k in ('run', 'inner_iter', 'main_iter', 'win_rate', 'win_ema', 'games',
                    'avg_ep_R', 'episodes', 'ploss', 'vloss', 'entropy', 'approx_kl',
-                   'value_ev', 'aux_loss_actor', 'aux_loss_critic'):
+                   'value_ev', 'aux_loss_actor', 'aux_loss_critic', 'seed_it'):
             wandb.define_metric(f"exp/{_k}", step_metric="exp/step")
         wandb.define_metric("*", step_metric="iter")   # everything else
 
@@ -2118,6 +2138,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             'last_perm_it': last_perm_it,
             'exp_state': exp,
             'exp_step': exp_step,
+            'exp_seeds': exp_seeds,
             'next_opp_id': next_opp_id,
             'opp_assign': opp_assign.cpu(),
             'opp_gen': opp_gen.get_state(),
@@ -2127,29 +2148,62 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             'cfg': vars(cfg),
         })
 
+    def pick_seed(it):
+        """The exp_seeds entry an exploiter starting at iteration `it` trains from:
+        the main agent as of it - cfg.exploiter_every.
+
+        Looked up as the newest boundary at or before that iteration rather than by
+        exact key, so a run whose exploiter_every was changed part-way (or one whose
+        first exploiter lands before a full interval has elapsed) still gets the
+        closest available past self instead of nothing. Returns (iteration, entry),
+        or (None, None) if no boundary has been recorded yet -- then the exploiter
+        falls back to a random init."""
+        want = it - (cfg.exploiter_every or 0)
+        keys = [k for k in exp_seeds if k <= want]
+        if not keys:
+            return None, None
+        k = max(keys)
+        return k, exp_seeds[k]
+
     def run_exploiter(it, st):
         """Train an EXPLOITER against a frozen snapshot of the current main actor.
 
-        The exploiter starts from FRESHLY INITIALIZED weights -- it is not seeded from
-        the main agent, so it is free to find a counter-strategy the main agent's own
-        habits would never lead it to -- and plays only that one frozen opponent: no
-        pool, no scripted bots, no full-mobilisation games. Its hyperparameters are its
-        own (a 2x PPO clip, higher lr, more epochs) so it can specialize hard and fast.
-        It stops at cfg.exploiter_iters iterations or as soon as the EMA of its
-        per-iteration win rates reaches cfg.exploiter_win_stop.
+        The exploiter is SEEDED FROM THE MAIN AGENT AS IT WAS cfg.exploiter_every
+        ITERATIONS AGO (actor and critic; see exp_seeds) and plays only the current
+        frozen main actor: no pool, no scripted bots, no full-mobilisation games. It
+        trains with the main agent's phase-1 hyperparameters. It stops at
+        cfg.exploiter_iters iterations or as soon as the EMA of its per-iteration win
+        rates reaches cfg.exploiter_win_stop.
+
+        The seed matters: from a random init the exploiter loses essentially every
+        game against a main actor with hundreds of iterations of training behind it,
+        so its advantages are all "everything I did was bad" and it never gets a
+        learning signal it can act on. Its own past self can already play the game,
+        while being far enough behind the current one to leave room to specialize
+        into a counter-strategy. (It is deliberately NOT seeded from the CURRENT
+        actor, which would make the exploiter a copy of its own opponent and start it
+        at the self-play fixed point it is supposed to break out of.) Only if no
+        boundary has been recorded yet does it fall back to a random init.
 
         `st` carries the run across a crash/resume (None = start a fresh run).
         Returns (frozen t1, frozen t2, iterations run, final EMA win rate)."""
         nonlocal exp_step
         if st is None:
+            # st['t1'/'t2'/'critic'] = "the weights to (re)start from": the seed on a
+            # fresh run, the partially trained exploiter on a resume.
+            seed_it, sd = pick_seed(it)
             st = dict(inner=0, win_ema=0.0,
                       main_t1={k: v.detach().clone() for k, v in actor_t1.state_dict().items()},
                       main_t2={k: v.detach().clone() for k, v in actor_t2.state_dict().items()},
-                      t1=None, t2=None, critic=None, opt_a=None, opt_c=None)
+                      seed_it=seed_it,
+                      t1=(sd['t1'] if sd else None),
+                      t2=(sd['t2'] if sd else None),
+                      critic=(sd['critic'] if sd else None),
+                      opt_a=None, opt_c=None)
         # the (fixed) opponent: a frozen copy of the main actor as of this iteration
         tgt_t1 = frozen_from_state(mk_t1, st['main_t1'], device)
         tgt_t2 = frozen_from_state(mk_t2, st['main_t2'], device)
-        # fresh random init (st['t1'] is only set when resuming a partial run)
+        # seeded / resumed weights, or a random init when st['t1'] is None
         e_t1 = ActorT1(d=cfg.d_model).to(device)
         e_t2 = ActorT2(cfg.d_model + T2_EXTRA, d=cfg.d_model).to(device)
         e_cr = Critic(d=cfg.d_model).to(device)
@@ -2180,7 +2234,11 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         all_rows = torch.ones(B_loc, dtype=torch.bool, device=device)
         env.regen(all_rows); rs.reset_all()
         if dd.is_main:
-            print(f"== exploiter (main iter {it}): vs frozen main actor, "
+            _si = st.get('seed_it')
+            print(f"== exploiter (main iter {it}): seeded from "
+                  + (f"main@{_si} (actor+critic)" if _si is not None else
+                     "RANDOM WEIGHTS (no seed recorded yet)")
+                  + f", vs frozen main actor@{it}, "
                   f"max {cfg.exploiter_iters} iters, stop at win-rate EMA "
                   f"{cfg.exploiter_win_stop:.0%} (alpha "
                   f"{cfg.exploiter_win_ema_alpha:g}) | lr {cfg.exploiter_lr:g} "
@@ -2218,7 +2276,11 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                   'exp/vloss': res['vl'], 'exp/entropy': res['el'],
                   'exp/approx_kl': res['kl'], 'exp/value_ev': res['ev'],
                   'exp/aux_loss_actor': res['ax_a'], 'exp/aux_loss_critic': res['ax_c'],
-                  'exp/main_iter': it})
+                  'exp/main_iter': it,
+                  # which main-actor snapshot this exploiter was seeded from
+                  # (-1 = random init); constant within a run
+                  'exp/seed_it': (-1 if st.get('seed_it') is None
+                                  else st['seed_it'])})
             if dd.is_main and (i - 1) % log_every == 0:
                 dte = time.time() - t0e
                 print(f"   exp {i:3d}/{cfg.exploiter_iters} | games {int(games):5d} | "
@@ -2230,6 +2292,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             # persist after every inner iteration -- an exploiter run is hours long
             st = dict(inner=i, win_ema=win_ema,
                       main_t1=st['main_t1'], main_t2=st['main_t2'],
+                      seed_it=st.get('seed_it'),   # kept only so a resume can say so
                       t1=e_t1.state_dict(), t2=e_t2.state_dict(),
                       critic=e_cr.state_dict(), opt_a=L.opt_a.state_dict(),
                       opt_c=L.opt_c.state_dict())
@@ -2291,6 +2354,22 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 prev_misses = map_factory.misses   # don't bill the exploiter's maps
                                                    # to the next main iteration
             snapshot(it, None)         # persist the pool addition
+
+        # ---- record this boundary's exploiter seed ----
+        # Taken at every exploiter boundary INCLUDING iter 0, and AFTER this
+        # iteration's exploiter has already picked its own seed, so an exploiter is
+        # never seeded from the iteration it is launched at: the run at 500 trains
+        # from main@0, the one at 1000 from main@500, ... Every boundary is kept
+        # (see exp_seeds). Idempotent -- a resume landing back on a boundary
+        # iteration re-takes the same weights (the exploiter does not touch the main
+        # actor), so no last_*_it guard is needed. The critic goes along with the
+        # actor: the exploiter trains its own value head and would otherwise start
+        # with a random critic estimating a trained policy's returns.
+        if cfg.exploiter_every and it % cfg.exploiter_every == 0:
+            exp_seeds[it] = dict(
+                t1={k: v.detach().clone() for k, v in actor_t1.state_dict().items()},
+                t2={k: v.detach().clone() for k, v in actor_t2.state_dict().items()},
+                critic={k: v.detach().clone() for k, v in critic.state_dict().items()})
 
         # ---- every cfg.perm_snapshot_every iters: freeze the CURRENT main actor
         # into the pool as a PERMANENT opponent (never evicted, cap grows by 1).

@@ -93,9 +93,19 @@ perm_snapshot_every: 500
 # ---- exploiters ----
 # Every exploiter_every main iterations, training pauses and a SEPARATE agent is
 # trained against a frozen snapshot of the main actor ONLY -- no pool, no scripted
-# bots, no full-mobilisation games. It starts from FRESHLY INITIALIZED weights (not
-# seeded from the main agent, so it is free to find a counter-strategy the main
-# agent's own habits would never lead it to) and runs until it either hits
+# bots, no full-mobilisation games. It is SEEDED WITH THE MAIN ACTOR+CRITIC FROM
+# exploiter_every ITERATIONS EARLIER -- the run at iter 500 starts from main@0, the
+# one at 1000 from main@500, and so on. (From a random init it loses essentially every
+# game against a main actor with hundreds of iterations behind it and never gets a
+# learning signal it can act on; its own past self can already play, while being far
+# enough behind the current one to leave room to specialize. Seeding from the CURRENT
+# actor instead would just start it at the fixed point it is meant to break out of.)
+# The seed is taken from the live actor+critic at every iteration divisible by
+# exploiter_every, starting at 0, and ALL of them are kept in the checkpoint (1.2 MB
+# each at d_model 64, so 7 of them / 8.4 MB over this run). Which snapshot a run was
+# seeded from is printed in its banner and logged as exp/seed_it (-1 = random init,
+# which only happens if no boundary has been recorded yet).
+# It runs until it either hits
 # exploiter_iters iterations or its win-rate EMA reaches exploiter_win_stop. Both
 # the raw per-iteration win rate (exp/win_rate) and that EMA (exp/win_ema) are
 # logged to wandb every iteration. The result joins the pool as a PERMANENT opponent
@@ -116,11 +126,16 @@ exploiter_win_stop: 0.7
 # 12 iterations to cross 0.7. Every iteration in which at least one game finished
 # feeds it -- there is no minimum-games threshold, the EMA handles the noise.
 exploiter_win_ema_alpha: 0.1
-exploiter_lr: 0.0002
-exploiter_epochs: 5
-exploiter_ent_coef: 0.001
-exploiter_steps_per_iter: 200000
-exploiter_clip: 0.2     # same trust region as the main agent
+# Optimisation settings: IDENTICAL to the main agent's PHASE 1 (phases[0] above,
+# plus the shared clip) instead of a hotter setting of their own -- phase 1 is the
+# schedule's exploratory end, which is what an exploiter needs in order to move away
+# from the policy it was seeded with and find something different. Keep in sync with
+# phases[0] if that schedule is retuned.
+exploiter_lr: 0.0005        # = phases[0].lr
+exploiter_epochs: 5         # = phases[0].epochs
+exploiter_ent_coef: 0.005   # = phases[0].ent_coef
+exploiter_steps_per_iter: 200000  # = phases[0].steps_per_iter
+exploiter_clip: 0.2         # = clip (not phased)
 
 # ---- logging / checkpointing ----
 use_wandb: true
