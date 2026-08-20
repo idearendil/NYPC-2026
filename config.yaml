@@ -96,23 +96,31 @@ perm_snapshot_every: 500
 # bots, no full-mobilisation games. It starts from FRESHLY INITIALIZED weights (not
 # seeded from the main agent, so it is free to find a counter-strategy the main
 # agent's own habits would never lead it to) and runs until it either hits
-# exploiter_iters iterations or wins exploiter_win_stop of one iteration's games
-# (its per-iteration win rate is logged to wandb as exp/win_rate every iteration).
-# The result joins the pool as a PERMANENT opponent (never
-# evicted) and the pool cap grows by 1, so every hole an exploiter found stays in
-# the training distribution for the rest of the run. Set exploiter_every: 0 to
-# disable. NOTE the cost: one run is up to exploiter_iters x exploiter_steps_per_iter
-# env-steps (500 x 200k = 100M) on top of the main loop's.
+# exploiter_iters iterations or its win-rate EMA reaches exploiter_win_stop. Both
+# the raw per-iteration win rate (exp/win_rate) and that EMA (exp/win_ema) are
+# logged to wandb every iteration. The result joins the pool as a PERMANENT opponent
+# (never evicted) and the pool cap grows by 1, so every hole an exploiter found
+# stays in the training distribution for the rest of the run. Set exploiter_every: 0
+# to disable. NOTE the cost: one run is up to exploiter_iters x
+# exploiter_steps_per_iter env-steps (500 x 200k = 100M) on top of the main loop's.
 exploiter_every: 500
 exploiter_iters: 500
 exploiter_win_stop: 0.7
-exploiter_min_games: 200  # min finished games in an iteration before the early stop
-                          # may fire (at B=4096 an iteration finishes ~2000)
+# The stop is judged on an EMA of the per-iteration win rates, NOT on a single
+# iteration: one iteration is only exploiter_steps_per_iter / B = 48 turns of a
+# 200-turn game and run_exploiter restarts every game at day 0, so a single
+# iteration only sees whichever games happened to end inside its window (early HQ
+# kills at first, turn-limit games later) -- measured: ~60% of games end in the
+# first 48 turns against a fresh net. The EMA starts at 0 and is not bootstrapped,
+# so the stop needs a sustained streak: at alpha 0.1 even a perfect exploiter needs
+# 12 iterations to cross 0.7. Every iteration in which at least one game finished
+# feeds it -- there is no minimum-games threshold, the EMA handles the noise.
+exploiter_win_ema_alpha: 0.1
 exploiter_lr: 0.0002
 exploiter_epochs: 5
-exploiter_ent_coef: 0.0005
+exploiter_ent_coef: 0.001
 exploiter_steps_per_iter: 200000
-exploiter_clip: 0.4     # 2x the usual clip; an exploiter may move fast and overfit
+exploiter_clip: 0.2     # same trust region as the main agent
 
 # ---- logging / checkpointing ----
 use_wandb: true

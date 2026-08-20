@@ -944,16 +944,23 @@ class Config:
     # main agent keeps having to answer every hole an exploiter has found.
     exploiter_every: int = 500       # main iters between exploiter runs (0 = disabled)
     exploiter_iters: int = 500       # max iterations of one exploiter run
-    exploiter_win_stop: float = 0.7  # stop early at this per-iteration win rate
-    exploiter_min_games: int = 200   # ...but only once this many games have finished
-                                     # in that iteration (a win rate over a handful of
-                                     # games is noise; 200 gives ~3% standard error)
+    exploiter_win_stop: float = 0.7  # stop early at this EMA win rate (see below)
+    # The early stop is judged on an EMA over the per-iteration win rates, not on a
+    # single iteration: one iteration is only exploiter_steps_per_iter / B turns
+    # (200k/4096 = 48) of a 200-turn game, and run_exploiter restarts every game at
+    # day 0, so an individual iteration's win rate is measured over whichever games
+    # happened to end inside that window -- early HQ kills at first, turn-limit games
+    # later. The EMA starts at 0 and is NOT bootstrapped from the first iteration, so
+    # the stop needs a sustained streak: at alpha 0.1 even a perfect exploiter needs
+    # ceil(log(0.3)/log(0.9)) = 12 iterations to cross 0.7. Every iteration in which
+    # at least one game finished feeds the EMA (there is no minimum-games threshold;
+    # the EMA is what handles the noise).
+    exploiter_win_ema_alpha: float = 0.1
     exploiter_lr: float = 2e-4
     exploiter_epochs: int = 5
-    exploiter_ent_coef: float = 5e-4
+    exploiter_ent_coef: float = 1e-3
     exploiter_steps_per_iter: int = 200_000
-    exploiter_clip: float = 0.4      # 2x the usual clip: an exploiter is meant to move
-                                     # fast and does not have to stay a good generalist
+    exploiter_clip: float = 0.2      # same trust region as the main agent
     # "full-mobilisation" opponent games: a fraction of games where the opponent may
     # ignore the work-cap move restriction (labourers CAN be ordered to move) so the
     # agent learns to predict opponents that mobilise every warrior. Per such game,
@@ -1739,9 +1746,19 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             "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")
         run = wandb.init(project="nypc2026-selfplay", config=vars(cfg))
         wandb.define_metric("iter")
-        wandb.define_metric("*", step_metric="iter")
         wandb.define_metric("exp/step")
-        wandb.define_metric("exp/*", step_metric="exp/step")   # more specific -> wins
+        # The exploiter panels MUST be defined key by key, not as an `exp/*` glob:
+        # wandb resolves an undefined key against its globs in DEFINITION order and
+        # takes the first hit, so the catch-all `*` below would claim them and give
+        # them `iter` as their x-axis. `iter` is not logged during an exploiter run,
+        # so all of the run's points would forward-fill onto the last main
+        # iteration's x value and collapse into what looks like ONE logged point.
+        # An EXACT define always beats a glob, which makes this immune to the order.
+        for _k in ('run', 'inner_iter', 'main_iter', 'win_rate', 'win_ema', 'games',
+                   'avg_ep_R', 'episodes', 'ploss', 'vloss', 'entropy', 'approx_kl',
+                   'value_ev', 'aux_loss_actor', 'aux_loss_critic'):
+            wandb.define_metric(f"exp/{_k}", step_metric="exp/step")
+        wandb.define_metric("*", step_metric="iter")   # everything else
 
     def wlog(d):
         """Log one point on the shared monotone wandb step (rank 0 / wandb only)."""
@@ -2118,14 +2135,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         habits would never lead it to -- and plays only that one frozen opponent: no
         pool, no scripted bots, no full-mobilisation games. Its hyperparameters are its
         own (a 2x PPO clip, higher lr, more epochs) so it can specialize hard and fast.
-        It stops at cfg.exploiter_iters iterations or as soon as one iteration's win
-        rate reaches cfg.exploiter_win_stop over at least cfg.exploiter_min_games games.
+        It stops at cfg.exploiter_iters iterations or as soon as the EMA of its
+        per-iteration win rates reaches cfg.exploiter_win_stop.
 
         `st` carries the run across a crash/resume (None = start a fresh run).
-        Returns (frozen t1, frozen t2, iterations run, last win rate)."""
+        Returns (frozen t1, frozen t2, iterations run, final EMA win rate)."""
         nonlocal exp_step
         if st is None:
-            st = dict(inner=0,
+            st = dict(inner=0, win_ema=0.0,
                       main_t1={k: v.detach().clone() for k, v in actor_t1.state_dict().items()},
                       main_t2={k: v.detach().clone() for k, v in actor_t2.state_dict().items()},
                       t1=None, t2=None, critic=None, opt_a=None, opt_c=None)
@@ -2164,14 +2181,16 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         env.regen(all_rows); rs.reset_all()
         if dd.is_main:
             print(f"== exploiter (main iter {it}): vs frozen main actor, "
-                  f"max {cfg.exploiter_iters} iters, stop at win rate "
-                  f"{cfg.exploiter_win_stop:.0%} over >= {cfg.exploiter_min_games} "
-                  f"games | lr {cfg.exploiter_lr:g} "
+                  f"max {cfg.exploiter_iters} iters, stop at win-rate EMA "
+                  f"{cfg.exploiter_win_stop:.0%} (alpha "
+                  f"{cfg.exploiter_win_ema_alpha:g}) | lr {cfg.exploiter_lr:g} "
                   f"epochs {cfg.exploiter_epochs} ent {cfg.exploiter_ent_coef:g} "
                   f"clip {cfg.exploiter_clip} horizon {hp['steps']}"
-                  + (f" (resumed at {st['inner']})" if st['inner'] else ""))
+                  + (f" (resumed at {st['inner']}, "
+                     f"win EMA {st.get('win_ema', 0.0):.3f})" if st['inner'] else ""))
 
         i, win = st['inner'], 0.0
+        win_ema = float(st.get('win_ema', 0.0))
         while i < cfg.exploiter_iters:
             t0e = time.time()
             res = run_iteration(L, rs, [tgt_t1], [tgt_t2], e_wr, e_assign,
@@ -2181,10 +2200,19 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             win = float(res['wr_sum'][N_SCRIPTED]) / max(games, 1.0)
             i += 1
             exp_step += 1
-            # every exploiter iteration gets its own wandb point; exp/win_rate is the
-            # headline -- this iteration's win rate against the frozen main actor
+            # EMA over the per-iteration win rates -- what the early stop is judged on.
+            # NOT bootstrapped from the first iteration: starting at 0 is what forces
+            # the stop to need a sustained streak instead of one lucky 48-turn window
+            # (see Config.exploiter_win_ema_alpha). An iteration in which NO game
+            # finished carries no information (`win` is 0 only because of the 0/0
+            # guard), so it is skipped rather than folded in as a total loss.
+            if games > 0:
+                a = cfg.exploiter_win_ema_alpha
+                win_ema = (1.0 - a) * win_ema + a * win
+            # every exploiter iteration gets its own wandb point; exp/win_rate is this
+            # iteration's raw win rate vs the frozen main actor, exp/win_ema the EMA
             wlog({'exp/step': exp_step, 'exp/run': n_exploiters, 'exp/inner_iter': i,
-                  'exp/win_rate': win, 'exp/games': games,
+                  'exp/win_rate': win, 'exp/win_ema': win_ema, 'exp/games': games,
                   'exp/avg_ep_R': res['ep_rewards'] / max(res['ep_count'], 1),
                   'exp/episodes': res['ep_count'], 'exp/ploss': res['pl'],
                   'exp/vloss': res['vl'], 'exp/entropy': res['el'],
@@ -2194,19 +2222,24 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             if dd.is_main and (i - 1) % log_every == 0:
                 dte = time.time() - t0e
                 print(f"   exp {i:3d}/{cfg.exploiter_iters} | games {int(games):5d} | "
-                      f"win {win:.3f} | avg_ep_R {res['ep_rewards']/max(res['ep_count'],1):+6.2f} | "
+                      f"win {win:.3f} ema {win_ema:.3f} | "
+                      f"avg_ep_R {res['ep_rewards']/max(res['ep_count'],1):+6.2f} | "
                       f"ploss {res['pl']:+.4f} vloss {res['vl']:.3f} ent {res['el']:.3f} "
                       f"kl {res['kl']:.4f} | ev {res['ev']:+.3f} | "
                       f"{hp['steps']*cfg.B/dte:,.0f} steps/s ({dte:.1f}s)")
             # persist after every inner iteration -- an exploiter run is hours long
-            st = dict(inner=i, main_t1=st['main_t1'], main_t2=st['main_t2'],
+            st = dict(inner=i, win_ema=win_ema,
+                      main_t1=st['main_t1'], main_t2=st['main_t2'],
                       t1=e_t1.state_dict(), t2=e_t2.state_dict(),
                       critic=e_cr.state_dict(), opt_a=L.opt_a.state_dict(),
                       opt_c=L.opt_c.state_dict())
             snapshot(it, st)
-            if games >= cfg.exploiter_min_games and win >= cfg.exploiter_win_stop:
+            if win_ema >= cfg.exploiter_win_stop:
+                if dd.is_main:
+                    print(f"   exploiter early stop: win-rate EMA {win_ema:.3f} >= "
+                          f"{cfg.exploiter_win_stop:.2f} after {i} iters")
                 break
-        return frozen_copy(e_t1), frozen_copy(e_t2), i, win
+        return frozen_copy(e_t1), frozen_copy(e_t2), i, win_ema
 
     for it in range(start_iter, cfg.iters):
         # ---- apply this iteration's phase hyperparameters ----
@@ -2241,7 +2274,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             pool_perm.append(True)
             n_exploiters += 1
             if dd.is_main:
-                print(f"== exploiter done after {e_iters} iters (win {e_win:.3f}); "
+                print(f"== exploiter done after {e_iters} iters (win EMA {e_win:.3f}); "
                       f"added as PERMANENT opponent 'exp@{it}' -> "
                       f"pool {len(pool_t1) + N_SCRIPTED}/"
                       f"{cfg.pool_max_size + sum(pool_perm)}")
