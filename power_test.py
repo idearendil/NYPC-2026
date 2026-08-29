@@ -22,8 +22,15 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PY = r"D:\other_programs\anaconda3\envs\nypc\python.exe"  # has numpy
+DEFAULT_PY = r"D:\applications\anaconda3\envs\nypc\python.exe"  # has numpy
 RESULT_RE = re.compile(r"RESULT\s+(LEFT_WIN|RIGHT_WIN|DRAW)\s+(\S+)")
+# numpy/BLAS spins up one thread PER CORE by default; vanilla_bot's matmuls are
+# tiny, so with several games running at once that's several processes each
+# grabbing every core -- easily enough contention to blow the judge's turn
+# budget and cause a spurious WA. Pin every child (judge + the bots it spawns,
+# which inherit this env transitively) to 1 BLAS thread.
+_SUBPROC_ENV = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
+                    OPENBLAS_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
 
 
 def build_cmd(py, weights, stochastic):
@@ -40,7 +47,7 @@ def run_one(py, seed, left_cmd, right_cmd, logdir, timeout):
            "--exec1", left_cmd, "--exec2", right_cmd, "--log", log]
     try:
         p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
-                           timeout=timeout)
+                           timeout=timeout, env=_SUBPROC_ENV)
     except subprocess.TimeoutExpired:
         return None, "JUDGE_TIMEOUT"
     m = RESULT_RE.search(p.stdout) or RESULT_RE.search(p.stderr)
@@ -86,7 +93,12 @@ def main():
     ap.add_argument("--stochastic", action="store_true", default=True)
     ap.add_argument("--greedy", dest="stochastic", action="store_false",
                     help="run both bots in argmax mode")
-    ap.add_argument("--jobs", type=int, default=1, help="parallel games")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="parallel games (each costs 3 OS processes: judge + 2 "
+                         "bots -- keep jobs <= cpu_count()//5 or turns can miss "
+                         "the judge's timing budget under contention and end in "
+                         "a spurious WA (LEFT disproportionately); see "
+                         "mode_power_test.py's docstring for why)")
     ap.add_argument("--timeout", type=int, default=600, help="per-game seconds")
     ap.add_argument("--logdir", default=None)
     args = ap.parse_args()
@@ -140,6 +152,7 @@ def _summary(results):
     old = sum(1 for r in results if r["winner"] == "old")
     draw = sum(1 for r in results if r["winner"] == "draw")
     err = sum(1 for r in results if r["winner"] == "error")
+    wa = sum(1 for r in results if r.get("reason") == "WA")
     decisive = new + old
     print("\n" + "=" * 48)
     print(f"games played : {n}")
@@ -148,6 +161,10 @@ def _summary(results):
     print(f"draws        : {draw}")
     if err:
         print(f"errors       : {err}  (see logs / reasons above)")
+    if wa and n and wa / n > 0.15:
+        print(f"\n*** {wa}/{n} games ended in WA (disqualification) -- that's high. ***\n"
+              f"*** Likely CPU contention from --jobs, not a real bug -- keep    ***\n"
+              f"*** jobs <= cpu_count()//3. Rerun lower before trusting this.    ***")
     if decisive:
         print(f"\nnew win rate (excl. draws/errors): {new/decisive:6.1%}")
     if n:

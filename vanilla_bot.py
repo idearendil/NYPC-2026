@@ -1111,7 +1111,7 @@ def main():
     # Manual argv parse (no argparse) -- supports `--weights X`, `--weights=X`,
     # `--stochastic` (default) / `--greedy`. No search knobs: this bot always emits a
     # single one-shot policy action. Defaults: data.bin, stochastic sampling.
-    weights, stochastic = "data.bin", True
+    weights, stochastic = "data.bin", False
     args = sys.argv[1:]
     i = 0
     while i < len(args):
