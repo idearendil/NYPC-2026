@@ -11,7 +11,7 @@
 # (steps_per_iter / B); with lam=0.95 the advantage estimate only reaches back
 # ~1/(1-gamma*lam) ~ 20 steps anyway -- the terminal +-10 is propagated by the
 # critic, not by the rollout length -- so a horizon of ~100 is plenty.
-B: 4096
+B: 12288
 steps_per_iter: 200000  # env-steps per iteration (horizon = steps_per_iter / B), FIXED
 iters: 3000              # number of training iterations
 
@@ -23,13 +23,15 @@ lam: 0.95               # GAE lambda
 clip: 0.2               # PPO clip range
 lr: 0.0005               # Adam lr (shared by actor & critic optimizers)
 epochs: 4                # PPO epochs per iteration
-minibatch: 4096         # TOTAL minibatch size; with --gpus N each rank takes
+minibatch: 12288         # TOTAL minibatch size; with --gpus N each rank takes
                         # minibatch/N, so the number of optimizer steps and the
-                        # effective batch match a 1-GPU run. Once B is large the
-                        # PPO update, not the rollout, is the bottleneck, and
-                        # raising this is the main lever left -- but it changes
-                        # the optimization (fewer, larger steps), so it is not
-                        # touched by default.
+                        # effective batch match a 1-GPU run. MUST be divisible by
+                        # the GPU count (683 x 6 here -- the training server); if
+                        # you change --gpus, re-pick a multiple of the new count.
+                        # Once B is large the PPO update, not the rollout, is the
+                        # bottleneck, and raising this is the main lever left --
+                        # but it changes the optimization (fewer, larger steps),
+                        # so it is not touched by default.
 target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
 ent_coef: 0.001          # entropy bonus (actor loss)
 aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables

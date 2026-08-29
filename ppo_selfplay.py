@@ -868,7 +868,7 @@ class Config:
     clip: float = 0.2
     lr: float = 5e-4
     epochs: int = 4
-    minibatch: int = 12288
+    minibatch: int = 4096
     # KL early stopping: stop an iter's PPO epochs once the policy has drifted
     # this far from the data-collection policy (approx_kl, Schulman estimator).
     # null/None disables it. Lets you raise lr/epochs without overshooting.
