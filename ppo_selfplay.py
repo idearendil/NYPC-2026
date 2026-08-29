@@ -1060,6 +1060,7 @@ class RolloutState:
         self.reach_op = torch.zeros(B, T, 5, device=device)
         self.rstate = RushState(B, device)
         self.jstate = DefenceState(B, device)
+        self.r2state = RushState(B, device)
         self._all = torch.arange(B, device=device)
 
     def reset_rows(self, rows):
@@ -1067,6 +1068,7 @@ class RolloutState:
         self.reach_op[rows] = 0
         self.rstate.reset_rows(rows)
         self.jstate.reset_rows(rows)
+        self.r2state.reset_rows(rows)
 
     def reset_all(self):
         self.reset_rows(self._all)
@@ -1085,15 +1087,17 @@ def sample_opponents(n, pool_wr, gen, floor=0.05):
 
 
 # The first N_SCRIPTED unified opponent indices are FIXED scripted bots (never
-# evicted): index 0 = rush, index 1 = defence. Net snapshot j is unified index
-# j + N_SCRIPTED. These are batched, region-based ports of the team's
-# final_rush_bot.py / final_defence_bot.py -- see the two *_action functions
-# below for exactly how each maps its (per-warrior-role) original onto the env's
-# per-REGION move interface (one target per source region per day; the env
-# itself picks which stationary warriors beyond the region's work_cap go).
+# evicted): index 0 = rush, index 1 = defence, index 2 = rush2. Net snapshot j
+# is unified index j + N_SCRIPTED. These are batched, region-based ports of the
+# team's final_rush_bot.py / final_defence_bot.py / final_rush_bot2.py -- see
+# the *_action functions below for exactly how each maps its (per-warrior-role)
+# original onto the env's per-REGION move interface (one target per source
+# region per day; the env itself picks which stationary warriors beyond the
+# region's work_cap go).
 RUSH_IDX = 0
 DEFENCE_IDX = 1
-N_SCRIPTED = 2
+RUSH2_IDX = 2
+N_SCRIPTED = 3
 _BIG = 1 << 30
 
 # rush-bot strategy knobs (mirror final_rush_bot.py; that file already targets
@@ -1121,6 +1125,17 @@ DEF_INCURSION_MIN = 5        # visible-near-my-land enemy count that means "seri
 DEF_GOLD_RESERVE = 60
 DEF_UPGRADE_BUFFER = 120
 DEF_UPGRADE_SAVE = 700       # gold set aside for upgrades once the army target is met
+
+# rush2-bot strategy knobs (mirror final_rush_bot2.py). Unlike rush_action this
+# opponent never expands (BASE_COUNT=0 there) and never upgrades its HQ past
+# level 1 (MAX_HQ_LEVEL=1 there, so train_cap stays 1/turn) -- pure tempo: train
+# continuously and throw a small wave at the enemy HQ over and over.
+RUSH2_WAVE_SIZE = 7
+RUSH2_DEFENSE_RATIO = 2
+RUSH2_HOME_GUARD = 1
+RUSH2_FORCE_LAUNCH_TURN = 200
+RUSH2_GOLD_RESERVE = 60
+RUSH2_VISION = 2
 
 
 class RushState:
@@ -1264,6 +1279,78 @@ def rush_action(env, side, rstate):
     reserve = torch.where(expanding, rstate.BASE_COST[1] + RUSH_GOLD_RESERVE,
                           torch.full_like(gold, RUSH_GOLD_RESERVE))
     n_afford = ((gold_left - reserve) // TRAIN_COST).clamp(min=0)
+    train = torch.minimum(traincap, n_afford)
+
+    rstate.launched = torch.where(ready, rstate.launched + 1, rstate.launched)
+    return {'build': build, 'move': move, 'train': train, 'force_build': force}
+
+
+def rush2_action(env, side, rstate):
+    """Scripted fixed opponent: a batched, region-based port of
+    final_rush_bot2.py. Unlike rush_action this bot never expands
+    (BASE_COUNT=0 there) and never upgrades its HQ (MAX_HQ_LEVEL=1 there, so
+    the level-1 HQ's train_cap of 1/turn is permanent) -- its whole strategy is
+    train continuously, and the moment RUSH2_WAVE_SIZE warriors are idle at
+    home and home isn't badly outmatched by visible nearby enemies (or
+    RUSH2_FORCE_LAUNCH_TURN has passed with no wave sent yet), throw them all
+    at the enemy HQ -- repeats forever. Returns a full-batch action dict
+    (build/force_build always empty: this bot never builds or upgrades
+    anything). Reuses the RushState class for its per-game ``launched`` wave
+    counter even though the HQ_UPCOST/BASE_COST tables it also carries go
+    unused here."""
+    B, N, dev = env.B, env.N, env.device
+    opp = 1 - side
+    turn = env.day
+    my_hq = env.hq_region[:, side]
+    opp_hq = env.hq_region[:, opp]
+    tok = env.mb.token_ids
+    tt = env.mb.travel_turns
+    T = env.mb.T
+    reg_ids = torch.arange(N, device=dev)[None, :]
+
+    def tok_idx(region):
+        q = region.clamp(min=0)[:, None].contiguous()
+        return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
+
+    def dist_to(region):
+        ti = tok_idx(region)
+        return tt.gather(2, ti[:, None, None].expand(B, N, 1)).squeeze(2)
+
+    def at(field, region):
+        return field.gather(1, region.clamp(min=0)[:, None]).squeeze(1)
+
+    sd = env.slot_side[None, :].expand(B, env.W)
+    alive = env.w_hp > 0
+    mine = alive & (sd == side)
+    enemy = alive & (sd == opp)
+    stat_mine = mine & (~env.w_move)
+    stat_reg = env._scatter_region(stat_mine)
+    opp_reg = env._scatter_region(enemy)
+    gold = env.gold[:, side]
+    hq_level = env.b_level.gather(1, my_hq[:, None]).squeeze(1).clamp(max=HQ_MAXLEVEL)
+    traincap = rstate.HQ_TRAINCAP[hq_level]
+
+    tt_to_myhq = dist_to(my_hq)
+
+    build = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    move = torch.full((B, N), -1, dtype=torch.long, device=dev)
+    force = torch.zeros(B, N, dtype=torch.bool, device=dev)
+
+    # ---- wave launch: RUSH2_WAVE_SIZE idle at HQ, home not badly outmatched ----
+    home_stat = at(stat_reg, my_hq)
+    near_hq_enemy = (opp_reg * (tt_to_myhq <= RUSH2_VISION).long()).sum(1)
+    home_left = home_stat - RUSH2_WAVE_SIZE
+    outmatched = home_left < near_hq_enemy * RUSH2_DEFENSE_RATIO + RUSH2_HOME_GUARD
+    force_launch = (turn >= RUSH2_FORCE_LAUNCH_TURN) & (rstate.launched == 0)
+    ready = (home_stat >= RUSH2_WAVE_SIZE) & (~outmatched | force_launch) \
+        & (gold >= MOVE_COST * RUSH2_WAVE_SIZE)
+
+    hq_tgt = torch.where(ready, opp_hq, my_hq)
+    move = torch.where(reg_ids == my_hq[:, None], hq_tgt[:, None].expand(B, N), move)
+
+    # ---- train: no expansion/upgrades ever (HQ stays level 1) -- just keep the
+    # upkeep reserve and train up to cap every turn ----
+    n_afford = ((gold - RUSH2_GOLD_RESERVE) // TRAIN_COST).clamp(min=0)
     train = torch.minimum(traincap, n_afford)
 
     rstate.launched = torch.where(ready, rstate.launched + 1, rstate.launched)
@@ -1491,12 +1578,12 @@ def region_to_token(token_ids, region):
 
 
 def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
-                     rstate, jstate, relax_reg=None, forbid_tgt=None):
+                     rstate, jstate, r2state, relax_reg=None, forbid_tgt=None):
     """Sample opponent actions, grouping batch slots by their assigned opponent so
     each opponent runs once over its subset of games. The first N_SCRIPTED unified
-    indices are fixed scripted bots (0 = rush, 1 = defence); index p >= N_SCRIPTED
-    maps to net snapshot pool_t1[p-N_SCRIPTED]/pool_t2[p-N_SCRIPTED]. Returns
-    (action, new_hq_commit) -- the scripted bots never commit."""
+    indices are fixed scripted bots (0 = rush, 1 = defence, 2 = rush2); index
+    p >= N_SCRIPTED maps to net snapshot pool_t1[p-N_SCRIPTED]/pool_t2[p-N_SCRIPTED].
+    Returns (action, new_hq_commit) -- the scripted bots never commit."""
     build_full = torch.zeros(B, N, dtype=torch.bool, device=dev)
     move_full = torch.full((B, N), -1, dtype=torch.long, device=dev)
     train_full = torch.zeros(B, dtype=torch.long, device=dev)
@@ -1505,8 +1592,12 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
     for p in torch.unique(opp_assign).tolist():
         rows = (opp_assign == p).nonzero(as_tuple=True)[0]
         if p < N_SCRIPTED:
-            act = (rush_action(env, side, rstate) if p == RUSH_IDX
-                   else defence_action(env, side, jstate))
+            if p == RUSH_IDX:
+                act = rush_action(env, side, rstate)
+            elif p == DEFENCE_IDX:
+                act = defence_action(env, side, jstate)
+            else:
+                act = rush2_action(env, side, r2state)
             build_full[rows] = act['build'][rows]
             move_full[rows] = act['move'][rows]
             train_full[rows] = act['train'][rows]
@@ -1582,15 +1673,15 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     # room stays constant: ordinary win-rate-triggered self-snapshots are all evictable
     # (oldest first), while the scripted bots and the periodic perm_snapshot_every
     # self-snapshots are permanent. pool_perm[j] marks net snapshot j as permanent.
-    # pool_ids names each opponent: 'rush'/'defence' for the fixed ones, 'main@<it>'
-    # for the periodic permanent self-snapshots, and an int for the ordinary evictable
-    # ones (those are logged to wandb by SLOT -- opponent1..N -- so the number of
-    # curves stays bounded).
+    # pool_ids names each opponent: 'rush'/'defence'/'rush2' for the fixed ones,
+    # 'main@<it>' for the periodic permanent self-snapshots, and an int for the
+    # ordinary evictable ones (those are logged to wandb by SLOT -- opponent1..N --
+    # so the number of curves stays bounded).
     pool_t1 = [frozen_copy(actor_t1)]
     pool_t2 = [frozen_copy(actor_t2)]
-    # EMA win rate, indexed by unified opponent index: [rush, defence, net0]
+    # EMA win rate, indexed by unified opponent index: [rush, defence, rush2, net0]
     pool_wr = torch.full((N_SCRIPTED + 1,), 0.5)
-    pool_ids = ['rush', 'defence', 0]
+    pool_ids = ['rush', 'defence', 'rush2', 0]
     pool_perm = [False]                 # per net snapshot: never-evict?
     next_opp_id = 1
     n_perm_snaps = 0                    # periodic permanent self-snapshots taken so far
@@ -1690,13 +1781,14 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             opp_assign = sample_opponents(B_loc, ck['pool_wr'].cpu(), opp_gen,
                                           cfg.opp_sample_floor).to(device)
         # backward-compat: older checkpoints have fewer scripted slots than the
-        # current N_SCRIPTED (rusher=0, japper=1). The scripted bots occupy the
+        # current N_SCRIPTED (e.g. a checkpoint saved when only rush+defence
+        # existed, before rush2 was added). The scripted bots occupy the
         # leading unified indices ahead of the net snapshots; insert the MISSING
         # ones at their positions (right after the present scripted, before the
         # nets) and shift only the opp_assign references at/after that position.
         n_have = pool_wr.numel() - len(pool_t1)            # scripted slots present
         if n_have < N_SCRIPTED:
-            missing = ['rush', 'defence'][n_have:N_SCRIPTED]
+            missing = ['rush', 'defence', 'rush2'][n_have:N_SCRIPTED]
             k = len(missing)
             pool_wr = torch.cat([pool_wr[:n_have],
                                  torch.full((k,), 0.5), pool_wr[n_have:]])
@@ -1769,7 +1861,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         actor_params, critic_params = L.pa, L.pc
         pool_t1, pool_t2 = p_t1, p_t2
         prev_reach_ag, prev_reach_op = rs.reach_ag, rs.reach_op
-        rstate, jstate = rs.rstate, rs.jstate
+        rstate, jstate, r2state = rs.rstate, rs.jstate, rs.r2state
 
         buf = []
         # Episode bookkeeping is accumulated on the DEVICE and read once per
@@ -1791,7 +1883,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                              & (torch.rand(B_loc, N, device=device) < cfg.opp_relax_prob))
                 act_op, ncommit_op = opponent_actions(
                     pool_t1, pool_t2, o_op, opp_assign, env, 1, B_loc, N, device,
-                    rstate, jstate, relax_reg=relax_reg)
+                    rstate, jstate, r2state, relax_reg=relax_reg)
             # ---------------- turn-1 opening split ----------------
             # On a game's first turn (env.day==0) our region-move action space would send
             # the HQ's two spare warriors to ONE stronghold. Re-infer with warrior #1
@@ -1831,7 +1923,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                                               torch.full_like(a_reg1, -1))
                         act_op2, _ = opponent_actions(
                             pool_t1, pool_t2, o2op, opp_assign, env, 1, B_loc, N, device,
-                            rstate, jstate, relax_reg=relax_reg, forbid_tgt=forbid1)
+                            rstate, jstate, r2state, relax_reg=relax_reg, forbid_tgt=forbid1)
                         b_reg1 = act_op2['move'].gather(1, hq1[:, None]).squeeze(1)
                         r1 = split1.nonzero(as_tuple=True)[0]
                         act_op['move'][r1, hq1[r1]] = b_reg1[r1]             # execute HQ -> B
@@ -1891,6 +1983,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 # restart the scripted opponents' state machines for the new games
                 rstate.reset_rows(drows)
                 jstate.reset_rows(drows)
+                r2state.reset_rows(drows)
 
         with torch.no_grad():
             # bootstrap value on the post-rollout state; same prev_reach the next
@@ -2091,7 +2184,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 o_op = extract(env, 1, rs.reach_op)
                 act_op, ncommit_op = opponent_actions(
                     pool_t1, pool_t2, o_op, opp_assign, env, 1, B_loc, N, device,
-                    rs.rstate, rs.jstate)
+                    rs.rstate, rs.jstate, rs.r2state)
             rs.reach_ag = o_ag['reach_raw'].clone()
             rs.reach_op = o_op['reach_raw'].clone()
             env.step({'left': act_ag, 'right': act_op})
@@ -2108,6 +2201,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 rs.reach_op[rows] = 0
                 rs.rstate.reset_rows(rows)
                 rs.jstate.reset_rows(rows)
+                rs.r2state.reset_rows(rows)
 
     steps = max(1, cfg.steps_per_iter // cfg.B)
     # de-synchronize episode phases across the B_loc games before the first real
@@ -2211,7 +2305,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                   f"pool {len(pool_t1)+N_SCRIPTED}/{pool_cap} "
                   f"wr_min {float(pool_wr.min()):.2f} "
                   f"rush_wr {float(pool_wr[RUSH_IDX]):.2f} "
-                  f"def_wr {float(pool_wr[DEFENCE_IDX]):.2f} | "
+                  f"def_wr {float(pool_wr[DEFENCE_IDX]):.2f} "
+                  f"rush2_wr {float(pool_wr[RUSH2_IDX]):.2f} | "
                   f"{steps*cfg.B/dt:,.0f} steps/s ({dt:.1f}s)")
 
         if run is not None:
@@ -2236,6 +2331,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'opp_winrate_mean': float(pool_wr.mean()),
                 'opp_winrate_rush': float(pool_wr[RUSH_IDX]),
                 'opp_winrate_defence': float(pool_wr[DEFENCE_IDX]),
+                'opp_winrate_rush2': float(pool_wr[RUSH2_IDX]),
                 'pool_added': int(added),
                 'steps_per_s': steps * cfg.B / dt,
                 'world_size': dd.world,
@@ -2246,7 +2342,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             # curves is bounded by cfg.pool_max_size - N_SCRIPTED however long the run
             # goes: on an eviction each remaining snapshot shifts down one slot and
             # opponentN simply continues with the next one. Only the permanent entries
-            # (rush/defence, main@<it>) get a curve of their own, and those
+            # (rush/defence/rush2, main@<it>) get a curve of their own, and those
             # are added on a fixed schedule.
             slot = 0
             for k, oid in enumerate(pool_ids):
