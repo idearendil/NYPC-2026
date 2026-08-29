@@ -433,23 +433,24 @@ def run_scripted_coverage(NP, KP, turns, seed):
 
 def main():
     configs = [
-        # (NP, KP) -- KP must be in the legal odd range for N=2NP+1
-        (25, 4),    # N=51,  K=9   (smallest)
-        (30, 5),    # N=61,  K=11
-        (40, 6),    # N=81,  K=13
-        (54, 10),   # N=109, K=21  (largest)
+        # (NP, KP) -- KP must be in the legal odd range for N=2NP+1 (see
+        # testing-tool2.generate_map: NP in [90,124], N in [181,249])
+        (90, 6),    # N=181, K=13  (smallest)
+        (100, 7),   # N=201, K=15
+        (115, 8),   # N=231, K=17
+        (124, 9),   # N=249, K=19  (largest)
     ]
     ok = True
     for (NP, KP) in configs:
         ok &= run_parity(B=16, NP=NP, KP=KP, turns=200, seed=1234 + NP, device='cpu')
 
     # deterministic economy: guarantees build/upgrade/heal branches are hit
-    for (NP, KP) in [(25, 4), (40, 6)]:
+    for (NP, KP) in [(90, 6), (115, 8)]:
         ok &= run_scripted_coverage(NP, KP, turns=200, seed=77 + NP)
 
     # MIXED SIZES in one padded batch (different N and K per game)
-    mixed_specs = [(25, 4), (54, 10), (31, 5), (40, 6), (25, 4), (47, 8),
-                   (54, 9), (33, 6)]
+    mixed_specs = [(90, 6), (124, 9), (95, 6), (115, 8), (90, 6), (109, 7),
+                   (124, 8), (100, 7)]
     for dev in (['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']):
         mmaps = gen_maps_mixed(mixed_specs, seed0=555)
         ns = sorted({mm.N for mm in mmaps})
@@ -458,7 +459,7 @@ def main():
 
     # GPU == CPU determinism check on one config (compare to its own reference)
     if torch.cuda.is_available():
-        ok &= run_parity(B=16, NP=40, KP=6, turns=200, seed=999, device='cuda')
+        ok &= run_parity(B=16, NP=115, KP=8, turns=200, seed=999, device='cuda')
     else:
         print("[skip] CUDA not available for GPU parity")
 

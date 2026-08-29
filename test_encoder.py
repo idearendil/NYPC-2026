@@ -65,13 +65,62 @@ def warriors_of(st, side):
     return [w for w in st.warriors.values() if w.side is side and w.hp > 0]
 
 
-def check_game(env, b, st, m, side, cov):
+# --------------------------------------------------------------------------- #
+# Independent python-side belief tracker (fog of war), mirroring
+# FastEnv._update_fog exactly but built from the reference GameState + the
+# reference's OWN tt._hop_set -- so this is a genuinely independent check of
+# the vision/memory logic, not just a restatement of it.
+# --------------------------------------------------------------------------- #
+def _vis_regions(st, m, side):
+    vis = set()
+    for w in st.warriors.values():
+        if w.side is side and w.hp > 0:
+            vis |= tt._hop_set(w.region, tt.HOP_VISION, m.adj)
+    for bld in st.buildings.values():
+        if bld.side is side:
+            vis |= tt._hop_set(bld.region, tt.HOP_VISION, m.adj)
+    return vis
+
+
+def new_belief(N):
+    return {r: dict(kind=0, level=0, bhp=0, wcnt=0, whp=0, age=fe.MAX_DAYS) for r in range(N)}
+
+
+def update_belief(belief, st, m, side):
+    """One day's refresh of `side`'s belief about its opponent, in place."""
+    opp = Side.RIGHT if side is Side.LEFT else Side.LEFT
+    vis = _vis_regions(st, m, side)
+    op_w = warriors_of(st, opp)
+    wcnt_by_r, whp_by_r = {}, {}
+    for w in op_w:
+        wcnt_by_r[w.region] = wcnt_by_r.get(w.region, 0) + 1
+        whp_by_r[w.region] = whp_by_r.get(w.region, 0) + w.hp
+    for r in range(m.N):
+        e = belief[r]
+        if r in vis:
+            bld = st.buildings.get(r)
+            if bld is not None and bld.side is opp:
+                e['kind'] = 1 if bld.kind is BKind.HQ else 2
+                e['level'] = bld.level
+                e['bhp'] = bld.hp
+            else:
+                e['kind'] = 0; e['level'] = 0; e['bhp'] = 0
+            e['wcnt'] = wcnt_by_r.get(r, 0)
+            e['whp'] = whp_by_r.get(r, 0)
+            e['age'] = 0
+        else:
+            e['age'] += 1
+
+
+def check_game(env, b, st, m, side, belief, cov):
     me = side
     opp = Side.RIGHT if side is Side.LEFT else Side.LEFT
     tokens, glob, info = env.observe(0 if side is Side.LEFT else 1)
     tok_ids = env.mb.token_ids[b].tolist()
     tmask = env.mb.token_valid[b].tolist()
     T_ = env.mb.T
+    HQ_TUR = [0, 1, 2, 2, 3, 3]; HQ_WC = [0, 1, 2, 3, 4, 5]
+    BA_TUR = [0, 1, 1, 2]; BA_WC = [0, 1, 2, 3]
 
     # ground-truth turns-to-target for every token region (cache per token)
     tturns = {}  # token_region -> [turns from each region]
@@ -82,7 +131,6 @@ def check_game(env, b, st, m, side, cov):
                 tturns[r] = turns_to_target(m, r)
 
     my_w = warriors_of(st, me)
-    op_w = warriors_of(st, opp)
 
     for ti in range(T_):
         if not tmask[ti]:
@@ -93,48 +141,56 @@ def check_game(env, b, st, m, side, cov):
         f = tokens[b, ti].tolist()
 
         my_cnt = sum(1 for w in my_w if w.region == r)
-        op_cnt = sum(1 for w in op_w if w.region == r)
         bld = st.buildings.get(r)
         my_base = bld.level if (bld and bld.side is me and bld.kind is BKind.BASE) else 0
-        op_base = bld.level if (bld and bld.side is opp and bld.kind is BKind.BASE) else 0
         my_hq = bld.level if (bld and bld.side is me and bld.kind is BKind.HQ) else 0
-        op_hq = bld.level if (bld and bld.side is opp and bld.kind is BKind.HQ) else 0
         my_tur = bld.turret() if (bld and bld.side is me) else 0
-        op_tur = bld.turret() if (bld and bld.side is opp) else 0
         my_wc = bld.work_cap() if (bld and bld.side is me) else 0
-        op_wc = bld.work_cap() if (bld and bld.side is opp) else 0
         my_bhp = bld.hp if (bld and bld.side is me) else 0
-        op_bhp = bld.hp if (bld and bld.side is opp) else 0
         stat = [w for w in my_w if w.region == r and w.moving_target is None]
         surplus = len(stat) - my_wc
         stat_hp = sum(w.hp for w in stat)
 
+        # opponent fields come from this side's BELIEF, not the true state
+        e = belief[r]
+        op_cnt = e['wcnt']
+        op_base = e['level'] if e['kind'] == 2 else 0
+        op_hq = e['level'] if e['kind'] == 1 else 0
+        op_tur = (HQ_TUR[min(e['level'], 5)] if e['kind'] == 1 else
+                  BA_TUR[min(e['level'], 3)] if e['kind'] == 2 else 0)
+        op_wc = (HQ_WC[min(e['level'], 5)] if e['kind'] == 1 else
+                 BA_WC[min(e['level'], 3)] if e['kind'] == 2 else 0)
+        op_bhp = e['bhp']
+        age = e['age']
+
         expect = [my_cnt, op_cnt, my_base, op_base, my_hq, op_hq,
-                  my_tur, op_tur, my_wc, op_wc, my_bhp, op_bhp, surplus, stat_hp]
+                  my_tur, op_tur, my_wc, op_wc, my_bhp, op_bhp, surplus, stat_hp, age]
         for i, ev in enumerate(expect):
             assert int(f[i]) == ev, \
                 f"token feat {i} b{b} side{me} tok r{r}: env={int(f[i])} expect={ev}"
 
-        # arrivals of my movers in exactly k turns
+        # arrivals of my movers in exactly k turns (unaffected by fog -- own info)
         for k in range(1, 6):
             ev = sum(1 for w in my_w
                      if w.moving_target == r and tturns[r][w.region] == k)
-            assert int(f[14 + (k - 1)]) == ev, \
-                f"arrive k{k} b{b} tok r{r}: env={int(f[14 + k - 1])} expect={ev}"
+            assert int(f[15 + (k - 1)]) == ev, \
+                f"arrive k{k} b{b} tok r{r}: env={int(f[15 + k - 1])} expect={ev}"
             if ev > 0:
                 cov['arrive_pos'] += 1
 
-        # enemy reachable within k turns
+        # enemy reachable within k turns -- a sum over ALL regions weighted by
+        # (that region's BELIEVED opponent count) x (within k turns of r); belief
+        # is per-region (not per-warrior), so this mirrors the env exactly.
         for k in range(1, 6):
-            ev = sum(1 for w in op_w
-                     if 0 <= tturns[r][w.region] <= k)
-            assert int(f[19 + (k - 1)]) == ev, \
-                f"reach k{k} b{b} tok r{r}: env={int(f[19 + k - 1])} expect={ev}"
+            ev = sum(belief[src]['wcnt'] for src in range(m.N)
+                     if 0 <= tturns[r][src] <= k)
+            assert int(f[20 + (k - 1)]) == ev, \
+                f"reach k{k} b{b} tok r{r}: env={int(f[20 + k - 1])} expect={ev}"
             cov['reach_max'] = max(cov['reach_max'], ev)
 
         # distance to every other token (turns)
         for tj in range(T_):
-            base = 24 + tj
+            base = 25 + tj
             if not tmask[tj]:
                 assert int(f[base]) == 0
                 continue
@@ -147,11 +203,17 @@ def check_game(env, b, st, m, side, cov):
 
 def main():
     import sys
-    maps = T.gen_maps_mixed([(25, 4), (54, 10), (31, 5), (40, 6)], seed0=2024)
+    maps = T.gen_maps_mixed([(90, 6), (124, 9), (95, 6), (115, 8)], seed0=2024)
     env = fe.FastEnv(maps, device='cpu')
     refs = [tt.init_state(m) for m in maps]
     rng = random.Random(7)
     B = len(maps)
+
+    # independent fog-of-war belief tracker: belief[b][side] = this side's
+    # persisted memory of the opponent, refreshed via the reference's own
+    # tt._hop_set (not env's hop2_reach) -- see update_belief().
+    belief = [{Side.LEFT: new_belief(maps[b].N), Side.RIGHT: new_belief(maps[b].N)}
+             for b in range(B)]
 
     # play random turns and validate observe() at several snapshots, so the
     # travel-based features are exercised across many different states.
@@ -171,7 +233,7 @@ def main():
                 if w.hp > 0 and w.region not in toks:
                     transit += 1
             for side in (Side.LEFT, Side.RIGHT):
-                check_game(env, b, refs[b], maps[b], side, cov)
+                check_game(env, b, refs[b], maps[b], side, belief[b][side], cov)
                 checked += 1
 
     for t in range(60):
@@ -183,6 +245,12 @@ def main():
             tt._dijkstra_cache.clear()
             per_game.append(T.play_ref_turn(refs[b], maps[b], rng))
         env.step(T.assemble_actions(env, per_game))
+        for b in range(B):
+            if done[b]:
+                continue
+            # belief refreshes off the SAME post-day state env._update_fog uses
+            for side in (Side.LEFT, Side.RIGHT):
+                update_belief(belief[b][side], refs[b], maps[b], side)
         for b in range(B):
             if tt.hq_of(refs[b], Side.LEFT) is None or tt.hq_of(refs[b], Side.RIGHT) is None:
                 done[b] = True
@@ -210,7 +278,8 @@ def main():
     assert transit > 0, "no warriors in transit (non-token) regions to test reach"
     print(f"coverage: nonzero-arrive cells={cov['arrive_pos']}, "
           f"max enemy-reach value={cov['reach_max']}, transit warriors={transit}")
-    # global feature spot-checks
+    # global feature spot-checks (opponent aggregates are belief-based, i.e.
+    # summed over this side's per-region memory -- see fast_env.observe)
     for side in (0, 1):
         tokens, glob, info = env.observe(side)
         me = Side.LEFT if side == 0 else Side.RIGHT
@@ -219,12 +288,13 @@ def main():
             if done[b]:
                 continue
             st = refs[b]
+            bel = belief[b][me]
             assert int(glob[b, 1]) == len(warriors_of(st, me))
-            assert int(glob[b, 2]) == len(warriors_of(st, opp))
+            assert int(glob[b, 2]) == sum(e['wcnt'] for e in bel.values())
             assert int(glob[b, 5]) == st.gold[me.value]
-            assert int(glob[b, 6]) == st.gold[opp.value]
+            assert int(glob[b, 6]) == st.gold[opp.value]     # opp gold is NOT fogged in observe()
             lvl_my = sum(bb.level for bb in st.buildings.values() if bb.side is me)
-            lvl_op = sum(bb.level for bb in st.buildings.values() if bb.side is opp)
+            lvl_op = sum(e['level'] for e in bel.values())
             assert int(glob[b, 9]) == lvl_my and int(glob[b, 10]) == lvl_op
 
     print(f"all token features (counts, buildings, surplus, stat_hp, "

@@ -31,11 +31,11 @@ import os
 import queue as _queue
 import random
 
-_TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testing-tool.py")
+_TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testing-tool2.py")
 
 
 def _load_tt():
-    """Import testing-tool.py (its name isn't a valid module name) by path."""
+    """Import testing-tool2.py (its name isn't a valid module name) by path."""
     spec = importlib.util.spec_from_file_location("tt_reference", _TT_PATH)
     tt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tt)
@@ -55,21 +55,15 @@ def tt():
 def random_map_lines(rng: random.Random):
     """One uniformly random legal map, as the generator's raw text lines.
 
-    Mirrors ``FastEnv._random_map``'s draw (NP in [25,54], KP uniform over the
-    legal range for that N) and retries the map-placement failures the generator
-    raises for unlucky stronghold counts.
+    Mirrors ``FastEnv._random_map``'s draw: NP/KP are left unset so
+    ``generate_map`` picks both itself (it owns the legal-range formula), and
+    retries the map-placement failures the generator raises for unlucky
+    stronghold counts.
     """
     t = tt()
     while True:
-        NP = rng.randint(25, 54)
-        N = 2 * NP + 1
-        klo = (3 * N + 19) // 20
-        khi = N // 5
-        klo = klo + 1 if klo % 2 == 0 else klo
-        khi = khi - 1 if khi % 2 == 0 else khi
-        KP = rng.randint((klo - 1) // 2, (khi - 1) // 2)
         try:
-            return t.generate_map(t.XoShiro256(rng.getrandbits(63)), NP, KP)
+            return t.generate_map(t.XoShiro256(rng.getrandbits(63)))
         except (ValueError, RuntimeError):
             continue
 

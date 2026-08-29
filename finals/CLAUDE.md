@@ -29,10 +29,13 @@
 
 ```
 [환경 — 사용자에게 받아서 채울 것]
-python   : (미확인)      예) /home/team/miniconda3/envs/nypc/bin/python
-CPU      : (미확인) 스레드
-GPU      : (미확인)      예) RTX 4070 Super x2, 12GB each
-규칙/참조: (미확인)      예) rules.pdf + organizer_sim.py
+python(학습서버): (미확인, 서버 접속 시 확인) — GPU 노드 venv 경로
+python(로컬)    : D:\applications\anaconda3\envs\nypc\python.exe
+CPU      : 학습서버 128 스레드
+GPU      : 학습서버 RTX 3090 x6 (24GB each) / RAM 503GB
+           로컬(개발) RTX 2060 laptop 1장 — 디버깅/스모크 테스트용
+규칙/참조: testing-tool2.py (신규 참조 구현, 최상위 디렉토리)
+           구 참조 구현은 testing-tool.py (예선) — diff 대상
 ```
 
 - 개발 머신과 학습 서버가 다를 수 있다. **다르면 둘 다 적어라.**

@@ -13,7 +13,7 @@ Side = tt.Side
 
 
 def main():
-    B, NP, KP = 8, 35, 6
+    B, NP, KP = 8, 100, 7
     maps = T.gen_maps(B, NP, KP, 2024)
     env = fe.FastEnv(maps, device='cpu')
     rng = random.Random(0)
@@ -32,8 +32,8 @@ def main():
     T_tok = env.mb.T
     N = env.N
     # token feature count per spec:
-    #  14 scalar features + arrive(5) + reach(5) + dist-to-all-tokens(T)
-    exp_F = 14 + 5 + 5 + T_tok
+    #  15 scalar features (incl. fog-of-war age) + arrive(5) + reach(5) + dist-to-all-tokens(T)
+    exp_F = 15 + 5 + 5 + T_tok
     for side in (0, 1):
         tokens, glob, info = env.observe(side)
         assert tokens.shape == (B, T_tok, exp_F), \
@@ -57,24 +57,26 @@ def main():
             my_cnt = int(((env.w_region[b, :env.Wside] == r) & my_alive[b]).sum())
             feat = int(tokens[b, ti, 0])
             assert feat == my_cnt, f"my_cnt mismatch b{b} tok{ti}: {feat} vs {my_cnt}"
-    # global feature 1/2 = total warriors per side
+    # global feature 1 = my total warriors (exact -- own info is never fogged).
+    # feature 2 (opponent total) is belief-based under fog-of-war (see
+    # test_encoder.py for the dedicated fog-of-war check), so it is not
+    # compared against the true count here.
     for b in range(B):
         mt = int((env.w_hp[b, :env.Wside] > 0).sum())
-        ot = int((env.w_hp[b, env.Wside:] > 0).sum())
-        assert int(glob[b, 1]) == mt and int(glob[b, 2]) == ot
+        assert int(glob[b, 1]) == mt
     # distance block is symmetric in turns: dist(tok i -> HQ) sanity (>=0)
-    dist_block = tokens[:, :, 14 + 10:]
+    dist_block = tokens[:, :, 15 + 10:]
     assert (dist_block >= 0).all()
     print("feature recompute checks (my_cnt, totals, dist>=0): OK")
 
     # ---- mixed-size batch: token_mask must mark exactly K_b+2 valid tokens ----
-    mmaps = T.gen_maps_mixed([(25, 4), (54, 10), (31, 5), (40, 6)], 321)
+    mmaps = T.gen_maps_mixed([(90, 6), (124, 9), (95, 6), (115, 8)], 321)
     menv = fe.FastEnv(mmaps, device='cpu')
     for _ in range(10):
         menv.step(T.assemble_actions(menv, [(([], [], 1), ([], [], 1))] * len(mmaps)))
     tk, gl, info = menv.observe(0)
     Tmax = menv.mb.T
-    assert tk.shape == (len(mmaps), Tmax, 14 + 5 + 5 + Tmax)
+    assert tk.shape == (len(mmaps), Tmax, 15 + 5 + 5 + Tmax)
     for b, mm in enumerate(mmaps):
         nvalid = int(info['token_mask'][b].sum())
         assert nvalid == mm.K + 2, f"game {b}: {nvalid} valid tokens != {mm.K + 2}"

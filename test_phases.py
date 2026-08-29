@@ -155,13 +155,13 @@ def main():
     import sys
     ok = True
     # uniform sizes
-    for (NP, KP) in [(25, 4), (40, 6), (54, 10)]:
+    for (NP, KP) in [(90, 6), (115, 8), (124, 9)]:
         maps = T.gen_maps(12, NP, KP, 4321 + NP)
         ok &= run(maps, turns=200, seed=4321 + NP, device='cpu',
                   label=f"N={2*NP+1}")
     # mixed sizes (padded batch)
-    mixed = T.gen_maps_mixed([(25, 4), (54, 10), (31, 5), (40, 6),
-                              (47, 8), (33, 6)], seed0=999)
+    mixed = T.gen_maps_mixed([(90, 6), (124, 9), (95, 6), (115, 8),
+                              (109, 7), (100, 7)], seed0=999)
     ok &= run(mixed, turns=200, seed=999, device='cpu', label="MIXED")
     if torch.cuda.is_available():
         ok &= run(mixed, turns=200, seed=999, device='cuda', label="MIXED")

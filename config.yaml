@@ -12,32 +12,17 @@
 # ~1/(1-gamma*lam) ~ 20 steps anyway -- the terminal +-10 is propagated by the
 # critic, not by the rollout length -- so a horizon of ~100 is plenty.
 B: 4096
-steps_per_iter: 300000  # env-steps per iteration (horizon = steps_per_iter / B).
-                        # OVERRIDDEN by the phase schedule below unless phases: null
+steps_per_iter: 200000  # env-steps per iteration (horizon = steps_per_iter / B), FIXED
 iters: 3000              # number of training iterations
 
-# ---- training phases ----
-# Iterations are grouped into blocks of phase_iters; entering a block swaps in its
-# lr / epochs / ent_coef / steps_per_iter. The LAST entry is held for every later
-# phase, so with phase_iters 500: 0-499 = phase 1, 500-999 = 2, 1000-1499 = 3,
-# 1500+ = 4 (steady state). Resolved from the iteration number, so a resumed run
-# lands in the right phase. Set `phases: null` (or pass --no-phases / --steps) to
-# ignore the schedule and use the flat lr/epochs/ent_coef/steps_per_iter above.
-# This matches exploiter_every / perm_snapshot_every, so a phase boundary, an
-# exploiter run and a permanent self-snapshot all coincide.
-phase_iters: 500
-phases:
-  - {lr: 0.0005,  epochs: 5, ent_coef: 0.005, steps_per_iter: 200000}
-  - {lr: 0.0002,  epochs: 4, ent_coef: 0.002, steps_per_iter: 250000}
-  - {lr: 0.0001,  epochs: 3, ent_coef: 0.001, steps_per_iter: 300000}
-  - {lr: 0.00005, epochs: 3, ent_coef: 0.0005, steps_per_iter: 300000}
-
 # ---- PPO ----
+# lr/epochs/ent_coef/steps_per_iter are FLAT (no phase schedule) -- fixed for the
+# whole run.
 gamma: 0.997            # discount
 lam: 0.95               # GAE lambda
 clip: 0.2               # PPO clip range
-lr: 0.00005              # Adam lr (shared by actor & critic optimizers; phased above)
-epochs: 3               # PPO epochs per iteration (phased above)
+lr: 0.0005               # Adam lr (shared by actor & critic optimizers)
+epochs: 4                # PPO epochs per iteration
 minibatch: 4096         # TOTAL minibatch size; with --gpus N each rank takes
                         # minibatch/N, so the number of optimizer steps and the
                         # effective batch match a 1-GPU run. Once B is large the
@@ -46,7 +31,7 @@ minibatch: 4096         # TOTAL minibatch size; with --gpus N each rank takes
                         # the optimization (fewer, larger steps), so it is not
                         # touched by default.
 target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
-ent_coef: 0.0005         # entropy bonus (actor loss; phased above)
+ent_coef: 0.001          # entropy bonus (actor loss)
 aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
@@ -68,7 +53,7 @@ store_vram_frac: 0.45   # share of FREE VRAM the buffer may claim under auto
 # B=2048 this is otherwise a serial stall in the middle of the rollout. Counted
 # PER RANK (a 2-GPU run with 6 spawns 12 processes; sized for a 36-thread box).
 # 0 = generate inline, deterministic but slow.
-map_workers: 6
+map_workers: 7          # clamp(cpu_threads // (3 * n_gpus), 2, 12); 128 threads / 6 GPUs -> 7
 map_queue: 512          # ready maps buffered per worker pool
 torch_threads: null     # CPU threads for torch (null -> min(8, cpu_count // 2))
 
@@ -76,8 +61,8 @@ torch_threads: null     # CPU threads for torch (null -> min(8, cpu_count // 2))
 opp_ema_alpha: 0.02     # EMA rate for per-opponent win rate
 pool_add_threshold: 0.6 # snapshot the agent into the pool when min win rate exceeds this
 pool_max_size: 6        # BASE pool cap (incl. rusher+japper). The cap GROWS by 1 for
-                        # every permanent opponent added later (each exploiter and each
-                        # perm_snapshot_every self-snapshot), so the EVICTABLE room stays
+                        # every permanent opponent added later (each perm_snapshot_every
+                        # self-snapshot), so the EVICTABLE room stays
                         # at pool_max_size - 2 = 4 ordinary snapshots; when those are full
                         # the OLDEST is evicted. Those 4 slots are what wandb logs as
                         # opp_winrate/opponent1..4 (the curve set stays bounded: on an
@@ -89,53 +74,6 @@ opp_sample_floor: 0.05  # minimum sampling weight per opponent
 # a permanent ladder of its own past selves so it cannot cycle back into a style it
 # already beat. 0 disables. Costs ~4.5 MB of checkpoint per snapshot.
 perm_snapshot_every: 500
-
-# ---- exploiters ----
-# Every exploiter_every main iterations, training pauses and a SEPARATE agent is
-# trained against a frozen snapshot of the main actor ONLY -- no pool, no scripted
-# bots, no full-mobilisation games. It is SEEDED WITH THE MAIN ACTOR+CRITIC FROM
-# exploiter_every ITERATIONS EARLIER -- the run at iter 500 starts from main@0, the
-# one at 1000 from main@500, and so on. (From a random init it loses essentially every
-# game against a main actor with hundreds of iterations behind it and never gets a
-# learning signal it can act on; its own past self can already play, while being far
-# enough behind the current one to leave room to specialize. Seeding from the CURRENT
-# actor instead would just start it at the fixed point it is meant to break out of.)
-# The seed is taken from the live actor+critic at every iteration divisible by
-# exploiter_every, starting at 0, and ALL of them are kept in the checkpoint (1.2 MB
-# each at d_model 64, so 7 of them / 8.4 MB over this run). Which snapshot a run was
-# seeded from is printed in its banner and logged as exp/seed_it (-1 = random init,
-# which only happens if no boundary has been recorded yet).
-# It runs until it either hits
-# exploiter_iters iterations or its win-rate EMA reaches exploiter_win_stop. Both
-# the raw per-iteration win rate (exp/win_rate) and that EMA (exp/win_ema) are
-# logged to wandb every iteration. The result joins the pool as a PERMANENT opponent
-# (never evicted) and the pool cap grows by 1, so every hole an exploiter found
-# stays in the training distribution for the rest of the run. Set exploiter_every: 0
-# to disable. NOTE the cost: one run is up to exploiter_iters x
-# exploiter_steps_per_iter env-steps (500 x 200k = 100M) on top of the main loop's.
-exploiter_every: 500
-exploiter_iters: 500
-exploiter_win_stop: 0.7
-# The stop is judged on an EMA of the per-iteration win rates, NOT on a single
-# iteration: one iteration is only exploiter_steps_per_iter / B = 48 turns of a
-# 200-turn game and run_exploiter restarts every game at day 0, so a single
-# iteration only sees whichever games happened to end inside its window (early HQ
-# kills at first, turn-limit games later) -- measured: ~60% of games end in the
-# first 48 turns against a fresh net. The EMA starts at 0 and is not bootstrapped,
-# so the stop needs a sustained streak: at alpha 0.1 even a perfect exploiter needs
-# 12 iterations to cross 0.7. Every iteration in which at least one game finished
-# feeds it -- there is no minimum-games threshold, the EMA handles the noise.
-exploiter_win_ema_alpha: 0.1
-# Optimisation settings: IDENTICAL to the main agent's PHASE 1 (phases[0] above,
-# plus the shared clip) instead of a hotter setting of their own -- phase 1 is the
-# schedule's exploratory end, which is what an exploiter needs in order to move away
-# from the policy it was seeded with and find something different. Keep in sync with
-# phases[0] if that schedule is retuned.
-exploiter_lr: 0.0005        # = phases[0].lr
-exploiter_epochs: 5         # = phases[0].epochs
-exploiter_ent_coef: 0.005   # = phases[0].ent_coef
-exploiter_steps_per_iter: 200000  # = phases[0].steps_per_iter
-exploiter_clip: 0.2         # = clip (not phased)
 
 # ---- logging / checkpointing ----
 use_wandb: true
