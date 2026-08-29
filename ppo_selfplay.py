@@ -44,7 +44,7 @@ import fast_env as fe
 import map_gen
 from fast_env import (OWN_LEFT, OWN_RIGHT, KIND_HQ, KIND_BASE, MOVE_COST,
                       TRAIN_COST, HQ_MAXLEVEL, BASE_MAXLEVEL, HQ_HEAL, BASE_HEAL,
-                      MAX_DAYS)
+                      MAX_DAYS, WORK_INCOME)
 
 TOK_FEAT = 32          # 15 scalars (incl. fog-of-war "turns since last seen") + 5 arrive
                        # + 5 reach (all log1p) + 2 norm coords + 5 reach-delta vs prev turn
@@ -412,38 +412,8 @@ def extract(env, side, prev_reach=None):
     t1 = torch.cat([raw25, normx[:, :, None], normy[:, :, None], reach_delta],
                    dim=2)  # [B,T,32]
 
-    # ---- CRITIC-ONLY view -------------------------------------------------- #
-    # The submission never runs the critic, so during training it may condition
-    # on privileged (hidden) information the actor cannot see: the per-거점 "enemy
-    # reachable within k turns" block (raw25[:,:,20:25]) is replaced by the enemy's
-    # PLANNED arrivals within k turns, computed from the (hidden) opponent move
-    # orders EXACTLY like observe()'s own-arrival block -- so the value net sees who
-    # is actually coming, not who merely could. reach_delta (t1's last 5 dims) is
-    # left as the actor's. NOTE: the other 20 scalars of raw25_crit are still the
-    # FOGGED (belief) view -- raw25_crit is a clone of the actor's raw25, not a
-    # fresh true-state recompute; only the arrival slice is genuinely privileged. A
-    # fully unfogged critic is possible future work. glob has no privileged swap
-    # (opponent gold isn't fed as a feature to either net -- see extract()'s top).
-    sd_all = env.slot_side[None, :].expand(B, env.W)
-    op_moving = (env.w_hp > 0) & (sd_all == opp_idx) & env.w_move
-    tt_full = env.mb.travel_turns                      # [B,N,T]
-    tok_sorted = env.mb.token_ids                      # [B,T] ascending
-    ti_of = torch.searchsorted(tok_sorted, env.w_tgt.clamp(min=0)).clamp(max=T - 1)
-    is_tok = tok_sorted.gather(1, ti_of) == env.w_tgt
-    valid_mv = op_moving & is_tok                      # opp movers heading to a token
-    mcount = torch.zeros((B, N, T), dtype=torch.int64, device=t1.device)
-    if bool(valid_mv.any()):
-        flat = ((env.b_ar[:, None] * N + env.w_region) * T + ti_of)[valid_mv]
-        mcount.view(-1).scatter_add_(0, flat, torch.ones_like(flat))
-    op_arrive = torch.zeros((B, T, 5), dtype=torch.float32, device=t1.device)
-    for k in range(1, 6):                              # arrivals in EXACTLY k turns
-        op_arrive[:, :, k - 1] = (mcount * (tt_full == k)).sum(1).float()
-    raw25_crit = raw25.clone()
-    raw25_crit[:, :, 20:25] = slog1p(op_arrive) * tmask[:, :, None].float()
-    t1_crit = torch.cat([raw25_crit, normx[:, :, None], normy[:, :, None],
-                         reach_delta], dim=2)          # [B,T,32]
-    glob_crit = glob_t.clone()
-
+    # ---- shared true-state building/warrior arrays (legality AND the critic) --
+    oppo = OWN_RIGHT if side == 0 else OWN_LEFT
     cnt, sumhp = env._side_counts()
     turret, workcap = env._turret(), env._workcap()
 
@@ -466,6 +436,62 @@ def extract(env, side, prev_reach=None):
     my_tur = torch.where(me_b, tur_t, torch.zeros_like(tur_t))
     my_bhp = torch.where(me_b, bhp_t, torch.zeros_like(bhp_t))
     my_wc = torch.where(me_b, wc_t, torch.zeros_like(wc_t))
+    op_tur_true = torch.where(opp_b, tur_t, torch.zeros_like(tur_t))
+    op_wc_true = torch.where(opp_b, wc_t, torch.zeros_like(wc_t))
+    op_bhp_true = torch.where(opp_b, bhp_t, torch.zeros_like(bhp_t))
+    op_base_lvl_true = torch.where(opp_b & (kind_t == KIND_BASE), lvl_t, torch.zeros_like(lvl_t))
+    op_hq_lvl_true = torch.where(opp_b & (kind_t == KIND_HQ), lvl_t, torch.zeros_like(lvl_t))
+
+    # ---- CRITIC-ONLY view -------------------------------------------------- #
+    # The submission never runs the critic (no search -- a single one-shot policy
+    # inference per turn), so during training it conditions on the FULL TRUE STATE
+    # throughout, not the actor's fogged belief: every one of the 15 per-token
+    # scalars uses the true op_* computed just above instead of the belief ones in
+    # raw25, the enemy-reachable block is the enemy's PLANNED arrivals (from their
+    # hidden move orders, computed exactly like observe()'s own-arrival block --
+    # so the value net sees who is actually coming, not who merely could), and
+    # glob's opponent aggregates (op_total/op_hq_level/lvl_sum_op/op_income) are
+    # the true globals rather than fast_env.observe()'s belief-based estimates.
+    # reach_delta and the coord features are shared with the actor unchanged (an
+    # enemy force's true position is already folded into op_arrive; the actor's
+    # own reach-delta is a fine proxy for "how my belief of the threat changed").
+    sd_all = env.slot_side[None, :].expand(B, env.W)
+    op_moving = (env.w_hp > 0) & (sd_all == opp_idx) & env.w_move
+    tt_full = env.mb.travel_turns                      # [B,N,T]
+    tok_sorted = env.mb.token_ids                      # [B,T] ascending
+    ti_of = torch.searchsorted(tok_sorted, env.w_tgt.clamp(min=0)).clamp(max=T - 1)
+    is_tok = tok_sorted.gather(1, ti_of) == env.w_tgt
+    valid_mv = op_moving & is_tok                      # opp movers heading to a token
+    mcount = torch.zeros((B, N, T), dtype=torch.int64, device=t1.device)
+    if bool(valid_mv.any()):
+        flat = ((env.b_ar[:, None] * N + env.w_region) * T + ti_of)[valid_mv]
+        mcount.view(-1).scatter_add_(0, flat, torch.ones_like(flat))
+    op_arrive = torch.zeros((B, T, 5), dtype=torch.float32, device=t1.device)
+    for k in range(1, 6):                              # arrivals in EXACTLY k turns
+        op_arrive[:, :, k - 1] = (mcount * (tt_full == k)).sum(1).float()
+
+    my_base_lvl_true = torch.where(me_b & (kind_t == KIND_BASE), lvl_t, torch.zeros_like(lvl_t))
+    my_hq_lvl_true = torch.where(me_b & (kind_t == KIND_HQ), lvl_t, torch.zeros_like(lvl_t))
+    feats_crit = torch.stack([
+        my_cnt, op_cnt, my_base_lvl_true, op_base_lvl_true,
+        my_hq_lvl_true, op_hq_lvl_true,
+        my_tur, op_tur_true, my_wc, op_wc_true, my_bhp, op_bhp_true,
+    ], dim=2)
+    raw25_crit = raw25.clone()
+    raw25_crit[:, :, :12] = slog1p(feats_crit)          # my/op cnt,base,hq,tur,wc,bhp (true)
+    raw25_crit[:, :, 12:14] = raw25[:, :, 12:14]        # surplus, stat_hp -- own info, unchanged
+    raw25_crit[:, :, 14] = 0.0                          # age is meaningless with full info -> "always fresh"
+    raw25_crit[:, :, 20:25] = slog1p(op_arrive) * tmask[:, :, None].float()
+    t1_crit = torch.cat([raw25_crit, normx[:, :, None], normy[:, :, None],
+                         reach_delta], dim=2)          # [B,T,32]
+
+    op_income_true = (WORK_INCOME * torch.minimum(cnt[:, :, opp_idx], workcap)).sum(1)
+    glob_crit = glob_t.clone()
+    glob_crit[:, 2] = plog1p(cnt[:, :, opp_idx].sum(1) / 10)                     # op_total
+    glob_crit[:, 4] = plog1p(env.b_level.gather(1, env.hq_region[:, opp_idx:opp_idx + 1]).squeeze(1))  # op_hq_level
+    glob_crit[:, 7] = plog1p(op_income_true / 10)                                # op prev income
+    glob_crit[:, 9] = plog1p(torch.where(env.b_owner == oppo, env.b_level,
+                                         torch.zeros_like(env.b_level)).sum(1) / 5)  # lvl_sum_op
 
     bel_kind = gtok(env.op_seen_kind[:, side, :]); bel_level = gtok(env.op_seen_level[:, side, :])
     bel_op_cnt = gtok(env.op_seen_wcnt[:, side, :])
@@ -901,7 +927,7 @@ class Config:
     # opponent pool
     opp_ema_alpha: float = 0.02      # EMA rate for per-opponent win rate
     pool_add_threshold: float = 0.6  # add agent to pool when min win rate exceeds this
-    pool_max_size: int = 6           # BASE total pool cap (incl. fixed rusher+japper).
+    pool_max_size: int = 6           # BASE total pool cap (incl. fixed rush+defence).
                                      # +1 per PERMANENT opponent added later, so the
                                      # evictable room stays at pool_max_size - N_SCRIPTED.
     opp_sample_floor: float = 0.05   # min sampling weight per opponent
@@ -921,7 +947,8 @@ class Config:
     opp_relax_prob: float = 0.10     # per-base/HQ per-turn relax prob in those games
     # turn-1 opening split: on each game's first turn, infer the actor twice so the HQ's
     # two spare warriors head to DIFFERENT strongholds (faster 2-base opening; matches
-    # the submission bots). Applies to the agent and to NET opponents (not rusher/japper).
+    # the submission bots). Applies to the agent and to NET opponents (not the fixed
+    # scripted rush/defence bots).
     opening_split: bool = True
     use_wandb: bool = True
     # checkpointing
@@ -1031,8 +1058,8 @@ class RolloutState:
     def __init__(self, B, T, device):
         self.reach_ag = torch.zeros(B, T, 5, device=device)
         self.reach_op = torch.zeros(B, T, 5, device=device)
-        self.rstate = RusherState(B, device)
-        self.jstate = JapperState(B, device)
+        self.rstate = RushState(B, device)
+        self.jstate = DefenceState(B, device)
         self._all = torch.arange(B, device=device)
 
     def reset_rows(self, rows):
@@ -1058,255 +1085,114 @@ def sample_opponents(n, pool_wr, gen, floor=0.05):
 
 
 # The first N_SCRIPTED unified opponent indices are FIXED scripted bots (never
-# evicted): index 0 = rusher, index 1 = japper. Net snapshot j is unified index
-# j + N_SCRIPTED.
-RUSHER_IDX = 0
-JAPPER_IDX = 1
+# evicted): index 0 = rush, index 1 = defence. Net snapshot j is unified index
+# j + N_SCRIPTED. These are batched, region-based ports of the team's
+# final_rush_bot.py / final_defence_bot.py -- see the two *_action functions
+# below for exactly how each maps its (per-warrior-role) original onto the env's
+# per-REGION move interface (one target per source region per day; the env
+# itself picks which stationary warriors beyond the region's work_cap go).
+RUSH_IDX = 0
+DEFENCE_IDX = 1
 N_SCRIPTED = 2
+_BIG = 1 << 30
 
-# rush-bot strategy knobs (mirror rush_bot.py). The three turn-count knobs are
-# scaled by MAX_DAYS/200 so the scripted opponent's phase transitions still land
-# at the same FRACTION of the game now that MAX_DAYS is 400, not the original 200
-# (an un-scaled bot would "give up" expansion or turn fully passive far too early
-# on the longer clock, making it a much weaker/worse training partner).
-_DAY_SCALE = MAX_DAYS / 200
-RUSH_SIZE = 6               # warriors massed at home before the wave launches
-KEEP_HOME = 1               # workers kept home when the wave launches / while sieging
-PASSIVE_UPGRADE_TURN = round(100 * _DAY_SCALE)  # passive opponent by this turn -> economy/UPGRADE
-SIEGE_MARGIN = round(20 * _DAY_SCALE)           # turns past ETA before a launched wave is "spent"
-_MODE_MASS, _MODE_RUSH_SENT, _MODE_UPGRADE = 0, 1, 2
+# rush-bot strategy knobs (mirror final_rush_bot.py; that file already targets
+# this ruleset -- MAX_TURN=400, START_GOLD=750 -- so its turn thresholds are used
+# as-is, unlike the old rusher/japper which needed rescaling from a 200-day bot).
+RUSH_SETTLE_COUNT = 3        # nearby strongholds to claim before massing
+RUSH_WAVE_SIZE = 30          # idle warriors at home before a wave launches
+RUSH_DEFENSE_RATIO = 2       # required home-left per visible nearby enemy
+RUSH_HOME_GUARD = 2          # minimum home-left even with zero visible threat
+RUSH_FORCE_LAUNCH_TURN = 200  # launch regardless of "outmatched" by this turn (once)
+RUSH_GOLD_RESERVE = 60       # upkeep buffer always kept back
+RUSH_MAX_BASE_LEVEL = 2      # post-expansion upgrade ceiling (mass > economy)
+RUSH_MAX_HQ_LEVEL = 3
+RUSH_VISION = 2              # hop radius used for the "threat near home" count
 
-# japper-bot strategy knobs (mirror the CURRENT japper_bot.py).
-JAP_WAVE_TRIGGER = 6        # warriors gathered at the rally before a wave launches
-JAP_GOLD_RESERVE = 30       # gold kept back (upkeep buffer) before training
-JAP_SETTLE_GIVEUP = round(30 * _DAY_SCALE)  # give up the 2-base expansion after this turn -> just train
-_JBIG = 1 << 30
+# defence-bot strategy knobs (mirror final_defence_bot.py).
+DEF_EXPAND_HQ_AFTER = 2      # bases built before the HQ gets any upgrade gold
+DEF_EXPAND_DEADLINE = 200    # give up expansion and move on by this turn regardless
+DEF_HQ_RUSH_LEVEL = 3        # HQ upgrade target once expansion is done
+DEF_ARMY_BASE = 24           # standing mobile-army target (post-expansion)
+DEF_ATTACK_SIZE = 20         # rally size that triggers a wave
+DEF_ATTACK_TURN_LIMIT = 260  # start attacking regardless by this turn
+DEF_HQ_GARRISON = 8          # extra rally headcount kept back before a wave launches
+DEF_INCURSION_MIN = 5        # visible-near-my-land enemy count that means "serious"
+DEF_GOLD_RESERVE = 60
+DEF_UPGRADE_BUFFER = 120
+DEF_UPGRADE_SAVE = 700       # gold set aside for upgrades once the army target is met
 
 
-class RusherState:
-    """Per-game persistent state for the scripted rush opponent -- a batched port of
-    rush_bot.py's Brain state machine. All tensors are [B]; ``reset_rows`` clears a
-    game's state at its episode boundary. Not checkpointed: episodes never resume
-    across runs (the env is freshly reset on resume), so a fresh state always aligns
-    with a fresh env."""
+class RushState:
+    """Per-game persistent state for the scripted rush opponent -- a batched port
+    of final_rush_bot.py (settle RUSH_SETTLE_COUNT nearby strongholds -> mass
+    RUSH_WAVE_SIZE warriors at home -> send them at the enemy HQ in repeated
+    waves). ``launched`` counts waves sent so far (used for the one-time forced
+    launch at RUSH_FORCE_LAUNCH_TURN); reset at episode boundaries."""
 
     def __init__(self, B, device):
-        self.mode = torch.zeros(B, dtype=torch.long, device=device)            # MASS
-        self.send_turn = torch.full((B,), -1, dtype=torch.long, device=device)  # None
-        self.opp_attacked = torch.zeros(B, dtype=torch.bool, device=device)
-        self.HQ_WCAP = torch.tensor(fe.HQ_WCAP, device=device)
+        self.launched = torch.zeros(B, dtype=torch.long, device=device)
         self.HQ_TRAINCAP = torch.tensor(fe.HQ_TRAINCAP, device=device)
         self.HQ_UPCOST = torch.tensor(fe.HQ_UPCOST, device=device)
-        self.HQ_HP = torch.tensor(fe.HQ_HP, device=device)
+        self.BASE_COST = torch.tensor(fe.BASE_COST, device=device)
 
     def reset_rows(self, rows):
-        self.mode[rows] = _MODE_MASS
-        self.send_turn[rows] = -1
-        self.opp_attacked[rows] = False
+        self.launched[rows] = 0
 
 
-def rusher_action(env, side, rstate):
-    """Scripted fixed opponent: a batched port of rush_bot.py. State machine over
-    MASS (mass RUSH_SIZE warriors at home, defend an inbound attack, then launch the
-    wave once the opponent commits to economy or has attacked), RUSH_SENT (the wave
-    is marching -- keep one worker home for income), and UPGRADE (pure economy: keep
-    the HQ work slots filled and pour gold into HQ upgrades; also the fallback once an
-    early rush is spent or the opponent stays passive). Persistent per-game state
-    lives in ``rstate`` (reset at episode boundaries). Returns a full-batch action
-    dict (build / move / train / force_build); the caller copies only its rows.
-    The HQ upgrade is emitted on the ``force_build`` channel so it bypasses the
-    env's free-worker build gating, matching rush_bot's "upgrade whenever a friendly
-    is home, no enemy is home, and gold suffices"."""
+def rush_action(env, side, rstate):
+    """Scripted fixed opponent: a batched, region-based port of final_rush_bot.py.
+      1) settle the RUSH_SETTLE_COUNT strongholds nearest my HQ, nearest-open one
+         at a time (send the HQ's surplus there; build once a warrior is standing
+         on it and gold allows -- the builder becomes its worker automatically,
+         via the env's per-region work_cap keep-rule, so no separate "assign a
+         worker" step is needed);
+      2) train continuously, reserving the next base's cost while any target is
+         still open;
+      3) once RUSH_WAVE_SIZE are idle at the HQ and home isn't badly outmatched by
+         visible nearby enemies (or RUSH_FORCE_LAUNCH_TURN has passed with no wave
+         sent yet), send them all at the enemy HQ -- repeats every time the count
+         is hit again;
+      4) once expansion is done, spends leftover gold on modest HQ/base upgrades
+         (RUSH_MAX_HQ_LEVEL / RUSH_MAX_BASE_LEVEL) -- this bot wins on repeated
+         mass, not economy, so the ceiling is deliberately low.
+    Returns a full-batch action dict; builds/upgrades go on force_build (bypasses
+    the free-worker gate -- the warrior standing there already justifies it)."""
     B, N, dev = env.B, env.N, env.device
     W, T = env.W, env.mb.T
     opp = 1 - side
     me_own = OWN_LEFT if side == 0 else OWN_RIGHT
-    op_own = OWN_RIGHT if side == 0 else OWN_LEFT
-    turn = env.day                                       # [B] per-game turn
-    my_hq = env.hq_region[:, side]                       # [B]
-    opp_hq = env.hq_region[:, opp]                       # [B]
-
-    sd = env.slot_side[None, :].expand(B, W)
-    alive = env.w_hp > 0
-    mine = alive & (sd == side)
-    enemy = alive & (sd == opp)
-    my_count = mine.sum(1)                               # [B]
-    stat_mine = mine & (~env.w_move)
-
-    my_reg = env._scatter_region(mine)                   # [B,N]
-    opp_reg = env._scatter_region(enemy)                 # [B,N]
-    home_stat = env._scatter_region(stat_mine).gather(1, my_hq[:, None]).squeeze(1)
-    my_at_hq = my_reg.gather(1, my_hq[:, None]).squeeze(1)
-    away_count = my_count - my_at_hq
-    opp_at_ownhq = opp_reg.gather(1, opp_hq[:, None]).squeeze(1)
-    opp_off_base = enemy.sum(1) > opp_at_ownhq           # opp warrior off its HQ
-    opp_at_myhq = opp_reg.gather(1, my_hq[:, None]).squeeze(1)
-    opp_has_base = ((env.b_owner == op_own) & (env.b_kind == KIND_BASE)).any(1)
-    enemy_hq_alive = env.b_owner.gather(1, opp_hq[:, None]).squeeze(1) == op_own
-    hq_level = env.b_level.gather(1, my_hq[:, None]).squeeze(1).clamp(max=HQ_MAXLEVEL)
-
-    # ---- distances (in turns) via the token travel table ----
-    tok = env.mb.token_ids                              # [B,T] sorted ascending
-    tt = env.mb.travel_turns                            # [B,N,T]
-
-    def tok_idx(region):                                # region [B] -> token index [B]
-        q = region[:, None].contiguous()
-        return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
-
-    opp_hq_ti = tok_idx(opp_hq)
-    my_hq_ti = tok_idx(my_hq)
-    eta = tt.gather(1, my_hq[:, None, None].expand(B, 1, T)).squeeze(1) \
-            .gather(1, opp_hq_ti[:, None]).squeeze(1)   # [B] dist my_hq -> opp_hq
-    defend_hops = torch.clamp((eta + 1) // 2, min=3)
-    tt_to_myhq = tt.gather(2, my_hq_ti[:, None, None].expand(B, N, 1)).squeeze(2)  # [B,N]
-    w_dist = tt_to_myhq.gather(1, env.w_region)         # [B,W] dist of each warrior -> my_hq
-    off_opphq = env.w_region != opp_hq[:, None]
-    enemy_threat = (enemy & off_opphq & (w_dist <= defend_hops[:, None])).any(1)  # [B]
-
-    # ---- transitions ----
-    rstate.opp_attacked |= enemy_threat
-    mode = rstate.mode
-    to_up_passive = (mode == _MODE_MASS) & (turn >= PASSIVE_UPGRADE_TURN) \
-        & (~opp_has_base) & (~rstate.opp_attacked) & (~enemy_threat)
-    mode = torch.where(to_up_passive, torch.full_like(mode, _MODE_UPGRADE), mode)
-    st = rstate.send_turn
-    spent = (my_count == 0) \
-        | ((away_count == 0) & (st >= 0) & (turn > st + 1)) \
-        | ((st >= 0) & (turn > st + eta + SIEGE_MARGIN))
-    to_up_spent = (mode == _MODE_RUSH_SENT) & enemy_hq_alive & spent
-    mode = torch.where(to_up_spent, torch.full_like(mode, _MODE_UPGRADE), mode)
-
-    gold = env.gold[:, side]
-    traincap = rstate.HQ_TRAINCAP[hq_level]
-    build = torch.zeros(B, N, dtype=torch.bool, device=dev)
-    move = torch.full((B, N), -1, dtype=torch.long, device=dev)
-    force = torch.zeros(B, N, dtype=torch.bool, device=dev)
-    train = torch.zeros(B, dtype=torch.long, device=dev)
-
-    # ---- MASS: launch the wave when ready, else mass toward RUSH_SIZE ----
-    is_mass = mode == _MODE_MASS
-    ready = is_mass & (~enemy_threat) & (home_stat >= RUSH_SIZE) \
-        & (opp_has_base | rstate.opp_attacked)
-    lrows = ready.nonzero(as_tuple=True)[0]
-    if lrows.numel() > 0:
-        # per-region move keeps the HQ's work_cap (=1 at level 1) worker home and
-        # sends the rest at the enemy HQ -- matches rush_bot's send-all-but-KEEP_HOME.
-        move[lrows, my_hq[lrows]] = opp_hq[lrows]
-    train_mass = is_mass & (~ready) & (my_count < RUSH_SIZE)
-    n_mass = torch.minimum(torch.minimum(traincap, (RUSH_SIZE - my_count).clamp(min=0)),
-                           gold // TRAIN_COST)
-    train = torch.where(train_mass, n_mass, train)
-
-    # ---- RUSH_SENT: keep one worker home for income ----
-    is_rs = mode == _MODE_RUSH_SENT
-    train_rs = is_rs & (my_at_hq < KEEP_HOME)
-    n_rs = torch.minimum(torch.minimum(traincap, (KEEP_HOME - my_at_hq).clamp(min=0)),
-                         gold // TRAIN_COST)
-    train = torch.where(train_rs, n_rs, train)
-
-    # ---- UPGRADE: keep the work slots filled, pour gold into the HQ ----
-    is_up = mode == _MODE_UPGRADE
-    work_cap = rstate.HQ_WCAP[hq_level]
-    friendly_home = my_at_hq > 0
-    enemy_at_home = opp_at_myhq > 0
-    hq_can_up = hq_level < HQ_MAXLEVEL
-    hq_upcost = rstate.HQ_UPCOST[(hq_level + 1).clamp(max=HQ_MAXLEVEL)]
-    do_up = is_up & friendly_home & (~enemy_at_home) & hq_can_up & (gold >= hq_upcost)
-    # heal a maxed, damaged HQ (rush_bot keeps a 200-gold cushion past the heal cost)
-    hq_hp = env.b_hp.gather(1, my_hq[:, None]).squeeze(1)
-    hq_maxhp = rstate.HQ_HP[hq_level]
-    do_heal = is_up & friendly_home & (~enemy_at_home) & (~hq_can_up) \
-        & (hq_hp < hq_maxhp) & (gold >= HQ_HEAL + 200)
-    do_hq = do_up | do_heal
-    hrows = do_hq.nonzero(as_tuple=True)[0]
-    if hrows.numel() > 0:
-        force[hrows, my_hq[hrows]] = True
-    # the env charges the build (HQ upgrade) before training, so size training from
-    # the gold left after the upgrade to avoid driving gold negative.
-    spend = torch.where(do_up, hq_upcost,
-                        torch.where(do_heal, torch.full_like(gold, HQ_HEAL),
-                                    torch.zeros_like(gold)))
-    gold_after = gold - spend
-    train_up = is_up & (my_at_hq < work_cap)
-    n_up = torch.minimum(torch.minimum(traincap, (work_cap - my_at_hq).clamp(min=0)),
-                         gold_after // TRAIN_COST)
-    train = torch.where(train_up, n_up, train)
-
-    # ---- commit the launch transition ----
-    rstate.mode = torch.where(ready, torch.full_like(mode, _MODE_RUSH_SENT), mode)
-    rstate.send_turn = torch.where(ready, turn, st)
-    return {'build': build, 'move': move, 'train': train, 'force_build': force}
-
-
-class JapperState:
-    """Per-game state for the scripted japper opponent -- a batched port of the CURRENT
-    japper_bot.py. That strategy is region-based enough that the per-warrior settler /
-    attacker bookkeeping is realized POSITIONALLY here (fast_env moves per region: one
-    target per source, moving every stationary warrior beyond a region's work-cap):
-    warriors sitting on the HQ / own bases gather & expand, those stranded on a razed
-    field region march on the weakest-then-nearest enemy building, those already on an
-    enemy building siege it. Everything is a deterministic function of the map + current
-    board (nearest-2 strongholds, rally = own base nearest the enemy HQ), so no
-    persistent state is needed beyond the train-cap table; reset_rows is a no-op."""
-
-    def __init__(self, B, device):
-        self.HQ_TRAINCAP = torch.tensor(fe.HQ_TRAINCAP, device=device)
-
-    def reset_rows(self, rows):
-        pass
-
-
-def japper_action(env, side, jstate):
-    """Scripted fixed opponent: a batched, region-based port of the CURRENT japper_bot.py.
-      1) expand to the 2 nearest strongholds (build a base once a warrior stands on an
-         empty one, no enemy present, gold >= 300);
-      2) train up to the HQ cap while keeping a small gold reserve, once expansion is done;
-      3) funnel spare warriors to the RALLY (own base nearest the enemy HQ, else the HQ);
-      4) when >= WAVE_TRIGGER gather at the rally, launch its surplus (~5, work-cap stays
-         home) at the enemy building with the FEWEST enemies, then nearest, then lowest id;
-      5) field warriors chain to the next such enemy building; siegers hold;
-      6) if an enemy reaches the HQ or an adjacent region, recall gatherers home to defend
-         and hold the waves (attackers already out keep attacking).
-    Returns a full-batch action dict; bases go on the force_build channel (bypasses the
-    free-worker gate)."""
-    B, N, dev = env.B, env.N, env.device
-    W = env.W
-    opp = 1 - side
-    me_own = OWN_LEFT if side == 0 else OWN_RIGHT
-    op_own = OWN_RIGHT if side == 0 else OWN_LEFT
     turn = env.day                                       # [B] per-game turn
     my_hq = env.hq_region[:, side]
     opp_hq = env.hq_region[:, opp]
-    tt = env.mb.travel_turns                             # [B,N,T] hops region->token
-    tok = env.mb.token_ids                               # [B,T] ascending
-    T = env.mb.T
-    reg_ids = torch.arange(N, device=dev)[None, :]       # [1,N]
+    tok = env.mb.token_ids
+    tt = env.mb.travel_turns
+
+    def tok_idx(region):
+        q = region.clamp(min=0)[:, None].contiguous()
+        return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
+
+    def dist_to(region):
+        ti = tok_idx(region)
+        return tt.gather(2, ti[:, None, None].expand(B, N, 1)).squeeze(2)
+
+    def at(field, region):
+        return field.gather(1, region.clamp(min=0)[:, None]).squeeze(1)
 
     sd = env.slot_side[None, :].expand(B, W)
     alive = env.w_hp > 0
     mine = alive & (sd == side)
     enemy = alive & (sd == opp)
     stat_mine = mine & (~env.w_move)
-    stat_reg = env._scatter_region(stat_mine)            # [B,N] my stationary per region
-    opp_reg = env._scatter_region(enemy)                 # [B,N] enemy per region
+    stat_reg = env._scatter_region(stat_mine)
+    opp_reg = env._scatter_region(enemy)
     gold = env.gold[:, side]
     hq_level = env.b_level.gather(1, my_hq[:, None]).squeeze(1).clamp(max=HQ_MAXLEVEL)
-    traincap = jstate.HQ_TRAINCAP[hq_level]
+    traincap = rstate.HQ_TRAINCAP[hq_level]
     owner = env.b_owner
+    reg_ids = torch.arange(N, device=dev)[None, :]
 
-    def tok_idx(region):                                 # region [B] -> token index [B]
-        q = region.clamp(min=0)[:, None].contiguous()
-        return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
-
-    def dist_to(region):                                 # [B,N] hops each region -> `region`
-        ti = tok_idx(region)
-        return tt.gather(2, ti[:, None, None].expand(B, N, 1)).squeeze(2)
-
-    def at(field, region):                               # field[B,N] gathered at region[B]
-        return field.gather(1, region.clamp(min=0)[:, None]).squeeze(1)
-
-    tt_to_myhq = dist_to(my_hq)                          # [B,N]
-    tt_to_opphq = dist_to(opp_hq)                        # [B,N]
+    tt_to_myhq = dist_to(my_hq)
 
     build = torch.zeros(B, N, dtype=torch.bool, device=dev)
     move = torch.full((B, N), -1, dtype=torch.long, device=dev)
@@ -1318,75 +1204,279 @@ def japper_action(env, side, jstate):
         if rows.numel() > 0:
             force[rows, reg.clamp(min=0)[rows]] = True
 
-    # ---- static expansion targets: the 2 strongholds nearest my HQ -------------
+    # ---- settle targets: the RUSH_SETTLE_COUNT strongholds nearest my HQ -------
     is_strong = env.mb.is_stronghold
-    d_sh = torch.where(is_strong, tt_to_myhq, torch.full_like(tt_to_myhq, _JBIG))
-    sa = d_sh.argmin(1)                                  # nearest stronghold
-    d_sh2 = d_sh.scatter(1, sa[:, None], _JBIG)
-    sb = d_sh2.argmin(1)                                 # 2nd nearest
-    has_sh = is_strong.any(1)
-    sa_open = has_sh & (at(owner, sa) == 0)              # empty (OWN_NONE == 0)
-    sb_open = has_sh & (at(owner, sb) == 0)
-    expand_tgt = torch.where(sa_open, sa, torch.where(sb_open, sb, torch.full_like(sa, -1)))
-    expanding = expand_tgt >= 0
-    expansion_done = ((~sa_open) & (~sb_open)) | (turn >= JAP_SETTLE_GIVEUP)
+    d = torch.where(is_strong, tt_to_myhq, torch.full_like(tt_to_myhq, _BIG))
+    claim = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    dwork = d.clone()
+    for _ in range(RUSH_SETTLE_COUNT):
+        nearest = dwork.argmin(1)
+        found = dwork.gather(1, nearest[:, None]).squeeze(1) < _BIG
+        rows = found.nonzero(as_tuple=True)[0]
+        if rows.numel() > 0:
+            claim[rows, nearest[rows]] = True
+        dwork.scatter_(1, nearest[:, None], _BIG)
+    d_open = torch.where(claim & (owner == 0), tt_to_myhq, torch.full_like(tt_to_myhq, _BIG))
+    expand_tgt = d_open.argmin(1)
+    expanding = d_open.gather(1, expand_tgt[:, None]).squeeze(1) < _BIG
+    expansion_done = ~expanding
 
-    # ---- rally: my BASE nearest the enemy HQ (tie: lower region), else the HQ ---
+    # ---- wave launch: RUSH_WAVE_SIZE idle at HQ, home not badly outmatched -----
+    home_stat = at(stat_reg, my_hq)
+    near_hq_enemy = (opp_reg * (tt_to_myhq <= RUSH_VISION).long()).sum(1)
+    home_left = home_stat - RUSH_WAVE_SIZE
+    outmatched = home_left < near_hq_enemy * RUSH_DEFENSE_RATIO + RUSH_HOME_GUARD
+    force_launch = (turn >= RUSH_FORCE_LAUNCH_TURN) & (rstate.launched == 0)
+    ready = (home_stat >= RUSH_WAVE_SIZE) & (~outmatched | force_launch) \
+        & (gold >= MOVE_COST * RUSH_WAVE_SIZE)
+
+    # ---- per-region move plan: HQ launches the wave if ready, else pushes the
+    # settle target if still expanding, else stays put (mass) ----
+    hq_tgt = torch.where(ready, opp_hq, torch.where(expanding, expand_tgt, my_hq))
+    move = torch.where(reg_ids == my_hq[:, None], hq_tgt[:, None].expand(B, N), move)
+
+    # ---- build the settle target once occupied and clear ----
+    can_settle_build = expanding & (at(stat_reg, expand_tgt) > 0) \
+        & (at(opp_reg, expand_tgt) == 0) & (gold >= rstate.BASE_COST[1])
+    emit_force(can_settle_build, expand_tgt)
+
+    # ---- upgrades once expansion is done: HQ first, then the cheapest eligible
+    # base, up to the (deliberately low) caps ----
+    hq_can_up = expansion_done & (hq_level < RUSH_MAX_HQ_LEVEL) \
+        & (at(owner, my_hq) == me_own) & (at(opp_reg, my_hq) == 0)
+    hq_cost = rstate.HQ_UPCOST[(hq_level + 1).clamp(max=HQ_MAXLEVEL)]
+    do_hq_up = hq_can_up & (gold >= hq_cost + RUSH_GOLD_RESERVE)
+    emit_force(do_hq_up, my_hq)
+    gold_left = torch.where(do_hq_up, gold - hq_cost, gold)
+
+    my_base = (owner == me_own) & (env.b_kind == KIND_BASE)
+    base_lvl = torch.where(my_base, env.b_level, torch.zeros_like(env.b_level))
+    base_cost_next = rstate.BASE_COST[(base_lvl + 1).clamp(max=BASE_MAXLEVEL)]
+    can_base_up = expansion_done[:, None] & my_base & (base_lvl < RUSH_MAX_BASE_LEVEL) & (opp_reg == 0)
+    score = torch.where(can_base_up, base_cost_next, torch.full_like(base_cost_next, _BIG))
+    best = score.argmin(1)
+    best_cost = score.gather(1, best[:, None]).squeeze(1)
+    do_base_up = (best_cost < _BIG) & (gold_left >= best_cost + RUSH_GOLD_RESERVE)
+    emit_force(do_base_up, best)
+    gold_left = torch.where(do_base_up, gold_left - best_cost, gold_left)
+
+    # ---- train: reserve the next base's cost while still expanding ----
+    reserve = torch.where(expanding, rstate.BASE_COST[1] + RUSH_GOLD_RESERVE,
+                          torch.full_like(gold, RUSH_GOLD_RESERVE))
+    n_afford = ((gold_left - reserve) // TRAIN_COST).clamp(min=0)
+    train = torch.minimum(traincap, n_afford)
+
+    rstate.launched = torch.where(ready, rstate.launched + 1, rstate.launched)
+    return {'build': build, 'move': move, 'train': train, 'force_build': force}
+
+
+class DefenceState:
+    """Per-game persistent state for the scripted defence opponent -- a batched
+    port of final_defence_bot.py (claim my side of the map -> grow economy once
+    it's secured -> mass an army and roll it at the enemy's buildings, weakest-
+    then-nearest first, while pulling everyone home the moment a real incursion
+    is seen nearby). ``attacking`` is a ONE-WAY latch matching the original's
+    ``self.attacking`` (once tripped, stays in the attack phase); ``max_blob``
+    remembers the largest hostile concentration seen near my land so the standing
+    army target and the "we clearly held them off" re-engagement both scale with
+    the biggest threat actually faced. Both reset at episode boundaries."""
+
+    def __init__(self, B, device):
+        self.attacking = torch.zeros(B, dtype=torch.bool, device=device)
+        self.max_blob = torch.zeros(B, dtype=torch.long, device=device)
+        self.HQ_TRAINCAP = torch.tensor(fe.HQ_TRAINCAP, device=device)
+        self.HQ_UPCOST = torch.tensor(fe.HQ_UPCOST, device=device)
+        self.BASE_COST = torch.tensor(fe.BASE_COST, device=device)
+
+    def reset_rows(self, rows):
+        self.attacking[rows] = False
+        self.max_blob[rows] = 0
+
+
+def defence_action(env, side, dstate):
+    """Scripted fixed opponent: a batched, region-based port of final_defence_bot.py.
+      1) claim every stronghold on MY SIDE of the map (closer to my HQ than the
+         enemy's), nearest-open one at a time -- funded before any upgrade;
+      2) once claimed (or DEF_EXPAND_DEADLINE passes), grow the economy: HQ to
+         DEF_HQ_RUSH_LEVEL, then bases, out of gold left after training;
+      3) rally at my base nearest the enemy HQ (else the HQ itself); once the
+         mobile army is big enough (DEF_ARMY_BASE, scaled up by the largest
+         threat ever faced) AND the HQ has reached DEF_HQ_RUSH_LEVEL -- or the
+         rally alone hits 2x DEF_ATTACK_SIZE, or DEF_ATTACK_TURN_LIMIT passes, or
+         a big incoming wave was just weathered -- switch to attacking for good;
+      4) while attacking, launch the rally's surplus at the weakest, then
+         nearest, known enemy building (bases preferred over the HQ) whenever it
+         clears DEF_ATTACK_SIZE + DEF_HQ_GARRISON; stragglers on a razed/neutral
+         region chain to the same kind of target;
+      5) the instant a real incursion (DEF_INCURSION_MIN+ visible near any of my
+         buildings) is detected, everyone not already attacking is recalled to
+         the HQ and all non-attack builds/upgrades pause -- gold goes straight
+         to training until the threat clears.
+    Returns a full-batch action dict; builds/upgrades go on force_build (bypasses
+    the free-worker gate)."""
+    B, N, dev = env.B, env.N, env.device
+    W, T = env.W, env.mb.T
+    opp = 1 - side
+    me_own = OWN_LEFT if side == 0 else OWN_RIGHT
+    op_own = OWN_RIGHT if side == 0 else OWN_LEFT
+    turn = env.day
+    my_hq = env.hq_region[:, side]
+    opp_hq = env.hq_region[:, opp]
+    tok = env.mb.token_ids
+    tt = env.mb.travel_turns
+    reg_ids = torch.arange(N, device=dev)[None, :]
+
+    def tok_idx(region):
+        q = region.clamp(min=0)[:, None].contiguous()
+        return torch.searchsorted(tok, q).clamp(max=T - 1).squeeze(1)
+
+    def dist_to(region):
+        ti = tok_idx(region)
+        return tt.gather(2, ti[:, None, None].expand(B, N, 1)).squeeze(2)
+
+    def at(field, region):
+        return field.gather(1, region.clamp(min=0)[:, None]).squeeze(1)
+
+    sd = env.slot_side[None, :].expand(B, W)
+    alive = env.w_hp > 0
+    mine = alive & (sd == side)
+    enemy = alive & (sd == opp)
+    stat_mine = mine & (~env.w_move)
+    stat_reg = env._scatter_region(stat_mine)
+    opp_reg = env._scatter_region(enemy)
+    gold = env.gold[:, side]
+    hq_level = env.b_level.gather(1, my_hq[:, None]).squeeze(1).clamp(max=HQ_MAXLEVEL)
+    traincap = dstate.HQ_TRAINCAP[hq_level]
+    owner = env.b_owner
+
+    tt_to_myhq = dist_to(my_hq)
+    tt_to_opphq = dist_to(opp_hq)
+
+    build = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    move = torch.full((B, N), -1, dtype=torch.long, device=dev)
+    force = torch.zeros(B, N, dtype=torch.bool, device=dev)
+    train = torch.zeros(B, dtype=torch.long, device=dev)
+
+    def emit_force(mask, reg):
+        rows = mask.nonzero(as_tuple=True)[0]
+        if rows.numel() > 0:
+            force[rows, reg.clamp(min=0)[rows]] = True
+
+    # ---- claim: strongholds on MY side of the map (closer to my HQ) ------------
+    is_strong = env.mb.is_stronghold
+    my_side_sh = is_strong & (tt_to_myhq <= tt_to_opphq)
+    d_open = torch.where(my_side_sh & (owner == 0), tt_to_myhq, torch.full_like(tt_to_myhq, _BIG))
+    expand_tgt = d_open.argmin(1)
+    expanding = d_open.gather(1, expand_tgt[:, None]).squeeze(1) < _BIG
+    expansion_done = (~expanding) | (turn >= DEF_EXPAND_DEADLINE)
+    n_bases = ((owner == me_own) & (env.b_kind == KIND_BASE)).sum(1)
+
+    # ---- rally: my base nearest the enemy HQ (tie: lower region id), else HQ ---
     owned_base = (owner == me_own) & (env.b_kind == KIND_BASE)
-    d_rb = torch.where(owned_base, tt_to_opphq * 256 + reg_ids,
-                       torch.full_like(tt_to_opphq, _JBIG))
+    d_rb = torch.where(owned_base, tt_to_opphq * 256 + reg_ids, torch.full_like(tt_to_opphq, _BIG))
     rally = torch.where(owned_base.any(1), d_rb.argmin(1), my_hq)
 
-    # ---- defense: an enemy on the HQ or an adjacent (<=1 hop) region -----------
-    defending = (opp_reg * (tt_to_myhq <= 1).long()).sum(1) > 0
-    gather_to = torch.where(defending, my_hq, rally)
+    # ---- threat: enemies within the game's own vision radius of any of my
+    # buildings (reuses the same hop<=2 kernel fast_env precomputes for fog of
+    # war -- it IS the "within VISION hops" test this bot wants) ----------------
+    my_bldg_mask = owner == me_own
+    near_mine = torch.bmm(my_bldg_mask.float()[:, None, :],
+                          env.mb.hop2_reach.float()).squeeze(1) > 0        # [B,N]
+    incursion = (opp_reg * near_mine.long()).sum(1)
+    blob = torch.where(near_mine, opp_reg, torch.zeros_like(opp_reg)).amax(1)
+    serious = incursion >= DEF_INCURSION_MIN
+    dstate.max_blob = torch.maximum(dstate.max_blob, blob)
+    gather_to = torch.where(serious, my_hq, rally)
 
-    # ---- pick_target(from_region): per-SOURCE weakest->nearest->lowest enemy bldg
+    # ---- attack_target(from_region): per-source weakest -> nearest -> lowest-id
+    # enemy building (bases preferred over the HQ, exactly like japper) ----------
     enemy_bldg = owner == op_own
     enemy_base = enemy_bldg & (env.b_kind == KIND_BASE)
-    pool = torch.where(enemy_base.any(1)[:, None], enemy_base, enemy_bldg)  # [B,N]
-    has_pool = pool.any(1)                               # [B]
-    tokreg = tok.clamp(max=N - 1)                        # [B,T] candidate region ids
-    pool_tok = pool.gather(1, tokreg)                    # [B,T]
-    cnt_tok = opp_reg.gather(1, tokreg)                  # [B,T] enemy count at candidate
-    # lexicographic key (count, hops-from-src, region) packed into one int64 per (src,tok)
-    score = cnt_tok[:, None, :] * 65536 + tt * 256 + tokreg[:, None, :]     # [B,N,T]
-    score = torch.where(pool_tok[:, None, :], score, torch.full_like(score, _JBIG))
-    best_tok = score.argmin(2)                           # [B,N] chosen candidate token per src
-    tgt_by_src = tok.gather(1, best_tok.clamp(max=T - 1))  # [B,N] chosen enemy-building region
+    pool = torch.where(enemy_base.any(1)[:, None], enemy_base, enemy_bldg)
+    has_pool = pool.any(1)
+    tokreg = tok.clamp(max=N - 1)
+    pool_tok = pool.gather(1, tokreg)
+    cnt_tok = opp_reg.gather(1, tokreg)
+    score = cnt_tok[:, None, :] * 65536 + tt * 256 + tokreg[:, None, :]
+    score = torch.where(pool_tok[:, None, :], score, torch.full_like(score, _BIG))
+    best_tok = score.argmin(2)
+    tgt_by_src = tok.gather(1, best_tok.clamp(max=T - 1))
 
-    # ---- build the per-region move plan (later layers override earlier) --------
-    # 1) own bases (not the rally): funnel their surplus to the gather point
+    # ---- mobile army size: everyone not currently working a building's job ----
+    workcap_map = env._workcap()
+    my_workcap = torch.where(my_bldg_mask, workcap_map, torch.zeros_like(workcap_map))
+    workers = torch.minimum(torch.where(my_bldg_mask, stat_reg, torch.zeros_like(stat_reg)),
+                            my_workcap).sum(1)
+    mobile_now = (mine.sum(1) - workers).clamp(min=0)
+    army_target = torch.maximum(torch.full_like(dstate.max_blob, DEF_ARMY_BASE), dstate.max_blob)
+    dstate.attacking = dstate.attacking | (turn >= DEF_ATTACK_TURN_LIMIT) \
+        | (mobile_now >= DEF_ATTACK_SIZE * 2) \
+        | (expansion_done & (mobile_now >= army_target) & (hq_level >= DEF_HQ_RUSH_LEVEL)) \
+        | ((dstate.max_blob >= DEF_INCURSION_MIN) & (~serious) & (mobile_now >= DEF_ATTACK_SIZE))
+    attacking = dstate.attacking
+
+    # ---- per-region move plan (later layers override earlier) ------------------
+    # 1) own bases (not the rally): funnel surplus to the gather point
     ob = owned_base & (reg_ids != rally[:, None])
     move = torch.where(ob, gather_to[:, None].expand(B, N), move)
-    # 2) HQ: settle the next open stronghold, else funnel to the gather point. Matches
-    # japper_bot: expansion (step 1) runs unconditionally, so the HQ keeps pushing a
-    # settler toward an open target even while defending (gather-to-HQ is a no-op for
-    # the HQ garrison anyway).
+    # 2) HQ: push the claim target while expanding (unconditionally, like japper),
+    # else funnel to the gather point
     hq_tgt = torch.where(expanding, expand_tgt, gather_to)
     move = torch.where(reg_ids == my_hq[:, None], hq_tgt[:, None].expand(B, N), move)
-    # 3) field (stationary warriors on a razed / non-building region): chain to a target
+    # 3) field warriors stranded off any building: chain toward a known target
     my_bldg = owner == me_own
     field = (stat_reg > 0) & (~my_bldg) & (~enemy_bldg)
     move = torch.where(field & has_pool[:, None], tgt_by_src, move)
-    # 4) rally: recall to HQ while defending, else launch a wave at the trigger
+    # 4) rally: recall home while serious; else launch a wave once big enough
     rally_stat = at(stat_reg, rally)
     wave_tgt = tgt_by_src.gather(1, rally[:, None]).squeeze(1)
-    do_rally = defending | ((rally_stat >= JAP_WAVE_TRIGGER) & has_pool)
-    rally_tgt = torch.where(defending, my_hq, wave_tgt)
-    move = torch.where((reg_ids == rally[:, None]) & do_rally[:, None],
+    do_wave = attacking & (~serious) & has_pool & (rally_stat >= DEF_ATTACK_SIZE + DEF_HQ_GARRISON)
+    rally_tgt = torch.where(serious, my_hq, torch.where(do_wave, wave_tgt, rally))
+    move = torch.where((reg_ids == rally[:, None]) & (serious | do_wave)[:, None],
                        rally_tgt[:, None].expand(B, N), move)
 
-    # ---- build a base on the current open expansion target (one per turn) -------
-    et_can = (expanding & (at(stat_reg, expand_tgt) > 0)
-              & (at(opp_reg, expand_tgt) == 0) & (gold >= fe.BASE_COST[1]))
-    emit_force(et_can, expand_tgt)
+    # ---- build the claim target once occupied and clear ------------------------
+    can_settle_build = (~serious) & expanding & (at(stat_reg, expand_tgt) > 0) \
+        & (at(opp_reg, expand_tgt) == 0) & (gold >= dstate.BASE_COST[1] + DEF_GOLD_RESERVE)
+    emit_force(can_settle_build, expand_tgt)
 
-    # ---- train once the 2 bases are secured (or given up), keeping the reserve --
-    n_afford = ((gold - JAP_GOLD_RESERVE) // TRAIN_COST).clamp(min=0)
-    n = torch.minimum(traincap, n_afford)
-    hq_mine = at(owner, my_hq) == me_own
-    train = torch.where(expansion_done & hq_mine, n, train)
+    # ---- upgrades: paused while serious; HQ gated behind DEF_EXPAND_HQ_AFTER
+    # bases during expansion, then HQ up to DEF_HQ_RUSH_LEVEL, then the cheapest
+    # eligible base ----------------------------------------------------------
+    hq_room = (hq_level < HQ_MAXLEVEL) & (at(owner, my_hq) == me_own) & (at(opp_reg, my_hq) == 0)
+    hq_target_lvl = torch.where(expansion_done, torch.full_like(hq_level, HQ_MAXLEVEL),
+                                torch.full_like(hq_level, DEF_HQ_RUSH_LEVEL))
+    hq_wants_up = hq_room & (hq_level < hq_target_lvl) \
+        & (expansion_done | (n_bases >= DEF_EXPAND_HQ_AFTER))
+    hq_cost = dstate.HQ_UPCOST[(hq_level + 1).clamp(max=HQ_MAXLEVEL)]
+    do_hq_up = (~serious) & hq_wants_up & (gold >= hq_cost + DEF_UPGRADE_BUFFER)
+    emit_force(do_hq_up, my_hq)
+    gold_left = torch.where(do_hq_up, gold - hq_cost, gold)
+
+    my_base = (owner == me_own) & (env.b_kind == KIND_BASE)
+    base_lvl = torch.where(my_base, env.b_level, torch.zeros_like(env.b_level))
+    base_cost_next = dstate.BASE_COST[(base_lvl + 1).clamp(max=BASE_MAXLEVEL)]
+    can_base_up = (~serious)[:, None] & expansion_done[:, None] & my_base \
+        & (base_lvl < BASE_MAXLEVEL) & (opp_reg == 0)
+    bscore = torch.where(can_base_up, base_cost_next, torch.full_like(base_cost_next, _BIG))
+    best = bscore.argmin(1)
+    best_cost = bscore.gather(1, best[:, None]).squeeze(1)
+    do_base_up = (best_cost < _BIG) & (gold_left >= best_cost + DEF_UPGRADE_BUFFER)
+    emit_force(do_base_up, best)
+    gold_left = torch.where(do_base_up, gold_left - best_cost, gold_left)
+
+    # ---- train: full reserve dumped into training while serious; otherwise a
+    # phase-appropriate reserve (next base while expanding, upgrade savings once
+    # the standing army target is met, small buffer in between) -----------------
+    reserve_expand = dstate.BASE_COST[1] + DEF_GOLD_RESERVE
+    reserve_grown = DEF_GOLD_RESERVE + DEF_UPGRADE_SAVE
+    reserve = torch.where(serious, torch.full_like(gold, DEF_GOLD_RESERVE),
+                          torch.where(~expansion_done, reserve_expand,
+                                      torch.where(mobile_now >= army_target,
+                                                  reserve_grown,
+                                                  torch.full_like(gold, DEF_GOLD_RESERVE))))
+    n_afford = ((gold_left - reserve) // TRAIN_COST).clamp(min=0)
+    train = torch.minimum(traincap, n_afford)
 
     return {'build': build, 'move': move, 'train': train, 'force_build': force}
 
@@ -1404,7 +1494,7 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
                      rstate, jstate, relax_reg=None, forbid_tgt=None):
     """Sample opponent actions, grouping batch slots by their assigned opponent so
     each opponent runs once over its subset of games. The first N_SCRIPTED unified
-    indices are fixed scripted bots (0 = rusher, 1 = japper); index p >= N_SCRIPTED
+    indices are fixed scripted bots (0 = rush, 1 = defence); index p >= N_SCRIPTED
     maps to net snapshot pool_t1[p-N_SCRIPTED]/pool_t2[p-N_SCRIPTED]. Returns
     (action, new_hq_commit) -- the scripted bots never commit."""
     build_full = torch.zeros(B, N, dtype=torch.bool, device=dev)
@@ -1415,8 +1505,8 @@ def opponent_actions(pool_t1, pool_t2, o_op, opp_assign, env, side, B, N, dev,
     for p in torch.unique(opp_assign).tolist():
         rows = (opp_assign == p).nonzero(as_tuple=True)[0]
         if p < N_SCRIPTED:
-            act = (rusher_action(env, side, rstate) if p == RUSHER_IDX
-                   else japper_action(env, side, jstate))
+            act = (rush_action(env, side, rstate) if p == RUSH_IDX
+                   else defence_action(env, side, jstate))
             build_full[rows] = act['build'][rows]
             move_full[rows] = act['move'][rows]
             train_full[rows] = act['train'][rows]
@@ -1485,22 +1575,22 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     mk_t1 = lambda: ActorT1(d=cfg.d_model)
     mk_t2 = lambda: ActorT2(cfg.d_model + T2_EXTRA, d=cfg.d_model)
 
-    # opponent pool. Unified index 0 is a FIXED scripted rusher (never evicted,
+    # opponent pool. Unified index 0 is a FIXED scripted rush bot (never evicted,
     # tracked with its own EMA win rate); index i>=1 is net snapshot pool_t1[i-1].
-    # It starts with the rusher + a frozen copy of the initial policy. The total pool
+    # It starts with the rush bot + a frozen copy of the initial policy. The total pool
     # cap is cfg.pool_max_size plus one slot per PERMANENT opponent added, so the evictable
     # room stays constant: ordinary win-rate-triggered self-snapshots are all evictable
     # (oldest first), while the scripted bots and the periodic perm_snapshot_every
     # self-snapshots are permanent. pool_perm[j] marks net snapshot j as permanent.
-    # pool_ids names each opponent: 'rusher'/'japper' for the fixed ones, 'main@<it>'
+    # pool_ids names each opponent: 'rush'/'defence' for the fixed ones, 'main@<it>'
     # for the periodic permanent self-snapshots, and an int for the ordinary evictable
     # ones (those are logged to wandb by SLOT -- opponent1..N -- so the number of
     # curves stays bounded).
     pool_t1 = [frozen_copy(actor_t1)]
     pool_t2 = [frozen_copy(actor_t2)]
-    # EMA win rate, indexed by unified opponent index: [rusher, japper, net0]
+    # EMA win rate, indexed by unified opponent index: [rush, defence, net0]
     pool_wr = torch.full((N_SCRIPTED + 1,), 0.5)
-    pool_ids = ['rusher', 'japper', 0]
+    pool_ids = ['rush', 'defence', 0]
     pool_perm = [False]                 # per net snapshot: never-evict?
     next_opp_id = 1
     n_perm_snaps = 0                    # periodic permanent self-snapshots taken so far
@@ -1573,6 +1663,17 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         pool_t2 = [frozen_from_state(mk_t2, sd, device) for sd in ck['pool_t2']]
         pool_wr = ck['pool_wr'].cpu()   # kept on CPU (used with the CPU opp_gen)
         pool_ids = ck['pool_ids']
+        # the two fixed scripted slots' STRATEGY changed under this build (old
+        # rusher/japper -> rush/defence); their win-rate EMA describes a bot that
+        # no longer exists at that slot, so relabel and reset it to neutral rather
+        # than let a stale (possibly very high or low) EMA mis-weight
+        # sample_opponents until alpha=0.02 slowly recalibrates it on its own.
+        if list(pool_ids[:N_SCRIPTED]) == ['rusher', 'japper']:
+            pool_ids = ['rush', 'defence'] + list(pool_ids[N_SCRIPTED:])
+            pool_wr[:N_SCRIPTED] = 0.5
+            if dd.is_main:
+                print("  migrated checkpoint: rusher/japper -> rush/defence "
+                      "(win-rate EMA reset for these 2 slots)")
         # checkpoints written before permanent snapshots existed have no pool_perm ->
         # every net snapshot in them is an ordinary (evictable) one.
         pool_perm = list(ck.get('pool_perm', [False] * len(pool_t1)))
@@ -1595,7 +1696,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
         # nets) and shift only the opp_assign references at/after that position.
         n_have = pool_wr.numel() - len(pool_t1)            # scripted slots present
         if n_have < N_SCRIPTED:
-            missing = ['rusher', 'japper'][n_have:N_SCRIPTED]
+            missing = ['rush', 'defence'][n_have:N_SCRIPTED]
             k = len(missing)
             pool_wr = torch.cat([pool_wr[:n_have],
                                  torch.full((k,), 0.5), pool_wr[n_have:]])
@@ -1719,7 +1820,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                         r0 = split0.nonzero(as_tuple=True)[0]
                         mv[r0, hq0[r0]] = b_reg0[r0]                          # execute HQ -> B
                         act_ag_exec = {**act_ag, 'move': mv}
-                    # net opponents only (scripted rusher/japper keep their region moves)
+                    # net opponents only (scripted rush/defence bots keep their region moves)
                     hq1 = env.hq_region[:, 1]
                     a_reg1 = act_op['move'].gather(1, hq1[:, None]).squeeze(1)
                     split1 = turn1 & (opp_assign >= N_SCRIPTED) & (a_reg1 >= 0)
@@ -1969,7 +2070,58 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             'cfg': vars(cfg),
         })
 
+    def stagger_env(R):
+        """Give each of the B_loc games a random 'age' in [0, R) before real data
+        collection starts, by forcing an extra reset at a random point during a
+        throwaway R-step rollout (no buffer storage, no PPO update). Without this,
+        every game starts at day 0 in lockstep on every fresh start AND every
+        resume (env state is never checkpointed -- see snapshot()), and since the
+        policy behaves fairly uniformly across games at that point, many episodes
+        tend to finish within the same few iterations right after every restart --
+        a burst of simultaneous regens that destabilizes early training. Uses the
+        CURRENT (possibly just-resumed) main actor against the current opponent
+        pool, so the staggered states look like real early-game play, not noise."""
+        if R <= 0:
+            return
+        offset = torch.randint(0, R, (B_loc,), device=device)
+        for t in range(R):
+            o_ag = extract(env, 0, rs.reach_ag)
+            with torch.no_grad():
+                act_ag, _, _, ncommit_ag = sample_policy(actor_t1, actor_t2, o_ag, N)
+                o_op = extract(env, 1, rs.reach_op)
+                act_op, ncommit_op = opponent_actions(
+                    pool_t1, pool_t2, o_op, opp_assign, env, 1, B_loc, N, device,
+                    rs.rstate, rs.jstate)
+            rs.reach_ag = o_ag['reach_raw'].clone()
+            rs.reach_op = o_op['reach_raw'].clone()
+            env.step({'left': act_ag, 'right': act_op})
+            env.hq_commit[:, 0] = ncommit_ag
+            env.hq_commit[:, 1] = ncommit_op
+            _, done = reward_done(env)
+            force = done | (offset == t)
+            if bool(force.any()):
+                rows = force.nonzero(as_tuple=True)[0]
+                opp_assign[rows] = sample_opponents(
+                    rows.numel(), pool_wr, opp_gen, cfg.opp_sample_floor).to(device)
+                env.regen(force)
+                rs.reach_ag[rows] = 0
+                rs.reach_op[rows] = 0
+                rs.rstate.reset_rows(rows)
+                rs.jstate.reset_rows(rows)
+
     steps = max(1, cfg.steps_per_iter // cfg.B)
+    # de-synchronize episode phases across the B_loc games before the first real
+    # iteration (see stagger_env's docstring). Runs every train() start, fresh or
+    # resumed. Range = a few iterations' worth of turns, capped: stagger_env's
+    # wall-clock cost is the turn count itself (sequential env.step calls), which
+    # at a small B (steps_per_iter/B large) would otherwise balloon even though
+    # the whole point is a cheap one-time warmup -- 200 turns is already several
+    # times a normal early-game episode length.
+    stagger_R = min(4 * steps, 200)
+    if dd.is_main:
+        print(f"staggering {B_loc} games' episode phase over up to {stagger_R} turns...")
+    stagger_env(stagger_R)
+
     for it in range(start_iter, cfg.iters):
         # ---- checkpoint before starting this iter (for crash-safe resume) ----
         snapshot(it)
@@ -2025,7 +2177,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 pool_wr = torch.cat([pool_wr[:ev_idx], pool_wr[ev_idx + 1:]])
                 pool_ids.pop(ev_idx)
                 pool_perm.pop(evict_pos)
-                # rows on the evicted opponent fall back to the rusher (index 0);
+                # rows on the evicted opponent fall back to the rush bot (index 0);
                 # higher unified indices shift down one. Reassign BEFORE shifting.
                 opp_assign = torch.where(opp_assign == ev_idx,
                                          torch.zeros_like(opp_assign), opp_assign)
@@ -2058,8 +2210,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                   f"ev {ev:+.3f} "
                   f"pool {len(pool_t1)+N_SCRIPTED}/{pool_cap} "
                   f"wr_min {float(pool_wr.min()):.2f} "
-                  f"rush_wr {float(pool_wr[RUSHER_IDX]):.2f} "
-                  f"jap_wr {float(pool_wr[JAPPER_IDX]):.2f} | "
+                  f"rush_wr {float(pool_wr[RUSH_IDX]):.2f} "
+                  f"def_wr {float(pool_wr[DEFENCE_IDX]):.2f} | "
                   f"{steps*cfg.B/dt:,.0f} steps/s ({dt:.1f}s)")
 
         if run is not None:
@@ -2082,8 +2234,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
                 'pool_cap': pool_cap,
                 'opp_winrate_min': float(pool_wr.min()),
                 'opp_winrate_mean': float(pool_wr.mean()),
-                'opp_winrate_rusher': float(pool_wr[RUSHER_IDX]),
-                'opp_winrate_japper': float(pool_wr[JAPPER_IDX]),
+                'opp_winrate_rush': float(pool_wr[RUSH_IDX]),
+                'opp_winrate_defence': float(pool_wr[DEFENCE_IDX]),
                 'pool_added': int(added),
                 'steps_per_s': steps * cfg.B / dt,
                 'world_size': dd.world,
@@ -2094,7 +2246,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
             # curves is bounded by cfg.pool_max_size - N_SCRIPTED however long the run
             # goes: on an eviction each remaining snapshot shifts down one slot and
             # opponentN simply continues with the next one. Only the permanent entries
-            # (rusher/japper, exp@<it>, main@<it>) get a curve of their own, and those
+            # (rush/defence, main@<it>) get a curve of their own, and those
             # are added on a fixed schedule.
             slot = 0
             for k, oid in enumerate(pool_ids):
