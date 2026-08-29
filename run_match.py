@@ -50,7 +50,7 @@ def main():
     py = sys.executable
 
     cmd = [
-        py, os.path.join(HERE, "testing-tool.py"),
+        py, os.path.join(HERE, "testing-tool2.py"),
         "--seed", str(seed),
         "-l", args.log,
         "-a", bot_cmd(py, args.weights, args.left),

@@ -296,6 +296,17 @@ def main():
             lvl_my = sum(bb.level for bb in st.buildings.values() if bb.side is me)
             lvl_op = sum(e['level'] for e in bel.values())
             assert int(glob[b, 9]) == lvl_my and int(glob[b, 10]) == lvl_op
+            # opponent income (glob[8]) is belief-based: 15 x min(believed count,
+            # believed work_cap) per region, summed -- NOT the true st income.
+            HQ_WC = [0, 1, 2, 3, 4, 5]; BA_WC = [0, 1, 2, 3]
+            inc_op = 0
+            for e in bel.values():
+                if e['kind'] == 0:
+                    continue
+                wc = HQ_WC[min(e['level'], 5)] if e['kind'] == 1 else BA_WC[min(e['level'], 3)]
+                inc_op += 15 * min(e['wcnt'], wc)
+            assert int(glob[b, 8]) == inc_op, \
+                f"income_op b{b} side{me}: env={int(glob[b, 8])} expect={inc_op}"
 
     print(f"all token features (counts, buildings, surplus, stat_hp, "
           f"arrive 1-5, enemy-reach 1-5, token distances) verified for "

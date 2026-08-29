@@ -36,7 +36,7 @@ def run_one(py, seed, left_cmd, right_cmd, logdir, timeout):
     """Run one judge game; return (outcome, reason) or (None, err)."""
     os.makedirs(logdir, exist_ok=True)
     log = os.path.join(logdir, f"seed{seed}.log")
-    cmd = [py, "testing-tool.py", "--seed", str(seed),
+    cmd = [py, "testing-tool2.py", "--seed", str(seed),
            "--exec1", left_cmd, "--exec2", right_cmd, "--log", log]
     try:
         p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,

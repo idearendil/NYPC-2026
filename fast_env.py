@@ -1036,10 +1036,15 @@ class FastEnv:
         op_hq_level = bl.gather(1, self.hq_region[:, opp:opp + 1]).squeeze(1)
         lvl_sum_my = torch.where(self.b_owner == myo, self.b_level, torch.zeros_like(self.b_level)).sum(1)
         lvl_sum_op = bl.sum(1)
+        # opponent's last-turn income is also belief-based: 15 x min(believed warrior
+        # count, believed work_cap) per region, summed. self.prev_income[:,opp] is the
+        # TRUE value and would leak hidden info -- op_wc/bwcnt are already the fogged
+        # per-region belief computed above (same formula the real work phase uses).
+        op_income_est = (WORK_INCOME * torch.minimum(bwcnt, op_wc)).sum(dim=1)
         glob = torch.stack([
             self.day, my_total, op_total, my_hq_level, op_hq_level,
             self.gold[:, me], self.gold[:, opp],
-            self.prev_income[:, me], self.prev_income[:, opp],
+            self.prev_income[:, me], op_income_est,
             lvl_sum_my, lvl_sum_op,
         ], dim=1).to(torch.float32)
 
