@@ -12,8 +12,8 @@
 # ~1/(1-gamma*lam) ~ 20 steps anyway -- the terminal +-10 is propagated by the
 # critic, not by the rollout length -- so a horizon of ~100 is plenty.
 B: 12288
-steps_per_iter: 200000  # env-steps per iteration (horizon = steps_per_iter / B), FIXED
-iters: 3000              # number of training iterations
+steps_per_iter: 300000  # env-steps per iteration (horizon = steps_per_iter / B), FIXED
+iters: 5000              # number of training iterations
 
 # ---- PPO ----
 # lr/epochs/ent_coef/steps_per_iter are FLAT (no phase schedule) -- fixed for the
@@ -33,7 +33,7 @@ minibatch: 12288         # TOTAL minibatch size; with --gpus N each rank takes
                         # but it changes the optimization (fewer, larger steps),
                         # so it is not touched by default.
 target_kl: null         # KL early stop DISABLED: the factored move action makes the Schulman approx_kl saturate (~1e7) once exploration is unlocked, misfiring the early-stop; the PPO clip handles the trust region instead. (set a value to re-enable)
-ent_coef: 0.001          # entropy bonus (actor loss)
+ent_coef: 0.005          # entropy bonus (actor loss)
 aux_coef: 0.15          # gold-production aux-prediction loss weight (actor & critic); 0 disables
 max_grad_norm: 1.0      # grad clipping
 
