@@ -7,7 +7,7 @@
 
 <img alt="1st place" src="https://img.shields.io/badge/NYPC%202026%20Master%20Track%20Finals-%EC%A2%85%ED%95%A9%201%EC%9C%84-f5b400?style=for-the-badge">
 
-**NYPC 2026 마스터 트랙 본선 1위 팀의 솔루션입니다.**
+**NYPC 2026 Master Track 1st Team Solution**
 
 NYPC 2026 전략 게임을 푸는 강화학습 에이전트입니다. 시뮬레이터(judge)를 배치 GPU 환경으로
 직접 재구현한 뒤 그 위에서 self-play PPO로 처음부터 끝까지 학습시켰고, 제출 봇은
