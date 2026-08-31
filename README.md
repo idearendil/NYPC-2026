@@ -1,142 +1,177 @@
-# testing-tool
+<p align="right">
+  <a href="README.md"><img alt="English" src="https://img.shields.io/badge/README-English-1f6feb?style=for-the-badge"></a>
+  <a href="README.ko.md"><img alt="한국어" src="https://img.shields.io/badge/README-%ED%95%9C%EA%B5%AD%EC%96%B4-6e7681?style=for-the-badge"></a>
+</p>
 
-## How to Run
+# NYPC 2026 — self-play RL agent (finals)
 
-`testing-tool.py` accepts the following command-line arguments:
+A reinforcement-learning agent for the NYPC 2026 strategy game, trained end-to-end
+with self-play PPO on a custom batched GPU re-implementation of the judge, and
+submitted as a **numpy-only** bot with no torch dependency.
 
-- `-h`, `--help`: Print help message.
-- `-c CONFIG`, `--config CONFIG`: Use `CONFIG` as the **config file**.
-- `-i INPUT`, `--input INPUT`: Use `INPUT` as the **input file** (map file).
-- `-l LOG`, `--log LOG`: Use `LOG` as the **log file**.
-- `-s`, `--stdio`: If no **input file** or **log file** is specified, use standard I/O instead.
-- `-a EXEC1, --exec1 EXEC1`: Use `EXEC1` as the execution command for the LEFT player.
-- `-b EXEC2, --exec2 EXEC2`: Use `EXEC2` as the execution command for the RIGHT player.
-- `--seed S`: If omitted, a random seed is used.
-- `--NP NP`: Use `NP` as the number of zones in the right half. The total number of zones will be $2NP+1$.
-- `--KP KP`: Use `KP` as the number of neutral strongholds in the right half. The total number of strongholds will be $2KP+1$.
+This is the `main` branch: the **finals** ruleset (400 days, fog of war, larger
+maps). The qualification-round code lives on the
+[`qualification_round`](../../tree/qualification_round) branch — same architecture,
+different rules and a separately trained network.
 
-**Note: `--NP` and `--KP` are generation parameters equal to half the actual `N` and `K` values in the map file's first line.**
-**In other words, `NP` and `KP` are the number of zones and neutral strongholds on one half of the battlefield.**
-The generated actual `N` must satisfy 51 ≤ N ≤ 109, and the actual `K` must satisfy $\lceil 0.15N \rceil$ ≤ K ≤ $\lfloor 0.2N \rfloor$.
+| Piece | File | What it is |
+|---|---|---|
+| Environment | `fast_env.py` | The judge's dynamics re-written as batched tensor ops. `B` games step in parallel on the GPU, bit-exact against `testing-tool2.py`. |
+| Trainer | `ppo_selfplay.py` | Self-play PPO over that env: two-stage factored actor, privileged critic, opponent pool, multi-GPU. |
+| Submission | `vanilla_bot.py` | The trained actor, re-implemented in pure numpy. One inference per turn, no search. Loads `data.bin`. |
 
-A map can be provided in one of three ways:
-1. Use a pre-generated map file via the `INPUT` key in `config.ini` or the `-i INPUT` option
-2. Generate a random map via the `SEED` key in `config.ini` or the `--seed S` option
-3. Generate a random map of a specified size via `NP` and `KP` in `config.ini` or the `--NP NP` and `--KP KP` options
+## The game
 
-If multiple options are specified, the earlier one takes higher priority. If none are specified, a random seed is used to generate the map.
+Two players fight over a randomly generated graph of regions (`N` in 181–249,
+`K` strongholds ≈ √N). Each side starts with a headquarters, 3 warriors and
+750 gold, and has **400 days**.
 
-For example, to use `input.txt` as the input file, `log.txt` as the log file, `python3 sample-code.py P1` as the LEFT player's command, and `python3 sample-code.py P2` as the RIGHT player's command, run:
+- **Buildings.** Bases can be built on strongholds (500 gold, up to level 3).
+  The HQ upgrades to level 5 (600 / 1000 / 2000 / 3000 gold). Levels raise HP,
+  turret damage, the training cap and the *work cap* (how many warriors can earn
+  gold there).
+- **Economy.** Each working warrior earns 15 gold/day; every warrior costs 2
+  gold/day in upkeep. Training a warrior costs 120, moving one costs 10.
+- **Fog of war.** You see enemy units and buildings only within **2 hops** of one
+  of your own warriors or buildings. Everything else must be remembered and
+  guessed.
+- **Winning.** Destroy the enemy HQ, or be ahead on building HP when day 400 hits.
 
-```bash
-python3 testing-tool.py -i input.txt -l log.txt -a "python3 sample-code.py P1" -b "python3 sample-code.py P2"
-```
+`testing-tool2.py` is the finals judge; see [docs/testing-tool.md](docs/testing-tool.md)
+for its CLI, map format and log format.
 
-Or you can generate a map on the fly using `--seed`:
+## Quickstart
 
-```bash
-python3 testing-tool.py --seed 42 -l log.txt -a "python3 sample-code.py P1" -b "python3 sample-code.py P2"
-```
-
-### Config File
-
-The config file is a convenient alternative to command-line arguments. It supports the following keys:
-
-```
-INPUT=<path to input file>
-LOG=<path to log file>
-EXEC1=<execution command for the LEFT player>
-EXEC2=<execution command for the RIGHT player>
-SEED=<map generation seed>
-NP=<number of zones in the right half>
-KP=<number of neutral strongholds in the right half>
-```
-
-If a command-line argument conflicts with a config file value, the command-line argument takes priority.
-
-For example, the run command above can be written as a config file as follows:
-
-```
-INPUT=input.txt
-LOG=log.txt
-EXEC1=python3 sample-code.py P1
-EXEC2=python3 sample-code.py P2
-```
-
-To use seed-based map generation instead of a pre-generated map file, remove the `INPUT` line and specify `SEED` or the (`NP`, `KP`) pair.
-If `SEED` is present, the map size is determined automatically from the seed. If both `NP` and `KP` are also specified, a map of that size is generated.
-If `SEED` is absent, a random seed is used.
-
-```
-SEED=42
-LOG=log.txt
-EXEC1=python3 sample-code.py P1
-EXEC2=python3 sample-code.py P2
-```
-
-Then run with:
+Install torch **first**, matching your CUDA build, then the rest:
 
 ```bash
-python3 testing-tool.py -c config.ini
+pip install torch --index-url https://download.pytorch.org/whl/cu126   # pick your CUDA
+pip install -r requirements.txt
 ```
 
-### Input File (Map File)
+```bash
+# 1. sanity-check the whole pipeline end to end (tiny nets, a couple of iterations)
+python ppo_selfplay.py --smoke --ckpt smoke.pt
 
-The input file describes the **battlefield layout** for the game. It has the following format:
+# 2. train for real (edit config.yaml first; --gpus N for data parallel)
+python ppo_selfplay.py --config config.yaml --gpus 1
 
-```
-N K
-x_0 x_1 ... x_{N-1}
-y_0 y_1 ... y_{N-1}
-p_0 p_1 ... p_{K-1}
-a_0 b_{0,0} b_{0,1} ... b_{0,a_0-1}
-a_1 b_{1,0} b_{1,1} ... b_{1,a_1-1}
-...
-a_{N-1} b_{N-1,0} ... b_{N-1,a_{N-1}-1}
-```
+# 3. convert the checkpoint into the torch-free weights the bot loads
+python export_weights.py --ckpt checkpoint.pt --out data.bin
 
-- First line: number of zones `N` and number of strongholds `K`.
-- Second line: `x` coordinates of each zone's center (`N` integers).
-- Third line: `y` coordinates of each zone's center (`N` integers).
-- Fourth line: zone indices of the `K` neutral strongholds (in ascending order).
-- Following `N` lines: for each zone `i`, the number of adjacent zones `a_i` followed by the adjacent zone indices `b_{i,*}`.
+# 4. verify the numpy bot reproduces the torch pipeline (features + forward pass)
+python verify_np_bot.py
 
-### Log File
-
-
-```
-[LEFT "COMMAND: <exec1>"]
-[RIGHT "COMMAND: <exec2>"]
-MAP
-N K
-x_0 x_1 ... x_{N-1}
-y_0 y_1 ... y_{N-1}
-STRONGHOLDS p_0 p_1 ... p_{K-1}
-a_0 b_{0,0} b_{0,1} ...
-...
-a_{N-1} b_{N-1,0} ...
-END MAP
-TURN t
-COMMAND LEFT START
-<commands submitted by LEFT>
-COMMAND LEFT END
-COMMAND RIGHT START
-<commands submitted by RIGHT>
-COMMAND RIGHT END
-TURN t RESULT
-TIME LEFT <ms> <token> RIGHT <ms> <token>
-<UPGRADE/TRAIN/MOVE/DAMAGE/SIEGE result lines>
-END TURN t
-...
-RESULT <LEFT_WIN/RIGHT_WIN/DRAW> <HQ_DESTROYED/TURN_LIMIT/WA>
+# 5. watch it play, and measure it
+python run_match.py --seed 42                     # writes replay.log
+python power_test.py --games 40 --old-weights old.bin
 ```
 
-- `[LEFT ...]`, `[RIGHT ...]`: Shows the commands used to launch LEFT and RIGHT.
-- `MAP` through `END MAP`: Records the battlefield layout, same as the map file. The stronghold line starts with `STRONGHOLDS ...`.
-- `TURN t` through `END TURN t`: Records the commands submitted and their results for day `t`.
-- `COMMAND <LEFT/RIGHT> START` through `COMMAND <LEFT/RIGHT> END`: Command lines submitted by the given player. If no commands were submitted, these two lines appear consecutively with nothing in between.
-- After `TURN t RESULT`: Records time usage, remaining tokens, and UPGRADE/TRAIN/MOVE/DAMAGE/SIEGE results. Result types that did not occur are omitted.
-- `DAMAGE <CAUSE> <warrior_id> <damage>`: A warrior took damage. `CAUSE` is `TURRET`, `COMBAT`, or `HUNGER`. `damage` is the amount of HP lost (not remaining HP).
-- `SIEGE <side> <region> <damage>`: A building took siege damage. `damage` is the amount of HP lost (not remaining HP).
-- `RESULT <LEFT_WIN/RIGHT_WIN/DRAW> <HQ_DESTROYED/TURN_LIMIT/WA>`: Game result. The reason for ending is one of: HQ destroyed (`HQ_DESTROYED`), day 200 reached (`TURN_LIMIT`), or wrong answer / timeout (`WA`).
-- `# Debug <LEFT/RIGHT>: <msg>`: A line printed by LEFT or RIGHT to standard error (stderr).
+Training logs to Weights & Biases when `use_wandb: true` in `config.yaml`
+(`--no-wandb` to disable). Credentials come from `WANDB_API_KEY` in the
+environment or from `wandb login` — nothing is stored in this repo.
+
+## How it works
+
+**Batched environment.** RL needs far more games than a subprocess-per-game judge
+can produce, so `fast_env.py` re-implements the rules as tensor ops over `B`
+simultaneous games. It is verified **bit-exact** against the judge — gold, every
+building's owner/kind/level/HP, and every warrior — both at end-of-turn
+(`test_fast_env.py`) and after every individual phase (`test_phases.py`). The
+rollout is launch-bound, so throughput scales almost linearly with `B`
+(`B: 12288` in the shipped config). Details in [docs/fast_env.md](docs/fast_env.md).
+
+**Factored action space.** A turn is a *set* of commands, not one choice, so the
+actor is split in two:
+
+- **T1** — a 3-block transformer over one token per stronghold (32 token features
+  + 14 global features, all log1p / normalised). Its 5-dim head gives a per-token
+  build Bernoulli and, mask-averaged over tokens, a 4-way "what to train / upgrade"
+  softmax.
+- **T2** — a 2-block transformer re-run per move source, taking T1's token output
+  plus 8 extra features, producing a softmax over tokens: where to send this
+  group.
+
+Gold is enforced twice: an affordability mask *before* sampling, then a greedy
+allocation of the remaining gold afterwards (build → move → train). Commands
+dropped by the greedy step still count as taken for PPO; commands masked to
+probability 0 never do.
+
+**Critic and auxiliary tasks.** A separate encoder of the same shape predicts the
+value. Both actor and critic carry a 7-dim auxiliary head — per stronghold, the
+enemy garrison reachable within 1–5 turns, plus a global estimate of the
+opponent's hidden gold. The auxiliary targets are training-only supervision that
+shapes the encoders; the submission never runs them.
+
+**Self-play.** The agent (LEFT) plays a pool of opponents (RIGHT) sampled toward
+whichever is currently hardest, by EMA win rate. The first three pool slots are
+fixed scripted bots — batched, vectorised ports of `final_rush_bot.py`,
+`final_rush_bot2.py` and `final_defence_bot.py` — which never get evicted, so the
+pool cannot collapse into self-play homogeneity. When the agent beats every
+opponent above `pool_add_threshold`, it snapshots itself into the pool; every
+`perm_snapshot_every` iterations that snapshot is made permanent.
+
+**Submission.** torch's import alone (~2.3 s) does not fit the judge's 1 s
+handshake, so `export_weights.py` flattens the actor into a numpy `.npz`
+(`data.bin`) and `vanilla_bot.py` re-implements the forward pass — layernorm,
+multi-head attention, GELU — in numpy. It also reconstructs the hidden state the
+protocol never sends: a per-region belief about the opponent (kind, level, HP,
+garrison, and the age of that observation) refreshed inside the locally computed
+vision set and aged outside it, mirroring `fast_env`'s fog exactly so the bot sees
+the same features it was trained on.
+
+## Repo map
+
+```
+fast_env.py            batched GPU environment (+ observation encoder)
+map_gen.py             background random-map generation for training
+ppo_selfplay.py        self-play PPO trainer (nets, rollout, pool, update loop)
+config.yaml            all training hyperparameters
+export_weights.py      checkpoint.pt -> data.bin (torch-free)
+vanilla_bot.py         THE submission bot (numpy only)
+
+testing-tool2.py       the finals judge
+config.ini             judge config example
+sample-code.py         the organisers' protocol sample bot
+
+final_rush_bot.py      scripted opponents; ppo_selfplay contains batched ports
+final_rush_bot2.py       of these three as the fixed part of the opponent pool
+final_defence_bot.py
+basic_bot.py           qualification-era baselines, still runnable as sparring
+rush_bot.py              partners against the judge
+japper_bot.py
+
+run_match.py           one bot-vs-bot match -> replay log
+power_test.py          win rate between two weight files (sides swapped)
+mode_power_test.py     win rate of greedy vs stochastic action selection
+benchmark_env.py       env throughput benchmark
+
+docs/                  judge documentation and the fast_env deep-dive
+```
+
+## Tests
+
+```bash
+python test_fast_env.py    # bit-exact end-of-turn parity vs the judge (slow)
+python test_phases.py      # bit-exact parity after every phase, cpu + cuda
+python test_observe.py     # observation shapes, mixed-size token masks
+python test_encoder.py     # independent recompute of every encoder feature
+python verify_np_bot.py    # numpy bot == torch pipeline (needs checkpoint.pt + data.bin)
+```
+
+If you change the network, `verify_np_bot.py` alone is **not** enough — it checks
+the forward pass, not action selection. Also compare `ppo_selfplay.sample_policy`
+against `vanilla_bot._select_action` on the same states with both forced
+deterministic: a divergence in a mask, or in a mask's *polarity*, shows up nowhere
+else. (Give the states plenty of gold when you do — the greedy allocator funds a
+randomly permuted subset when gold binds, so a budget-bound state disagrees for
+legitimate reasons.)
+
+## Notes
+
+- No weights are committed. Train your own, or the bot has nothing to load.
+- Everything runs on one GPU; `--gpus N` is plain data parallelism (the same
+  data per iteration, split across ranks). `minibatch` must be divisible by the
+  GPU count.
+- `python ppo_selfplay.py --smoke` is the fast end-to-end check: tiny nets, a
+  handful of games, two iterations, no wandb.

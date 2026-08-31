@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a vanilla_bot.py vs vanilla_bot.py match and write a replay log.
 
-Thin wrapper around testing-tool.py (the judge) so you don't have to type the
+Thin wrapper around testing-tool2.py (the judge) so you don't have to type the
 nested exec commands by hand. Uses the *current* Python interpreter for both the
 judge and the two bots, so just run it with the interpreter that has numpy:
 

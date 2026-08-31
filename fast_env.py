@@ -3,7 +3,7 @@
 
 The goal is raw throughput for RL data collection: `B` independent games are
 stepped in parallel on the GPU. The dynamics are a faithful, bit-exact copy of
-`testing-tool.py` (verified by `test_fast_env.py`).
+`testing-tool2.py` (verified by `test_fast_env.py`).
 
 Design notes
 ------------

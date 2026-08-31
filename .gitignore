@@ -1,0 +1,20 @@
+# training artifacts / weights
+*.pt
+*.bin
+*.npz
+*.log
+
+# wandb run directory
+wandb/
+
+# judge scratch files
+input.txt
+
+# editor / tooling
+.vscode/
+.claude/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/

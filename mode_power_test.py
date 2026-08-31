@@ -51,7 +51,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PY = r"D:\applications\anaconda3\envs\nypc\python.exe"
+DEFAULT_PY = sys.executable          # any interpreter with numpy (override with --python)
 RESULT_RE = re.compile(r"RESULT\s+(LEFT_WIN|RIGHT_WIN|DRAW)\s+(\S+)")
 # numpy/BLAS spins up one thread PER CORE by default on import. vanilla_bot's
 # matmuls are tiny (single-token forward pass), so that's pure overhead even

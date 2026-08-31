@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bit-exact parity test: FastEnv vs the original testing-tool.py dynamics.
+"""Bit-exact parity test: FastEnv vs the original testing-tool2.py dynamics.
 
 For B games we drive a reference ``tt.GameState`` with the *original* phase
 functions (the same calls ``run_game`` makes), feeding it the per-warrior MOVE

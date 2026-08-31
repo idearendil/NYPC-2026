@@ -1,21 +1,11 @@
 # FastEnv — GPU-accelerated batched env for RL
 
-A batched, GPU (CUDA) re-implementation of `testing-tool.py`'s game dynamics for
+A batched, GPU (CUDA) re-implementation of `testing-tool2.py`'s game dynamics for
 fast RL data collection. `B` games are stepped in parallel as tensor ops.
-
-> **Training a DIFFERENT game?** Everything game-independent about the trainer
-> (PPO, GAE, the opponent pool, multi-GPU, checkpoints, phases, logging) lives in
-> **[`finals/`](finals/CLAUDE.md)** as a standalone kit: `finals/rlkit/` plus a
-> runnable template (`finals/examples/toy_duel.py`) and this game re-plugged into
-> it (`finals/examples/nypc2026.py`). Start a session in that directory and read
-> **[finals/FINALS_PLAYBOOK.md](finals/FINALS_PLAYBOOK.md)**. `ppo_selfplay.py`
-> below is unchanged and is still the entry point for THIS game's training run.
 
 ## Files
 - `fast_env.py` — the env (`FastEnv`, `MapBatch`, `observe`).
 - `map_gen.py` — background (multi-process) random-map generation for training.
-- `finals/` — self-contained, game-independent self-play PPO kit (`rlkit/`,
-  templates, tests, playbook) for a game whose rules are not known yet.
 - `test_fast_env.py` — **bit-exact end-of-turn parity** (uniform + mixed sizes).
 - `test_phases.py` — **bit-exact per-phase parity** (compares after every stage).
 - `test_observe.py` — observation shapes + mixed-size token-mask checks.
@@ -24,8 +14,8 @@ fast RL data collection. `B` games are stepped in parallel as tensor ops.
 
 Run with the env that has torch+CUDA:
 ```
-D:/other_programs/anaconda3/envs/nypc/python.exe test_fast_env.py
-D:/other_programs/anaconda3/envs/nypc/python.exe benchmark_env.py
+python test_fast_env.py
+python benchmark_env.py
 ```
 
 ## Correctness
@@ -284,7 +274,7 @@ python ppo_selfplay.py ...                    # trains -> checkpoint.pt
 python export_weights.py --ckpt checkpoint.pt --out data.bin      # offline, uses torch
 python verify_np_bot.py                       # checks numpy == torch pipeline (needs both files)
 # then submit / play:
-testing-tool.py -a "python vanilla_bot.py --weights data.bin" -b "..." --seed 1 --NP 40 --KP 6
+testing-tool2.py -a "python vanilla_bot.py --weights data.bin" -b "..." --seed 1 --NP 40 --KP 6
 python run_match.py --seed 42                 # vanilla vs vanilla -> replay.log
 python power_test.py --games 20 --old-weights data_prev.bin   # A/B two weight files
 ```
@@ -304,7 +294,7 @@ python power_test.py --games 20 --old-weights data_prev.bin   # A/B two weight f
 - The agent remembers its movers' destinations (the protocol never reveals them).
   The opponent's gold/income (also never sent) are reconstructed from the visible
   economy — exact except for rare opponent move-cost edge cases.
-- `fast_env.py`'s import of `testing-tool.py` is now lazy, so importing the env
+- `fast_env.py`'s import of `testing-tool2.py` is now lazy, so importing the env
   package doesn't require the reference simulator to be present.
 
 ## Modeling notes / assumptions
