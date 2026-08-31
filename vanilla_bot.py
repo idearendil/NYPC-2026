@@ -60,18 +60,6 @@ KIND_HQ, KIND_BASE = 1, 2
 TOK_FEAT = 31           # 14 + 5 arrive + 5 reach + 2 coords + 5 reach-delta vs prev turn
 GLOB_FEAT = 16          # 11 + HQ-turns + 거점-count + x/y map-span + own prev aux opp-gold pred
 T2_EXTRA = 8
-# The T2 encoder runs with its SELF-ATTENTION MASKED OFF, because that is how the
-# net was trained: ppo_selfplay.t2_logits_sources calls `t2(x, kpm)` with kpm in
-# "True = ignore" polarity, while ActorT2.forward(x, tmask) negates its argument
-# (`self.enc(x, ~tmask)`). The double negation makes every real token a masked key,
-# so for a state with no padding -- which is every state the submission sees, since
-# here T is exactly K+2 -- the attention softmax row is all -inf, nan_to_num's it to
-# zero, and the sublayer collapses to proj(0) = attn.proj.bias. The trained T2 is
-# therefore a per-token MLP, and running true attention here (what this file used to
-# do) feeds it a distribution it never saw: measured on 80 probe states it changed
-# the chosen move target in half of them. Flip to True only if ppo_selfplay's mask
-# polarity is fixed AND the net is retrained.
-T2_ATTENTION = False
 COST_INF = 1_000_000_000
 BIG = 1 << 20            # unreachable travel marker (matches fast_env)
 
@@ -138,20 +126,16 @@ class Net:
         return linear(gelu(linear(x, W[p + ".0.weight"], W[p + ".0.bias"])),
                       W[p + ".2.weight"], W[p + ".2.bias"])
 
-    def _encoder(self, pre, x, attn=True):      # x:[B,T,in]
-        """attn=False reproduces a fully key-masked attention sublayer: the softmax
-        row is all -inf -> nan -> 0, so MHA returns proj(0) = proj.bias. Used for the
-        T2 encoder (see T2_ATTENTION)."""
+    def _encoder(self, pre, x):                 # x:[B,T,in]
+        # No key-padding mask anywhere in this file: the submission always sees
+        # T == K+2 tokens exactly, so every token is real (training pads batches).
         W = self.W
         h = linear(x, W[pre + ".embed.weight"], W[pre + ".embed.bias"])
         i = 0
         while pre + f".blocks.{i}.ln1.weight" in W:
             bp = pre + f".blocks.{i}"
-            if attn:
-                h = h + self._mha(bp + ".attn",
-                                  layernorm(h, W[bp + ".ln1.weight"], W[bp + ".ln1.bias"]))
-            else:
-                h = h + W[bp + ".attn.proj.bias"]
+            h = h + self._mha(bp + ".attn",
+                              layernorm(h, W[bp + ".ln1.weight"], W[bp + ".ln1.bias"]))
             h = h + self._ff(bp + ".ff",
                              layernorm(h, W[bp + ".ln2.weight"], W[bp + ".ln2.bias"]))
             i += 1
@@ -168,10 +152,9 @@ class Net:
 
     def t2(self, x):                             # x:[S,T,d_in] -> [S,T,2]
         """Per-source target head: [...,0] = move-target logit (softmax over tokens),
-        [...,1] = full-mobilisation logit (sigmoid; send the source's labourers too).
-        The encoder runs without self-attention -- see T2_ATTENTION."""
+        [...,1] = full-mobilisation logit (sigmoid; send the source's labourers too)."""
         W = self.W
-        h = self._encoder("t2.enc", x, attn=T2_ATTENTION)
+        h = self._encoder("t2.enc", x)
         head = linear(gelu(linear(h, W["t2.head.0.weight"], W["t2.head.0.bias"])),
                       W["t2.head.2.weight"], W["t2.head.2.bias"])
         return head

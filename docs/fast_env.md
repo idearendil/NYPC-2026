@@ -4,28 +4,23 @@ A batched, GPU (CUDA) re-implementation of `testing-tool.py`'s game dynamics for
 fast RL data collection. `B` games are stepped in parallel as tensor ops.
 
 > **Training a DIFFERENT game?** Everything game-independent about the trainer
-> (PPO, GAE, the opponent pool, multi-GPU, checkpoints, phases, logging) lives in
-> **[`finals/`](finals/CLAUDE.md)** as a standalone kit: `finals/rlkit/` plus a
-> runnable template (`finals/examples/toy_duel.py`) and this game re-plugged into
-> it (`finals/examples/nypc2026.py`). Start a session in that directory and read
-> **[finals/FINALS_PLAYBOOK.md](finals/FINALS_PLAYBOOK.md)**. `ppo_selfplay.py`
-> below is unchanged and is still the entry point for THIS game's training run.
+> (PPO, GAE, the opponent pool, multi-GPU, checkpoints, phases, logging) is
+> factored out into a standalone kit on the **`main`** branch, under `finals/`.
+> `ppo_selfplay.py` below is this game's own training entry point.
 
 ## Files
 - `fast_env.py` — the env (`FastEnv`, `MapBatch`, `observe`).
 - `map_gen.py` — background (multi-process) random-map generation for training.
-- `finals/` — self-contained, game-independent self-play PPO kit (`rlkit/`,
-  templates, tests, playbook) for a game whose rules are not known yet.
 - `test_fast_env.py` — **bit-exact end-of-turn parity** (uniform + mixed sizes).
 - `test_phases.py` — **bit-exact per-phase parity** (compares after every stage).
 - `test_observe.py` — observation shapes + mixed-size token-mask checks.
 - `test_encoder.py` — **independent recompute of every encoder feature**.
 - `benchmark_env.py` — throughput benchmark.
 
-Run with the env that has torch+CUDA:
+Run with the interpreter that has torch+CUDA:
 ```
-D:/other_programs/anaconda3/envs/nypc/python.exe test_fast_env.py
-D:/other_programs/anaconda3/envs/nypc/python.exe benchmark_env.py
+python test_fast_env.py
+python benchmark_env.py
 ```
 
 ## Correctness

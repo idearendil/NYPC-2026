@@ -549,7 +549,11 @@ def t2_logits_sources(t2, h1, extra4, surplus_pb, tok_dist, normx, normy, tmask,
     dy = (normy[qb] - normy[qb, qs][:, None])[:, :, None]
     x = torch.cat([h1q, exq, sf, tv, dx, dy], dim=2)
     kpm = ~tmask[qb]
-    o2 = t2(x, kpm)                                              # [Q,T,2]
+    # ActorT2.forward takes tmask ("True = keep", like ActorT1/Critic) and negates it
+    # itself; passing kpm here would double-negate and mask off every REAL token,
+    # collapsing the encoder's attention to proj(0) = attn.proj.bias -- i.e. training
+    # a per-token MLP while vanilla_bot.py runs true attention on the same weights.
+    o2 = t2(x, tmask[qb])                                        # [Q,T,2]
     out[qb, qs] = o2[:, :, 0].masked_fill(kpm, -1e9)
     mob[qb, qs] = o2[:, :, 1]
     return out, mob
@@ -1762,8 +1766,8 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
     wstep = start_iter
     if cfg.use_wandb and dd.is_main:
         import wandb
-        os.environ["WANDB_API_KEY"] = (
-            "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")
+        # Credentials come from the environment (WANDB_API_KEY) or `wandb login`.
+        # Never hardcode a key here -- this file is public.
         run = wandb.init(project="nypc2026-selfplay", config=vars(cfg))
         wandb.define_metric("iter")
         wandb.define_metric("exp/step")

@@ -10,7 +10,7 @@
 # (Listing torch here would let pip pull the default PyPI wheel and clobber your
 #  CUDA build. Lower bounds below avoid forcing downgrades of an already-good env.)
 #
-# The submission bot, submit_bot.py, needs ONLY numpy at runtime.
+# The submission bot, vanilla_bot.py, needs ONLY numpy at runtime.
 
 numpy>=2.0
 PyYAML>=6.0

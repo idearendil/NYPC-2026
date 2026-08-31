@@ -177,12 +177,9 @@ def main():
                     dy = (o_n['normy'] - o_n['normy'][si])[:, None]
                     X[j] = np.concatenate([h1_n, o_n['extra4'], sf, tv, dx, dy], axis=1)
                 lg_n = net.t2(X)
-                # The mask argument mirrors what sample_policy -> t2_logits_sources
-                # actually passes: kpm ("True = ignore"), which ActorT2.forward then
-                # negates. On a padding-free state that means EVERY token is a masked
-                # key, so pass all-False here -- passing all-True (true attention)
-                # would test a forward pass the trained net never ran.
-                lg_t = t2net(torch.tensor(X), torch.zeros(src.size, T, dtype=torch.bool))
+                # tmask ("True = keep"), the same convention t2_logits_sources uses.
+                # The submission state has no padding, so every token is valid.
+                lg_t = t2net(torch.tensor(X), torch.ones(src.size, T, dtype=torch.bool))
                 worst_t2 = max(worst_t2, float(np.max(np.abs(lg_t.detach().numpy() - lg_n))))
 
     print("travel cache matches env:", tt_ok)
