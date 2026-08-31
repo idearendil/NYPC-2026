@@ -5,7 +5,7 @@
 
 # NYPC 2026 — 자가대전 강화학습 에이전트 (본선)
 
-NYPC 2026 전략 게임을 푸는 강화학습 에이전트입니다. 심판(judge)을 배치 GPU 환경으로
+NYPC 2026 전략 게임을 푸는 강화학습 에이전트입니다. 시뮬레이터(judge)를 배치 GPU 환경으로
 직접 재구현한 뒤 그 위에서 self-play PPO로 처음부터 끝까지 학습시켰고, 제출 봇은
 torch 없이 **numpy만으로** 동작합니다.
 
@@ -29,12 +29,12 @@ torch 없이 **numpy만으로** 동작합니다.
   한도, 그리고 *일자리 수*(그곳에서 금화를 벌 수 있는 전사 수)가 늘어납니다.
 - **경제.** 일하는 전사 1명당 하루 15금을 벌고, 전사 1명당 하루 2금이 유지비로
   나갑니다. 훈련은 120금, 이동은 10금입니다.
-- **안개.** 적 유닛과 건물은 내 전사나 건물로부터 **2홉 이내**에서만 보입니다. 그
+- **안개.** 적 유닛과 건물은 내 전사나 건물로부터 **2칸 이내**에서만 보입니다. 그
   바깥은 기억하고 추측해야 합니다.
 - **승리 조건.** 상대 본부를 파괴하거나, 400일이 지난 시점에 건물 체력 합이 앞서면
   이깁니다.
 
-본선 심판은 `testing-tool2.py`입니다. CLI, 맵 포맷, 로그 포맷은
+본선 시뮬레이터는 `testing-tool2.py`입니다. CLI, 맵 포맷, 로그 포맷은
 [docs/testing-tool.md](docs/testing-tool.md)를 보세요.
 
 ## 빠른 시작
@@ -70,7 +70,7 @@ python power_test.py --games 40 --old-weights old.bin
 
 ## 동작 원리
 
-**배치 환경.** 강화학습에는 게임 하나당 프로세스 하나를 띄우는 심판이 감당할 수 없는
+**배치 환경.** 강화학습에는 게임 하나당 프로세스 하나를 띄우는 기존 시뮬레이터가 감당할 수 없는
 양의 대국이 필요합니다. 그래서 `fast_env.py`가 규칙 전체를 `B`개 게임에 대한 텐서
 연산으로 재구현합니다. 심판과 **비트 단위로 일치**함을 검증했습니다 — 금화, 모든
 건물의 소유/종류/레벨/체력, 그리고 모든 전사까지. 턴 종료 시점(`test_fast_env.py`)과
@@ -121,14 +121,14 @@ config.yaml            학습 하이퍼파라미터 전부
 export_weights.py      checkpoint.pt -> data.bin (torch 불필요)
 vanilla_bot.py         실제 제출 봇 (numpy 전용)
 
-testing-tool2.py       본선 심판
-config.ini             심판 설정 예시
+testing-tool2.py       본선 시뮬레이터
+config.ini             시뮬레이터 설정 예시
 sample-code.py         주최측 프로토콜 예제 봇
 
 final_rush_bot.py      스크립트 상대 봇. ppo_selfplay가 이 셋을 배치 이식해
 final_rush_bot2.py       상대 풀의 고정 슬롯으로 사용
 final_defence_bot.py
-basic_bot.py           예선 시절 베이스라인. 심판에 그대로 물려
+basic_bot.py           예선 시절 베이스라인. 시뮬레이터에 그대로 물려
 rush_bot.py              스파링 상대로 쓸 수 있음
 japper_bot.py
 
@@ -137,7 +137,7 @@ power_test.py          가중치 파일 두 개의 승률 비교 (진영 교대)
 mode_power_test.py     greedy vs stochastic 행동 선택의 승률 비교
 benchmark_env.py       환경 처리량 벤치마크
 
-docs/                  심판 문서와 fast_env 상세 설명
+docs/                  시뮬레이터 문서와 fast_env 상세 설명
 ```
 
 ## 테스트
