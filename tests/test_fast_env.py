@@ -12,9 +12,14 @@ actions are fed to ``FastEnv``. After every turn we compare, per game:
 from __future__ import annotations
 
 import random
-import sys
 
 import torch
+
+# --- repo layout: make src/ importable when run directly --------------------
+import os
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 import fast_env as fe
 

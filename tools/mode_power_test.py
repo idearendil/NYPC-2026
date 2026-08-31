@@ -50,7 +50,9 @@ import subprocess
 import sys
 import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root
+BOT = os.path.join(ROOT, "src", "vanilla_bot.py")
+JUDGE = os.path.join(ROOT, "judge", "testing-tool2.py")
 DEFAULT_PY = sys.executable          # any interpreter with numpy (override with --python)
 RESULT_RE = re.compile(r"RESULT\s+(LEFT_WIN|RIGHT_WIN|DRAW)\s+(\S+)")
 # numpy/BLAS spins up one thread PER CORE by default on import. vanilla_bot's
@@ -66,17 +68,17 @@ _SUBPROC_ENV = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
 def build_cmd(py, weights, stochastic):
     """Command line for one contender: vanilla_bot in greedy or stochastic mode."""
     s = " --stochastic" if stochastic else " --greedy"
-    return f'"{py}" vanilla_bot.py --weights "{weights}"{s}'
+    return f'"{py}" "{BOT}" --weights "{weights}"{s}'
 
 
 def run_one(py, seed, left_cmd, right_cmd, logdir, timeout):
     """Run one judge game; return (outcome, reason) or (None, err)."""
     os.makedirs(logdir, exist_ok=True)
     log = os.path.join(logdir, f"seed{seed}.log")
-    cmd = [py, "testing-tool2.py", "--seed", str(seed),
+    cmd = [py, JUDGE, "--seed", str(seed),
            "--exec1", left_cmd, "--exec2", right_cmd, "--log", log]
     try:
-        p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
+        p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                            timeout=timeout, env=_SUBPROC_ENV)
     except subprocess.TimeoutExpired:
         return None, "JUDGE_TIMEOUT"
@@ -128,7 +130,7 @@ def main():
 
     jobs = args.jobs or max(1, (os.cpu_count() or 4) // 5)
 
-    weights = args.weights if os.path.isabs(args.weights) else os.path.join(HERE, args.weights)
+    weights = args.weights if os.path.isabs(args.weights) else os.path.join(ROOT, args.weights)
     if not os.path.exists(weights):
         print(f"weights not found: {weights}", file=sys.stderr); sys.exit(1)
 

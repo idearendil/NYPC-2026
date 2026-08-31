@@ -1,5 +1,9 @@
 # testing-tool
 
+> The judge and its files live in [`judge/`](../judge) — `testing-tool2.py`,
+> `config.ini`, `sample-code.py`. The commands below assume that directory
+> as the working directory.
+
 ## How to Run
 
 `testing-tool2.py` accepts the following command-line arguments:

@@ -7,6 +7,13 @@ import time
 
 import torch
 
+# --- repo layout: make src/ importable when run directly --------------------
+import os
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+sys.path.insert(0, os.path.join(_ROOT, "tests"))   # for test_fast_env helpers
+
 import fast_env as fe
 import test_fast_env as T
 

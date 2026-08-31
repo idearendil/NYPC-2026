@@ -46,6 +46,10 @@ from fast_env import (OWN_LEFT, OWN_RIGHT, KIND_HQ, KIND_BASE, MOVE_COST,
                       TRAIN_COST, HQ_MAXLEVEL, BASE_MAXLEVEL, HQ_HEAL, BASE_HEAL,
                       MAX_DAYS, WORK_INCOME)
 
+# config.yaml sits at the repo root, one level above src/.
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              os.pardir, "config.yaml")
+
 TOK_FEAT = 32          # 15 scalars (incl. fog-of-war "turns since last seen") + 5 arrive
                        # + 5 reach (all log1p) + 2 norm coords + 5 reach-delta vs prev turn
 GLOB_FEAT = 14         # 10 + HQ-turns + 거점-count + x/y map-span (no opponent-gold
@@ -2368,7 +2372,7 @@ def train(cfg: Config, device=None, seed=0, log_every=1):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true", help="tiny end-to-end run")
-    ap.add_argument("--config", default="config.yaml",
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
                     help="YAML hyperparameter file (used if it exists)")
     ap.add_argument("--device", default=None)
     ap.add_argument("--B", type=int, default=None)

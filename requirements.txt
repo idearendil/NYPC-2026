@@ -1,4 +1,4 @@
-# PPO self-play training dependencies (ppo_selfplay.py + fast_env.py + tests)
+# PPO self-play training dependencies (src/ + tests/)
 #
 # torch is intentionally NOT listed here: install it FIRST, separately, with the
 # CUDA build that matches the machine, e.g.
@@ -10,7 +10,7 @@
 # (Listing torch here would let pip pull the default PyPI wheel and clobber your
 #  CUDA build. Lower bounds below avoid forcing downgrades of an already-good env.)
 #
-# The submission bot, vanilla_bot.py, needs ONLY numpy at runtime.
+# The submission bot, src/vanilla_bot.py, needs ONLY numpy at runtime.
 
 numpy>=2.0
 PyYAML>=6.0

@@ -31,7 +31,8 @@ import os
 import queue as _queue
 import random
 
-_TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testing-tool2.py")
+_TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, "judge", "testing-tool2.py")
 
 
 def _load_tt():

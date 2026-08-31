@@ -38,7 +38,8 @@ import torch
 # Load the original simulator as a module (single source of truth for map gen
 # and for the reference dynamics used by the parity test).
 # --------------------------------------------------------------------------- #
-_TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testing-tool2.py")
+_TT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, "judge", "testing-tool2.py")
 if os.path.exists(_TT_PATH):
     _spec = importlib.util.spec_from_file_location("tt_reference", _TT_PATH)
     tt = importlib.util.module_from_spec(_spec)

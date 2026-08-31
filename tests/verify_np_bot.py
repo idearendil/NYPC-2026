@@ -6,6 +6,12 @@ data.bin + checkpoint.pt)."""
 import numpy as np
 import torch
 
+# --- repo layout: make src/ importable when run directly --------------------
+import os
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+
 import fast_env as fe
 from fast_env import OWN_LEFT, KIND_HQ, KIND_BASE
 from ppo_selfplay import ActorT1, ActorT2, extract, T2_EXTRA

@@ -4,18 +4,18 @@ A batched, GPU (CUDA) re-implementation of `testing-tool2.py`'s game dynamics fo
 fast RL data collection. `B` games are stepped in parallel as tensor ops.
 
 ## Files
-- `fast_env.py` — the env (`FastEnv`, `MapBatch`, `observe`).
-- `map_gen.py` — background (multi-process) random-map generation for training.
-- `test_fast_env.py` — **bit-exact end-of-turn parity** (uniform + mixed sizes).
-- `test_phases.py` — **bit-exact per-phase parity** (compares after every stage).
-- `test_observe.py` — observation shapes + mixed-size token-mask checks.
-- `test_encoder.py` — **independent recompute of every encoder feature**.
-- `benchmark_env.py` — throughput benchmark.
+- `src/fast_env.py` — the env (`FastEnv`, `MapBatch`, `observe`).
+- `src/map_gen.py` — background (multi-process) random-map generation for training.
+- `tests/test_fast_env.py` — **bit-exact end-of-turn parity** (uniform + mixed sizes).
+- `tests/test_phases.py` — **bit-exact per-phase parity** (compares after every stage).
+- `tests/test_observe.py` — observation shapes + mixed-size token-mask checks.
+- `tests/test_encoder.py` — **independent recompute of every encoder feature**.
+- `tools/benchmark_env.py` — throughput benchmark.
 
 Run with the env that has torch+CUDA:
 ```
-python test_fast_env.py
-python benchmark_env.py
+python tests/test_fast_env.py
+python tools/benchmark_env.py
 ```
 
 ## Correctness
@@ -139,8 +139,8 @@ full pool: 1.8k → 3.2k → 5.8k → 9.8k → 12.8k as B goes 256 → 512 → 1
   simulates `B/N` games in its own `FastEnv` against its own opponent draws, and
   the PPO gradients are averaged across ranks, so an N-GPU run consumes exactly
   the same data per iteration as a 1-GPU run with the same config — same horizon,
-  same number of optimizer steps, same lr. `python ppo_selfplay.py --gpus 2`
-  spawns the workers itself; `torchrun --nproc_per_node=2 ppo_selfplay.py` also
+  same number of optimizer steps, same lr. `python src/ppo_selfplay.py --gpus 2`
+  spawns the workers itself; `torchrun --nproc_per_node=2 src/ppo_selfplay.py` also
   works (the rank is read from the environment). Default is *all* visible GPUs.
   The nets are **not** wrapped in `DistributedDataParallel` — the code calls
   submodules directly (`t1net.aux(h1)`, T2 on a flattened source subset), which
@@ -243,11 +243,11 @@ adds the **source→token normalized coordinate difference**.
 
 Run:
 ```
-python ppo_selfplay.py                       # config.yaml: B=2048, phase schedule, all GPUs
-python ppo_selfplay.py --gpus 2              # explicit 2-GPU data-parallel run
-python ppo_selfplay.py --gpus 1              # single GPU
-python ppo_selfplay.py --smoke               # tiny end-to-end sanity run
-python ppo_selfplay.py --B 256 --steps 1000000 --iters 50   # the original setting
+python src/ppo_selfplay.py                       # config.yaml: B=2048, phase schedule, all GPUs
+python src/ppo_selfplay.py --gpus 2              # explicit 2-GPU data-parallel run
+python src/ppo_selfplay.py --gpus 1              # single GPU
+python src/ppo_selfplay.py --smoke               # tiny end-to-end sanity run
+python src/ppo_selfplay.py --B 256 --steps 1000000 --iters 50   # the original setting
 ```
 Verified learning: avg episode reward rises from ≈ −6 toward +6 within ~10 short
 iters (agent beating the frozen initial opponent), now against fresh maps.
@@ -270,13 +270,13 @@ is **numpy-only at runtime** — the 1000ms handshake budget can't fit torch's ~
 import, while numpy imports in ~0.15s. Workflow:
 
 ```
-python ppo_selfplay.py ...                    # trains -> checkpoint.pt
-python export_weights.py --ckpt checkpoint.pt --out data.bin      # offline, uses torch
-python verify_np_bot.py                       # checks numpy == torch pipeline (needs both files)
+python src/ppo_selfplay.py ...                    # trains -> checkpoint.pt
+python src/export_weights.py --ckpt checkpoint.pt --out data.bin      # offline, uses torch
+python tests/verify_np_bot.py                       # checks numpy == torch pipeline (needs both files)
 # then submit / play:
-testing-tool2.py -a "python vanilla_bot.py --weights data.bin" -b "..." --seed 1 --NP 40 --KP 6
-python run_match.py --seed 42                 # vanilla vs vanilla -> replay.log
-python power_test.py --games 20 --old-weights data_prev.bin   # A/B two weight files
+judge/testing-tool2.py -a "python src/vanilla_bot.py --weights data.bin" -b "..." --seed 1 --NP 40 --KP 6
+python tools/run_match.py --seed 42                 # vanilla vs vanilla -> replay.log
+python tools/power_test.py --games 20 --old-weights data_prev.bin   # A/B two weight files
 ```
 
 - The encoder (`extract`/`observe`) and the transformer forward are ported to

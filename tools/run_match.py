@@ -20,11 +20,13 @@ import random
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root
+BOT = os.path.join(ROOT, "src", "vanilla_bot.py")
+JUDGE = os.path.join(ROOT, "judge", "testing-tool2.py")
 
 
 def bot_cmd(py, weights, mode):
-    cmd = f'"{py}" "{os.path.join(HERE, "vanilla_bot.py")}" --weights "{weights}"'
+    cmd = f'"{py}" "{BOT}" --weights "{weights}"'
     # vanilla_bot CLI: --greedy = argmax, --stochastic = sample (default stochastic)
     cmd += " --greedy" if mode == "argmax" else " --stochastic"
     return cmd
@@ -36,9 +38,9 @@ def main():
                     help="LEFT player policy (default: argmax)")
     ap.add_argument("--right", choices=["argmax", "stochastic"], default="stochastic",
                     help="RIGHT player policy (default: stochastic)")
-    ap.add_argument("--weights", default=os.path.join(HERE, "data.bin"),
+    ap.add_argument("--weights", default=os.path.join(ROOT, "data.bin"),
                     help="weights file for both bots (default: data.bin)")
-    ap.add_argument("--log", default=os.path.join(HERE, "replay.log"),
+    ap.add_argument("--log", default=os.path.join(ROOT, "replay.log"),
                     help="output replay log (default: replay.log)")
     ap.add_argument("--seed", type=int, default=None,
                     help="map seed (default: random)")
@@ -50,7 +52,7 @@ def main():
     py = sys.executable
 
     cmd = [
-        py, os.path.join(HERE, "testing-tool2.py"),
+        py, JUDGE,
         "--seed", str(seed),
         "-l", args.log,
         "-a", bot_cmd(py, args.weights, args.left),
